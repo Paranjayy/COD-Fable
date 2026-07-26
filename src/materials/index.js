@@ -94,8 +94,12 @@ export class MaterialSystem {
 
   _size(base) {
     const s = Math.max(128, Math.round((base * this._quality) / 128) * 128);
-    // keep it a power of two so mip chains stay clean
-    return 1 << Math.round(Math.log2(s));
+    // Keep it a power of two so mip chains stay clean, and round DOWN to it.
+    // Rounding to the *nearest* power of two made the medium preset a no-op at
+    // every size in the library (0.75 * 1024 = 768, and log2(768) rounds to 10,
+    // i.e. straight back to 1024), so medium users paid the full ultra VRAM and
+    // bake cost. 128 stays the floor.
+    return Math.max(128, 1 << Math.floor(Math.log2(s)));
   }
 
   /**

@@ -6,6 +6,28 @@
  * uv in [0,1) with p = uv * per tiles seamlessly. Octaves double both the
  * frequency and the period, which keeps the whole fbm stack seamless.
  *
+ * ───────────────────────────────────────────────────────────────────────────
+ * THE PERIOD RULE: READ THIS BEFORE ADDING A CALL
+ * ───────────────────────────────────────────────────────────────────────────
+ * Wrapping is done with floor()/mod() on the lattice, so `n(q + per) == n(q)`
+ * holds only when `floor(q + per) == floor(q) + per` and `fract(q + per) ==
+ * fract(q)`, and both of those need `per` to be a WHOLE NUMBER of cells.
+ *
+ * A surface writes `p = uv * P` with `P = vec2(8.0)`, so a band written as
+ *
+ *     owFbm01(p * K, P * K, ...)
+ *
+ * lays `8 * K` cells across the tile and that has to be an integer: K must be
+ * a multiple of 1/8 (0.125). `owFbm01(p * 0.55, P * 0.5, ...)` is the classic
+ * failure: the domain advances 4.4 cells while the lattice wraps at 4.0, so
+ * the noise simply does not meet itself and the tile has a visible seam.
+ *
+ * When a band needs retuning, adjust the SCALE to the nearest valid multiple
+ * (0.55 -> 0.5, 2.3 -> 2.25) and pass `P * scale` as the period, so the two
+ * always agree. The same applies to each axis of a non-uniform scale, to the
+ * `stretch` of owShear/owShearPer, and to any floor()/fract() lattice a surface
+ * builds for itself out of uv.
+ *
  * Hashes are sin-free (Dave Hoskins style) — sin() based hashes band badly on
  * Apple GPUs at high lattice coordinates.
  */
@@ -177,8 +199,9 @@ float owCracks(vec2 p, vec2 per, float jitter, float width, float breakUp){
   vec2 wp = owWarp(p, per, 0.20, 3);
   float e = owVoronoiEdge(wp, per, jitter);
   float c = 1.0 - smoothstep(0.0, width, e);
-  // Break the network so it reads as damage, not as a net.
-  float mask = owFbm01(p * 1.7 + 11.3, per * 1.7, 4, 0.55);
+  // Break the network so it reads as damage, not as a net. The multiplier has
+  // to be integral: 'per' arrives whole, and per * 1.7 would not be.
+  float mask = owFbm01(p * 2.0 + 11.3, per * 2.0, 4, 0.55);
   c *= smoothstep(breakUp, breakUp + 0.28, mask);
   return clamp(c, 0.0, 1.0);
 }

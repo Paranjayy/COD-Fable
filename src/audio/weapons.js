@@ -107,9 +107,26 @@ export function resolveProfile(name) {
 
 const RR_SLOTS = 6;
 
-/** Build (once, lazily) the round-robin timbre table for a profile. */
+/**
+ * Round-robin state belongs to the caller, never to the shared profile objects
+ * in WEAPON_PROFILES. Cached on the profile it is global: whichever Rng built
+ * a table first would fix the timbre for every later context, the cursor would
+ * advance across contexts, and running the offline selftest (which drives every
+ * profile from its own Rng) would reseed the live game, all of which breaks
+ * the "no randomness except through an injected Rng" contract. Keying on the
+ * injected Rng gives one table per caller and keeps it deterministic.
+ */
+const RR_STATE = new WeakMap(); // Rng -> Map<profile, { table, index }>
+
+/** Build (once, lazily) the round-robin timbre table for a profile + rng. */
 function roundRobin(profile, rng) {
-  if (profile._rr) return profile._rr;
+  let byProfile = RR_STATE.get(rng);
+  if (!byProfile) {
+    byProfile = new Map();
+    RR_STATE.set(rng, byProfile);
+  }
+  const cached = byProfile.get(profile);
+  if (cached) return cached;
   const rr = [];
   for (let i = 0; i < RR_SLOTS; i++) {
     rr.push({
@@ -125,9 +142,9 @@ function roundRobin(profile, rng) {
       tilt: rng.range(-2.5, 2.5),
     });
   }
-  profile._rr = rr;
-  profile._rrIndex = (rng.u32() % RR_SLOTS) | 0;
-  return rr;
+  const state = { table: rr, index: (rng.u32() % RR_SLOTS) | 0 };
+  byProfile.set(profile, state);
+  return state;
 }
 
 /**
@@ -146,8 +163,8 @@ export function weaponShot(actx, bank, rng, profile, o = {}) {
   const fp = !!o.firstPerson;
 
   const rr = roundRobin(profile, rng);
-  profile._rrIndex = (profile._rrIndex + 1) % RR_SLOTS;
-  const v = rr[profile._rrIndex];
+  rr.index = (rr.index + 1) % RR_SLOTS;
+  const v = rr.table[rr.index];
 
   // Per-shot jitter on top of the round-robin slot — the fine grain.
   const jB = v.body * semis(rng.range(-0.45, 0.45));

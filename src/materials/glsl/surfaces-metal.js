@@ -36,10 +36,10 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   ao = 1.0;
 
   // ---- rust blooms: warped billow clusters, hard-edged where they flake ----
-  vec2 wp = owWarp(p * 1.4, P * 1.4, 1.2, 4);
-  float bloom = owBillow(wp, P * 1.4, 5, 0.6);
+  vec2 wp = owWarp(p * 1.375, P * 1.375, 1.2, 4);
+  float bloom = owBillow(wp, P * 1.375, 5, 0.6);
   bloom = 1.0 - bloom;                              // clusters, not veins
-  float spread = owFbm01(p * 0.7 + 12.0, P * 0.7, 3, 0.6);
+  float spread = owFbm01(p * 0.75 + 12.0, P * 0.75, 3, 0.6);
   float rust = smoothstep(0.36, 0.72, bloom * (0.55 + 0.85 * spread));
   float rustGrain = owFbm01(p * 26.0, P * 26.0, 4, 0.55);
   float pit = owFbm01(p * 24.0, P * 24.0, 3, 0.5);
@@ -50,7 +50,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
 
   // Rust *colour* is driven by how old the patch is, not by how much of it
   // there is — otherwise every heavily rusted area collapses to the same brown.
-  float rustAge = owFbm01(p * 0.85 + 21.0, P * 0.85, 4, 0.62);
+  float rustAge = owFbm01(p * 0.875 + 21.0, P * 0.875, 4, 0.62);
   vec3 rustCol = owRustColour(rustAge * 0.8 + rust * 0.3, rustGrain);
   c = mix(c, rustCol, rust);
   metal = mix(1.0, 0.0, smoothstep(0.15, 0.55, rust));
@@ -76,7 +76,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   h -= scr * 0.010;
 
   // ---- grime ----
-  float grime = smoothstep(0.55, 0.9, owFbm01(vec2(p.x * 5.0, p.y * 0.8), vec2(P.x * 5.0, max(P.y, 1.0)), 5, 0.55));
+  float grime = smoothstep(0.55, 0.9, owFbm01(vec2(p.x * 5.0, p.y * 0.75), vec2(P.x * 5.0, P.y * 0.75), 5, 0.55));
   c *= 1.0 - grime * 0.25;
   rough += grime * 0.08;
 
@@ -97,7 +97,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   vec3 steel = owSRGB(vec3(0.330, 0.335, 0.345)) * (0.88 + 0.2 * mill);
 
   // ---- rust that has crept under the paint ----
-  float bloom = 1.0 - owBillow(owWarp(p * 1.8, P * 1.8, 1.1, 4), P * 1.8, 5, 0.6);
+  float bloom = 1.0 - owBillow(owWarp(p * 1.75, P * 1.75, 1.1, 4), P * 1.75, 5, 0.6);
   float rustField = smoothstep(0.60, 0.92, bloom);
   float rustGrain = owFbm01(p * 22.0, P * 22.0, 4, 0.55);
   vec3 rustCol = owRustColour(rustField, rustGrain);
@@ -108,11 +108,11 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   vec3 paint = uTintA * (0.90 + 0.16 * roller);
   paint *= 0.96 + 0.08 * peel;
   // sun-bleached on the up-facing halves
-  float bleach = smoothstep(0.35, 0.85, owFbm01(p * 0.8, P * 0.8, 3, 0.6));
+  float bleach = smoothstep(0.35, 0.85, owFbm01(p * 0.75, P * 0.75, 3, 0.6));
   paint = mix(paint, paint * 1.25 + 0.03, bleach * 0.5);
 
   // ---- chipping: paint fails at scratches, impacts and along its own edges ----
-  float chipField = owFbm01(owWarp(p * 2.6 + 4.0, P * 2.6, 0.9, 3), P * 2.6, 5, 0.55);
+  float chipField = owFbm01(owWarp(p * 2.625 + 4.0, P * 2.625, 0.9, 3), P * 2.625, 5, 0.55);
   float chipEdge = owFbm01(p * 12.0, P * 12.0, 4, 0.5);
   // Paint mostly holds: only the top of the distribution actually fails, and
   // it fails hardest where rust is already lifting it from underneath.
@@ -157,7 +157,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   r = mix(r, 0.26, scr * 0.55);
 
   // ---- dirt and rain streaks ----
-  float streak = owFbm01(vec2(p.x * 6.0, p.y * 0.7), vec2(P.x * 6.0, max(P.y, 1.0)), 5, 0.55);
+  float streak = owFbm01(vec2(p.x * 6.0, p.y * 0.75), vec2(P.x * 6.0, P.y * 0.75), 5, 0.55);
   float grime = smoothstep(0.52, 0.92, streak);
   c *= 1.0 - grime * 0.30;
   r += grime * 0.10;
@@ -190,7 +190,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   float brush3 = owFbm01(owShear(p * 4.0, 0.0, 24.0), owShearPer(P * 4.0, 24.0), 3, 0.5);
   float brush = brush1 * 0.5 + brush2 * 0.32 + brush3 * 0.18;
 
-  float macro = owFbm01(p * 0.9, P * 0.9, 3, 0.6);
+  float macro = owFbm01(p * 0.875, P * 0.875, 3, 0.6);
 
   vec3 c = owSRGB(vec3(0.560, 0.565, 0.575));
   c *= 0.93 + 0.13 * brush;
@@ -217,7 +217,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   h += (dent - 0.5) * 0.05;
 
   // fingerprints and grease smudges — the thing that sells brushed metal
-  float smudge = smoothstep(0.58, 0.86, owFbm01(owWarp(p * 2.2 + 19.0, P * 2.2, 0.7, 3), P * 2.2, 4, 0.55));
+  float smudge = smoothstep(0.58, 0.86, owFbm01(owWarp(p * 2.25 + 19.0, P * 2.25, 0.7, 3), P * 2.25, 4, 0.55));
   rough += smudge * 0.22;
   c *= 1.0 - smudge * 0.06;
   metal -= smudge * 0.10;
@@ -252,7 +252,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   float lap = smoothstep(0.0, 0.06, fract(panel)) * smoothstep(0.0, 0.06, 1.0 - fract(panel));
   float panelStep = (owHash11(panelId + uSeed) - 0.5) * 0.05;
 
-  float dents = owFbm01(p * 2.2, P * 2.2, 4, 0.6);
+  float dents = owFbm01(p * 2.25, P * 2.25, 4, 0.6);
   float fine = owFbm01(p * 11.0, P * 11.0, 4, 0.5);
 
   h = 0.18 + profile * 0.62 + panelStep + (dents - 0.5) * 0.07 + (fine - 0.5) * 0.012;
@@ -271,7 +271,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // ---- rust, heavier in the valleys and at the bottom of the sheet ----
   float valley = 1.0 - profile;
   float rustField = smoothstep(0.62, 0.98,
-      (1.0 - owBillow(owWarp(p * 1.6, P * 1.6, 1.0, 4), P * 1.6, 5, 0.6)) *
+      (1.0 - owBillow(owWarp(p * 1.625, P * 1.625, 1.0, 4), P * 1.625, 5, 0.6)) *
       (0.58 + 0.40 * valley) + (1.0 - uv.y) * 0.16);
   float rustGrain = owFbm01(p * 22.0, P * 22.0, 4, 0.55);
   vec3 rustCol = owRustColour(rustField, rustGrain);

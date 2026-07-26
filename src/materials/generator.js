@@ -268,9 +268,17 @@ export class TextureForge {
 
     const mat = this._material(def.key, def.glsl);
     mat.uniforms.uSeed.value = def.seed ?? 0;
+    // One ShaderMaterial is cached per surface key and reused by every bake of
+    // that surface, so each bake has to write *all* of these: a bake that does
+    // not specify a tint has to reset it, or it silently inherits whatever the
+    // previous bake of the same surface left behind while the texture cache
+    // (which keys on the tint) hands it out as a distinct entry.
     if (def.tintA) mat.uniforms.uTintA.value.copy(def.tintA);
+    else mat.uniforms.uTintA.value.setRGB(1, 1, 1);
     if (def.tintB) mat.uniforms.uTintB.value.copy(def.tintB);
+    else mat.uniforms.uTintB.value.setRGB(1, 1, 1);
     if (def.param) mat.uniforms.uParam.value.copy(def.param);
+    else mat.uniforms.uParam.value.set(0, 0, 0, 0);
     this._mesh.material = mat;
 
     const albedoRT = this._target(size, { srgb: def.linearAlbedo !== true });

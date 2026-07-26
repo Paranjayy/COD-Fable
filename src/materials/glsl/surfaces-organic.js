@@ -59,7 +59,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   c = mix(c, wDark * 0.7, clamp(knotPull * 2.2, 0.0, 1.0) * 0.8);
 
   // weathering: UV-bleached, silvered, worst on the exposed boards
-  float weather = smoothstep(0.20, 0.85, owFbm01(p * 0.8, P * 0.8, 3, 0.6)) * (0.4 + 0.6 * rnd.x);
+  float weather = smoothstep(0.20, 0.85, owFbm01(p * 0.75, P * 0.75, 3, 0.6)) * (0.4 + 0.6 * rnd.x);
   c = mix(c, wGrey, weather * 0.68);
 
   float faceH = 0.74 - ringDark * 0.02 - latewood * 0.012 + (fibre - 0.5) * 0.03 + (micro - 0.5) * 0.008;
@@ -108,7 +108,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   float cavity = 1.0 - smoothstep(0.55, 0.78, h);
   c = mix(c, owSRGB(vec3(0.120, 0.106, 0.088)), cavity * 0.45);
   // ground-in dirt over the whole board
-  float soil = smoothstep(0.40, 0.88, owFbm01(owWarp(p * 2.2 + 5.0, P * 2.2, 0.9, 3), P * 2.2, 5, 0.6));
+  float soil = smoothstep(0.40, 0.88, owFbm01(owWarp(p * 2.25 + 5.0, P * 2.25, 0.9, 3), P * 2.25, 5, 0.6));
   c = mix(c, owSRGB(vec3(0.185, 0.160, 0.128)), soil * 0.40);
   rough += soil * 0.08;
 
@@ -141,7 +141,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // ---- fuzz and slubs ----
   float fuzz = owFbm01(p * 12.0, P * 12.0, 3, 0.55);
   float slub = owFbm01(p * 14.0, P * 14.0, 4, 0.5);
-  float macro = owFbm01(p * 1.2, P * 1.2, 4, 0.6);
+  float macro = owFbm01(p * 1.25, P * 1.25, 4, 0.6);
 
   vec3 cA = uTintA;
   vec3 cB = uTintB;
@@ -160,7 +160,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // apart, wandering as they run. At the 0.26 m mapping the awnings use, 2.6
   // cycles across the tile is a ~10 cm fold. A weave alone reads as printed
   // canvas; the fold field is what gives a canopy its shape between its poles.
-  float foldC = uv.y * 2.6 + uv.x * 0.55 + owFbm01(p * 0.9, P * 0.9, 3, 0.62) * 2.2;
+  float foldC = uv.y * 2.6 + uv.x * 0.55 + owFbm01(p * 0.875, P * 0.875, 3, 0.62) * 2.2;
   float foldT = abs(fract(foldC) - 0.5) * 2.0;          // 0 at crest, 1 in trough
   float crest = 1.0 - foldT;
   float foldR = owHash11(floor(foldC) * 2.13 + uSeed);
@@ -236,7 +236,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   ao = mix(0.74, 1.0, smoothstep(-0.4, 0.9, weave));
 
   // sun rot: bleached and frayed on the exposed side
-  float rot = smoothstep(0.55, 0.9, owFbm01(p * 0.7 + 11.0, P * 0.7, 3, 0.6));
+  float rot = smoothstep(0.55, 0.9, owFbm01(p * 0.75 + 11.0, P * 0.75, 3, 0.6));
   c = mix(c, cPale * 1.15, rot * 0.4);
   rough += rot * 0.05;
 

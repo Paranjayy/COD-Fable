@@ -119,6 +119,10 @@ export class AudioSystem {
     this._offs = [];
     this._gestureHandler = null;
     this._ambienceApi = null;
+    /** in-flight start(), so a burst of gestures cannot stack contexts */
+    this._starting = null;
+    /** countdown before the next resume() attempt on a suspended context */
+    this._resumeTimer = 0;
   }
 
   /* ================================================================ */
@@ -133,9 +137,17 @@ export class AudioSystem {
     // Web Audio needs a user gesture. Arm every plausible one; the first to
     // land builds the graph. Capture mode never gestures, so shots render in
     // silence and stay byte-identical.
+    //
+    // Not every armed event is an *activation-triggering* input event: `wheel`
+    // is not, so resume() can still be refused. The listeners therefore stay
+    // armed until a start actually succeeds, and one start at a time is allowed
+    // in flight so a burst of gestures cannot build two contexts.
     const kick = () => {
-      this._disarmGesture();
-      this.start().catch(() => {});
+      if (this._starting) return;
+      this._starting = this.start()
+        .then((started) => { if (started) this._disarmGesture(); })
+        .catch(() => { /* start() reports its own failures */ })
+        .finally(() => { this._starting = null; });
     };
     this._gestureHandler = kick;
     if (typeof addEventListener === 'function') {
@@ -146,13 +158,22 @@ export class AudioSystem {
 
   _disarmGesture() {
     if (!this._gestureHandler) return;
-    for (const ev of GESTURES) removeEventListener(ev, this._gestureHandler);
+    // Guarded exactly like the registration above: in a worker or a Node realm
+    // there is no removeEventListener, and throwing here would abort dispose()
+    // before the event unsubscribes and the graph teardown.
+    if (typeof removeEventListener === 'function') {
+      for (const ev of GESTURES) removeEventListener(ev, this._gestureHandler);
+    }
     this._gestureHandler = null;
   }
 
   /**
    * Build the graph. Safe to call repeatedly; resolves false when audio is
    * unavailable (no AudioContext, blocked autoplay, headless renderer, ...).
+   *
+   * A refused resume() is not fatal: the graph is torn down and `failed` is
+   * left clear, so the next gesture gets a clean attempt. Only a real error
+   * (no AudioContext at all, a node the browser will not build) latches it.
    */
   async start() {
     if (this.running) return true;
@@ -171,7 +192,16 @@ export class AudioSystem {
       this.ambience.start();
       this.mixer.setSpace(this._space, 0.001);
 
-      if (actx.state === 'suspended') await actx.resume();
+      if (actx.state === 'suspended') {
+        try {
+          await actx.resume();
+        } catch { /* the autoplay policy refused this particular gesture */ }
+        if (actx.state === 'suspended') {
+          console.info('[audio] context still suspended, waiting for a user gesture');
+          this._teardown();
+          return false;
+        }
+      }
       this.running = true;
       this.stats.started = true;
       this.stats.contextState = actx.state;
@@ -214,7 +244,25 @@ export class AudioSystem {
     if (!this.running) return;
     try {
       const actx = this.actx;
-      if (actx.state === 'suspended') return; // tab hidden, or resume pending
+      if (actx.state === 'suspended') {
+        // A context can be suspended long *after* a successful start: tab
+        // backgrounded, iOS interruption, OS focus loss, and by then the
+        // gesture handlers are gone and nothing else calls resume(). Retry
+        // here, rate-limited so a context that genuinely cannot resume is not
+        // asked once a frame. Teardown still has to run, or every voice and
+        // emitter that was live when the tab went away is held for the whole
+        // suspension.
+        this._resumeTimer -= dt;
+        if (this._resumeTimer <= 0) {
+          this._resumeTimer = 1.5;
+          try { actx.resume?.()?.catch?.(() => {}); } catch { /* not resumable */ }
+        }
+        this._reapDry(actx.currentTime);
+        this.field.update(dt);
+        this.stats.contextState = actx.state;
+        return;
+      }
+      this._resumeTimer = 0;
 
       /* ---- listener from the render camera ----------------------- */
       const cam = ctx.camera;
@@ -251,14 +299,7 @@ export class AudioSystem {
       this.ambience.update(dt, this._ambienceApi);
 
       /* ---- head-locked voice teardown ---------------------------- */
-      const now = actx.currentTime;
-      for (let i = 0; i < this._dry.length; i++) {
-        const d = this._dry[i];
-        if (!d.node || now < d.end) continue;
-        try { d.node.disconnect(); } catch { /* already gone */ }
-        try { d.send?.disconnect(); } catch { /* already gone */ }
-        d.node = null; d.send = null;
-      }
+      this._reapDry(actx.currentTime);
 
       /* ---- low-health heartbeat ---------------------------------- */
       if (this._health < 34) {
@@ -282,6 +323,17 @@ export class AudioSystem {
       s.contextState = actx.state;
     } catch (err) {
       this._error(err);
+    }
+  }
+
+  /** Release every head-locked slot whose tail has already decayed. */
+  _reapDry(now) {
+    for (let i = 0; i < this._dry.length; i++) {
+      const d = this._dry[i];
+      if (!d.node || now < d.end) continue;
+      try { d.node.disconnect(); } catch { /* already gone */ }
+      try { d.send?.disconnect(); } catch { /* already gone */ }
+      d.node = null; d.send = null;
     }
   }
 

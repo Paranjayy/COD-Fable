@@ -121,6 +121,23 @@ export const BARKS = {
 
 const WAVE_CACHE = new WeakMap();
 
+/**
+ * Scale a set of envelope segment lengths so the envelope, plus the 2 ms the
+ * dsp helpers spend closing it, fits inside the `slot` seconds the syllable
+ * owns. An envelope that overruns its slot lands its closing setValueAtTime(0)
+ * inside the *next* syllable's attack, so that syllable's opening
+ * exponentialRampToValueAtTime starts from a hard zero, a no-op hold followed
+ * by a discontinuous jump, which is an audible click on every overlap.
+ */
+function fitEnvelope(slot, segs) {
+  let sum = 0;
+  for (const s of segs) sum += s;
+  const budget = Math.max(slot - 0.002, 0.004);
+  if (sum <= budget || sum <= 0) return segs;
+  const k = budget / sum;
+  return segs.map((s) => s * k);
+}
+
 /** Glottal-ish pulse: strong fundamental, 1/n^1.15 rolloff, alternating phase. */
 function glottalWave(actx) {
   let w = WAVE_CACHE.get(actx);
@@ -255,12 +272,20 @@ export function bark(actx, bank, rng, o = {}) {
     }
 
     /* amplitude: fast onset, held, quick release; last syllable decays longer */
+    // The envelope is longer than s.d, so anything but the final syllable has
+    // to be squeezed into the slot it owns, see fitEnvelope(). The last
+    // syllable has no successor to collide with and keeps its full tail.
     const last = i === spec.syl.length - 1;
     const rel = last ? (spec.dying ? s.d * 0.9 : 0.055) : 0.028;
-    adsr(srcGain.gain, t, amp * level, 0.014, s.d * 0.22, s.d * 0.5, 0.72, rel);
-    ad(noiseGain.gain, t, amp * breathLevel * level, 0.02, s.d + rel);
+    const slot = s.d + (s.g ?? 0);
+    const env = [0.014, s.d * 0.22, s.d * 0.5, rel];
+    const [eA, eD, eS, eR] = last ? env : fitEnvelope(slot, env);
+    adsr(srcGain.gain, t, amp * level, eA, eD, eS, 0.72, eR);
+    const breath = [0.02, s.d + rel];
+    const [bA, bD] = last ? breath : fitEnvelope(slot, breath);
+    ad(noiseGain.gain, t, amp * breathLevel * level, bA, bD);
 
-    t += s.d + (s.g ?? 0);
+    t += slot;
   }
 
   /* ---- dying exhale ---------------------------------------------- */

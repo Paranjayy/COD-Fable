@@ -70,7 +70,12 @@ export class Ambience {
       this._lfo(0.037 + i * 0.023, rng.range(80, 170), lp.frequency);
       this.nodes.push(src, lp, hp, g, pan);
       this._windLayers ??= [];
-      this._windLayers.push({ g, lp });
+      // baseF is the layer's *intended* cutoff. A gust must automate relative
+      // to it, not to lp.frequency.value: setTargetAtTime only approaches its
+      // target asymptotically, so reading the live param mid-return gives a
+      // value biased high, and multiplying that by the next gust ratchets the
+      // whole wind bed brighter over a session with no way back down.
+      this._windLayers.push({ g, lp, baseF: lp.frequency.value, baseG: g.gain.value });
     }
 
     /* ---- wind whistle through edges and wires --------------------- */
@@ -187,10 +192,10 @@ export class Ambience {
     const dur = r.range(2.2, 6.5);
     const strength = r.range(0.25, 1) * lerp(1, 0.25, this.enclosure);
     for (const l of this._windLayers ?? []) {
-      const peak = 0.5 + 0.5 * strength * r.range(0.7, 1.2);
+      const peak = l.baseG + l.baseG * strength * r.range(0.7, 1.2);
       l.g.gain.setTargetAtTime(peak, t + r.range(0, 0.5), dur * 0.28);
-      l.g.gain.setTargetAtTime(0.5, t + dur * 0.55, dur * 0.4);
-      const f = l.lp.frequency.value;
+      l.g.gain.setTargetAtTime(l.baseG, t + dur * 0.55, dur * 0.4);
+      const f = l.baseF;
       l.lp.frequency.setTargetAtTime(f * (1 + strength * 0.9), t, dur * 0.3);
       l.lp.frequency.setTargetAtTime(f, t + dur * 0.6, dur * 0.5);
     }
