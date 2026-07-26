@@ -87,7 +87,11 @@ export class Clip {
     if (this.parts) {
       sampleTrack(this.parts, t, out, (a, b, w, o) => {
         o.parts.mag = lerp(a.mag ?? 0, b.mag ?? 0, w);
-        o.parts.magVisible = (b.magVisible ?? a.magVisible ?? 1) > 0.5 || w < 0.5;
+        // Visibility is a step, not a blend: it holds the value authored on the
+        // segment's own key until the next key is reached. The keys are written
+        // in pairs around each hide/show so the switch lands on the same frame
+        // as the matching event ('magdrop' hands the mag over to a physics prop).
+        o.parts.magVisible = (a.magVisible ?? b.magVisible ?? 1) > 0.5;
         o.parts.charge = lerp(a.charge ?? 0, b.charge ?? 0, w);
         o.parts.bolt = lerp(a.bolt ?? 0, b.bolt ?? 0, w);
         o.parts.slide = lerp(a.slide ?? 0, b.slide ?? 0, w);
@@ -149,7 +153,7 @@ export function buildClips(nodes, def) {
       { t: 0.5 * tac, p: v3(0.016, -0.03, 0.026), r: v3(-0.1, 0.34, 0.5) },
       { t: 0.72 * tac, p: v3(0.012, -0.022, 0.022), r: v3(-0.12, 0.26, 0.44) },
       { t: 0.78 * tac, p: v3(0.008, -0.008, 0.014), r: v3(-0.05, 0.18, 0.3), ease: 'back' },
-      { t: 1, p: v3(0, 0, 0), r: v3(0, 0, 0) },
+      { t: tac, p: v3(0, 0, 0), r: v3(0, 0, 0) },
     ],
     lhand: [
       { t: 0, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap' },
@@ -162,7 +166,7 @@ export function buildClips(nodes, def) {
       { t: 0.76 * tac, p: magHigh, finger: magFinger, back: magBack, pose: 'pinch', ease: 'out' },
       { t: 0.8 * tac, p: seated, finger: magFinger, back: magBack, pose: 'pinch' },
       { t: 0.86 * tac, p: v3(seated[0], seated[1] - 0.012, seated[2]), finger: magFinger, back: magBack, pose: 'open' },
-      { t: 1, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' },
+      { t: tac, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' },
     ],
     parts: [
       { t: 0, mag: 0, magVisible: 1 },
@@ -174,7 +178,7 @@ export function buildClips(nodes, def) {
       { t: 0.68 * tac, mag: 1, magVisible: 1 },
       { t: 0.79 * tac, mag: 1, magVisible: 1, ease: 'out' },
       { t: 0.81 * tac, mag: 0, magVisible: 1 },
-      { t: 1, mag: 0, magVisible: 1 },
+      { t: tac, mag: 0, magVisible: 1 },
     ],
     events: [
       { t: 0.02 * tac, name: 'start' },
@@ -214,7 +218,7 @@ export function buildClips(nodes, def) {
       { t: 0.92 * emp, p: v3(-0.02, seat[1] + 0.06, seat[2] - 0.06), finger: v3(0.7, -0.3, 0.65), back: v3(0.1, 0.94, 0.32), pose: 'open', ease: 'out' }
     );
   }
-  emptyLhand.push({ t: 1, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' });
+  emptyLhand.push({ t: emp, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' });
 
   const emptyParts = [
     { t: 0, mag: 0, magVisible: 1, bolt: 1, slide: 1 },
@@ -229,7 +233,7 @@ export function buildClips(nodes, def) {
     { t: 0.86 * emp, mag: 0, magVisible: 1, bolt: 1, slide: 1, charge: 0 },
     { t: 0.9 * emp, mag: 0, magVisible: 1, bolt: 1, slide: 1, charge: 1, ease: 'linear' },
     { t: 0.915 * emp, mag: 0, magVisible: 1, bolt: 0, slide: 0, charge: 0, ease: 'back' },
-    { t: 1, mag: 0, magVisible: 1, bolt: 0, slide: 0, charge: 0 },
+    { t: emp, mag: 0, magVisible: 1, bolt: 0, slide: 0, charge: 0 },
   ];
 
   const reloadEmpty = new Clip('reloadEmpty', emp, {
@@ -241,7 +245,7 @@ export function buildClips(nodes, def) {
       { t: 0.72 * emp, p: v3(0.01, -0.014, 0.018), r: v3(-0.06, 0.24, 0.38), ease: 'back' },
       { t: 0.86 * emp, p: v3(0.006, -0.012, 0.016), r: v3(-0.02, 0.42, 0.22) },
       { t: 0.92 * emp, p: v3(0.004, -0.006, 0.022), r: v3(0.02, 0.44, 0.18), ease: 'linear' },
-      { t: 1, p: v3(0, 0, 0), r: v3(0, 0, 0), ease: 'out' },
+      { t: emp, p: v3(0, 0, 0), r: v3(0, 0, 0), ease: 'out' },
     ],
     lhand: emptyLhand,
     parts: emptyParts,
@@ -266,17 +270,17 @@ export function buildClips(nodes, def) {
       { t: 0.52 * insp, p: v3(0.01, -0.02, 0.07), r: v3(0.22, 0.5, 0.9) },
       { t: 0.7 * insp, p: v3(0.012, -0.024, 0.055), r: v3(0.3, 0.62, 1.15) },
       { t: 0.86 * insp, p: v3(-0.006, -0.01, 0.03), r: v3(0.06, -0.18, 0.2) },
-      { t: 1, p: v3(0, 0, 0), r: v3(0, 0, 0), ease: 'out' },
+      { t: insp, p: v3(0, 0, 0), r: v3(0, 0, 0), ease: 'out' },
     ],
     lhand: [
       { t: 0, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap' },
       { t: 0.3 * insp, p: v3(hgP[0] - 0.01, hgP[1] - 0.01, hgP[2] + 0.03), finger: wrapFinger, back: wrapBack, pose: 'clamp' },
       { t: 0.55 * insp, p: v3(hgP[0] + 0.01, hgP[1] - 0.02, hgP[2] - 0.02), finger: wrapFinger, back: wrapBack, pose: 'wrap' },
-      { t: 1, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' },
+      { t: insp, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' },
     ],
     parts: [
       { t: 0, mag: 0, magVisible: 1 },
-      { t: 1, mag: 0, magVisible: 1 },
+      { t: insp, mag: 0, magVisible: 1 },
     ],
     events: [{ t: 0.995 * insp, name: 'end' }],
   });
@@ -288,12 +292,12 @@ export function buildClips(nodes, def) {
       { t: 0, p: v3(0.05, -0.3, 0.14), r: v3(-0.85, 0.5, 0.55) },
       { t: 0.55 * drawT, p: v3(0.01, -0.03, 0.02), r: v3(-0.1, 0.06, 0.06), ease: 'out' },
       { t: 0.78 * drawT, p: v3(-0.004, 0.008, -0.006), r: v3(0.04, -0.02, -0.02) },
-      { t: 1, p: v3(0, 0, 0), r: v3(0, 0, 0), ease: 'out' },
+      { t: drawT, p: v3(0, 0, 0), r: v3(0, 0, 0), ease: 'out' },
     ],
     lhand: [
       { t: 0, p: v3(hgP[0] - 0.02, hgP[1] - 0.09, hgP[2] + 0.06), finger: wrapFinger, back: wrapBack, pose: 'open' },
       { t: 0.6 * drawT, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap', ease: 'out' },
-      { t: 1, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap' },
+      { t: drawT, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap' },
     ],
     parts: [{ t: 0, mag: 0, magVisible: 1 }],
     events: [{ t: 0.995 * drawT, name: 'end' }],
@@ -304,11 +308,11 @@ export function buildClips(nodes, def) {
     weapon: [
       { t: 0, p: v3(0, 0, 0), r: v3(0, 0, 0) },
       { t: 0.25 * holT, p: v3(0.004, 0.014, -0.01), r: v3(0.08, -0.04, -0.05) },
-      { t: 1, p: v3(0.05, -0.32, 0.15), r: v3(-0.9, 0.55, 0.6), ease: 'out' },
+      { t: holT, p: v3(0.05, -0.32, 0.15), r: v3(-0.9, 0.55, 0.6), ease: 'out' },
     ],
     lhand: [
       { t: 0, p: hgP, finger: wrapFinger, back: wrapBack, pose: 'wrap' },
-      { t: 1, p: v3(hgP[0] - 0.02, hgP[1] - 0.1, hgP[2] + 0.07), finger: wrapFinger, back: wrapBack, pose: 'open', ease: 'out' },
+      { t: holT, p: v3(hgP[0] - 0.02, hgP[1] - 0.1, hgP[2] + 0.07), finger: wrapFinger, back: wrapBack, pose: 'open', ease: 'out' },
     ],
     parts: [{ t: 0, mag: 0, magVisible: 1 }],
     events: [{ t: 0.995 * holT, name: 'end' }],
