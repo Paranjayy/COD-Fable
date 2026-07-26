@@ -108,7 +108,9 @@ export class RigidBody {
       // cylinder + two hemispheres, standard composite
       const mc = m * (h / (h + 1.3333 * r));
       const ms = m - mc;
-      const iyy = 0.5 * mc * r * r + 0.8 * ms * r * r;
+      // About the symmetry axis: cylinder 1/2 mc r^2, plus two hemispheres of
+      // *combined* mass ms => 2 * (2/5)(ms/2) r^2 = 0.4 ms r^2.
+      const iyy = 0.5 * mc * r * r + 0.4 * ms * r * r;
       const ixx =
         mc * (0.25 * r * r + h * h / 12) +
         ms * (0.4 * r * r + 0.375 * r * h + 0.25 * h * h);

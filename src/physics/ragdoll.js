@@ -11,9 +11,17 @@
  *
  * Constraints, applied in order every iteration:
  *   1. bone length      (hard distance, stiffness 1)
- *   2. cone limit       (swing of a bone relative to its parent)
- *   3. twist limit      (roll of a bone's reference frame, damped)
- *   4. world contact    (capsule vs static BVH + Coulomb friction)
+ *   2. parent socket    (limb root pinned to a point on the parent bone)
+ *   3. cone limit       (swing of a bone relative to its parent)
+ *   4. twist limit      (roll of a bone's reference frame, damped)
+ *   5. world contact    (Coulomb friction; the contact set itself is
+ *                        broadphased against the static BVH once per step)
+ *
+ * A limb root is only a shared particle when it lands on its parent's head or
+ * tail to the millimetre. Arms hang off the *side* of the chest and legs off the
+ * *side* of the pelvis, and a skeleton branch shares a particle with the first
+ * child only, so those roots get an explicit parent-attachment constraint
+ * instead (see `_solveAttach`).
  *
  * `ai` hands over a dead actor with createRagdoll()/adoptSkeleton() and we own
  * the bone transforms from that moment on.
@@ -73,6 +81,8 @@ export function humanoidSpec(height = 1.8, scaleMass = 82) {
 const MAX_PARTICLE_STEP = 0.35; // metres per fixed step, anti-explosion clamp
 const SLEEP_MOTION = 0.0022;
 const SLEEP_TIME = 0.6;
+/** Cached contact record: nx, ny, nz, segment parameter, plane offset. */
+const CT_STRIDE = 5;
 
 let _nextRagdollId = 1;
 
@@ -172,6 +182,15 @@ export class Ragdoll {
       this._initUp(i);
     }
 
+    this._buildAttachments();
+
+    // Contact set, gathered once per step and re-resolved every iteration.
+    this._ctStart = new Int32Array(nb);
+    this._ctCount = new Int32Array(nb);
+    this._ctFriction = new Float32Array(nb);
+    this._ctCap = nb * 8;
+    this._ct = new Float64Array(this._ctCap * CT_STRIDE);
+
     // skeleton binding (filled by adoptSkeleton)
     this.bones3D = null;
     this.boneBind = null;
@@ -214,6 +233,46 @@ export class Ragdoll {
       }
     }
     return Int32Array.from(pairs);
+  }
+
+  /**
+   * Find the limb roots that are *not* shared particles. The dedup key rounds to
+   * a millimetre, so a bone whose head sits anywhere other than exactly on its
+   * parent's head or tail gets its own particle and nothing else ties the two
+   * bones together: the arms, the legs and every second-or-later child of a
+   * skeleton branch. Each of those is recorded as a socket: the parameter along
+   * the parent bone it hangs from, plus the offset it hangs at in the bind pose.
+   */
+  _buildAttachments() {
+    const bone = [], param = [], len = [];
+    for (let i = 0; i < this.boneCount; i++) {
+      const p = this.boneParent[i];
+      if (p < 0) continue;
+      const x = this.boneHead[i];
+      if (x === this.boneHead[p] || x === this.boneTail[p]) continue;
+      const pa = this.boneHead[p], pc = this.boneTail[p];
+      const ex = this.px[pc] - this.px[pa];
+      const ey = this.py[pc] - this.py[pa];
+      const ez = this.pz[pc] - this.pz[pa];
+      const e2 = ex * ex + ey * ey + ez * ez;
+      let s = 0;
+      if (e2 > 1e-12) {
+        s = ((this.px[x] - this.px[pa]) * ex +
+             (this.py[x] - this.py[pa]) * ey +
+             (this.pz[x] - this.pz[pa]) * ez) / e2;
+        if (s < 0) s = 0; else if (s > 1) s = 1;
+      }
+      bone.push(i);
+      param.push(s);
+      len.push(Math.hypot(
+        this.px[x] - (this.px[pa] + ex * s),
+        this.py[x] - (this.py[pa] + ey * s),
+        this.pz[x] - (this.pz[pa] + ez * s)
+      ));
+    }
+    this.attachBone = Int32Array.from(bone);
+    this.attachParam = Float64Array.from(param);
+    this.attachLen = Float64Array.from(len);
   }
 
   _initUp(i) {
@@ -294,8 +353,13 @@ export class Ragdoll {
     }
 
     // --- Gauss-Seidel constraint solve ---
+    // Broadphase once: `overlapCapsule` is a BVH descent plus a segment-triangle
+    // test per candidate, and re-running it for all 15 bones on all 6 iterations
+    // costs 90 traversals per doll per step for a contact set that barely moves.
+    this._gatherContacts();
     for (let it = 0; it < this.iterations; it++) {
       this._solveDistance();
+      this._solveAttach();
       this._solveCones();
       this._solveContacts(it === this.iterations - 1);
     }
@@ -341,6 +405,49 @@ export class Ragdoll {
       this.px[c] -= dx * diff * wc;
       this.py[c] -= dy * diff * wc;
       this.pz[c] -= dz * diff * wc;
+    }
+  }
+
+  /**
+   * Socket constraint for limb roots that are not shared particles. Holds the
+   * child's head at its bind offset from a fixed point along the parent bone,
+   * mass-weighted exactly like `_solveDistance`. The parent point's inverse
+   * mass is the usual PBD segment blend (1-s)^2*wHead + s^2*wTail, and the
+   * correction is split back onto the two parent particles by (1-s) and s.
+   */
+  _solveAttach() {
+    const att = this.attachBone;
+    for (let k = 0; k < att.length; k++) {
+      const i = att[k];
+      const p = this.boneParent[i];
+      const x = this.boneHead[i];
+      const pa = this.boneHead[p], pc = this.boneTail[p];
+      const s = this.attachParam[k];
+      const u = 1 - s;
+      const wx = this.invMass[x];
+      const wa = this.invMass[pa], wc = this.invMass[pc];
+      const w = wx + u * u * wa + s * s * wc;
+      if (w === 0) continue;
+      const qx = this.px[pa] + (this.px[pc] - this.px[pa]) * s;
+      const qy = this.py[pa] + (this.py[pc] - this.py[pa]) * s;
+      const qz = this.pz[pa] + (this.pz[pc] - this.pz[pa]) * s;
+      const dx = this.px[x] - qx;
+      const dy = this.py[x] - qy;
+      const dz = this.pz[x] - qz;
+      const d = Math.hypot(dx, dy, dz);
+      if (d < 1e-9) continue;
+      const diff = (d - this.attachLen[k]) / d / w;
+      this.px[x] -= dx * diff * wx;
+      this.py[x] -= dy * diff * wx;
+      this.pz[x] -= dz * diff * wx;
+      const ka = diff * wa * u;
+      this.px[pa] += dx * ka;
+      this.py[pa] += dy * ka;
+      this.pz[pa] += dz * ka;
+      const kc = diff * wc * s;
+      this.px[pc] += dx * kc;
+      this.py[pc] += dy * kc;
+      this.pz[pc] += dz * kc;
     }
   }
 
@@ -419,28 +526,90 @@ export class Ragdoll {
     }
   }
 
-  /** Capsule bones vs the static world, with friction against the previous position. */
-  _solveContacts(applyFriction) {
+  /**
+   * Broadphase every bone against the static world once per step and cache the
+   * contact planes. Each record keeps the normal, the parameter along the bone
+   * where the contact sits, and `d0 = depth + P(s)·n` (the plane's offset), so
+   * the solver can re-derive the depth from the bone's *current* position
+   * without touching the BVH again.
+   */
+  _gatherContacts() {
     const w = this.world;
-    if (!w || w.triCount === 0) return;
+    const live = !!w && w.triCount > 0;
+    let k = 0;
     for (let i = 0; i < this.boneCount; i++) {
+      this._ctStart[i] = k;
+      this._ctCount[i] = 0;
+      this._ctFriction[i] = 0.7;
+      if (!live) continue;
       const a = this.boneHead[i], c = this.boneTail[i];
-      const r = this.boneRadius[i];
       const n = w.overlapCapsule(
         this.px[a], this.py[a], this.pz[a],
         this.px[c], this.py[c], this.pz[c],
-        r, this.mask, 0
+        this.boneRadius[i], this.mask, 0
       );
       if (n === 0) continue;
       const cts = w.contacts;
+      const ex = this.px[c] - this.px[a];
+      const ey = this.py[c] - this.py[a];
+      const ez = this.pz[c] - this.pz[a];
+      let count = 0;
+      for (let j = 0; j < n; j++) {
+        const d = cts.depth[j];
+        if (d <= 1e-5) continue;
+        if (k >= this._ctCap) this._growContacts();
+        const s = cts.s[j];
+        const nx = cts.nx[j], ny = cts.ny[j], nz = cts.nz[j];
+        const o = k * CT_STRIDE;
+        this._ct[o] = nx;
+        this._ct[o + 1] = ny;
+        this._ct[o + 2] = nz;
+        this._ct[o + 3] = s;
+        this._ct[o + 4] = d +
+          (this.px[a] + ex * s) * nx +
+          (this.py[a] + ey * s) * ny +
+          (this.pz[a] + ez * s) * nz;
+        k++;
+        count++;
+        const sp = SURFACE_PROPS[w.surface[cts.tri[j]]];
+        if (sp) this._ctFriction[i] = sp.friction;
+      }
+      this._ctCount[i] = count;
+    }
+  }
+
+  _growContacts() {
+    this._ctCap *= 2;
+    const next = new Float64Array(this._ctCap * CT_STRIDE);
+    next.set(this._ct);
+    this._ct = next;
+  }
+
+  /** Capsule bones vs the static world, with friction against the previous position. */
+  _solveContacts(applyFriction) {
+    for (let i = 0; i < this.boneCount; i++) {
+      const count = this._ctCount[i];
+      if (count === 0) continue;
+      const a = this.boneHead[i], c = this.boneTail[i];
+      const ex = this.px[c] - this.px[a];
+      const ey = this.py[c] - this.py[a];
+      const ez = this.pz[c] - this.pz[a];
       let pushx = 0, pushy = 0, pushz = 0;
-      let fric = 0.7;
+      const fric = this._ctFriction[i];
       let param = 0;
       let wsum = 0;
-      for (let k = 0; k < n; k++) {
-        const d = cts.depth[k];
+      const base = this._ctStart[i];
+      for (let j = 0; j < count; j++) {
+        const o = (base + j) * CT_STRIDE;
+        const nx = this._ct[o], ny = this._ct[o + 1], nz = this._ct[o + 2];
+        const s = this._ct[o + 3];
+        // Depth against the cached plane, re-measured at the bone's current pose.
+        const d = this._ct[o + 4] - (
+          (this.px[a] + ex * s) * nx +
+          (this.py[a] + ey * s) * ny +
+          (this.pz[a] + ez * s) * nz
+        );
         if (d <= 1e-5) continue;
-        const nx = cts.nx[k], ny = cts.ny[k], nz = cts.nz[k];
         // Accumulate the *maximum* push along each normal instead of the sum:
         // a tessellated floor would otherwise eject the bone into orbit.
         const already = pushx * nx + pushy * ny + pushz * nz;
@@ -450,10 +619,8 @@ export class Ragdoll {
           pushy += ny * extra;
           pushz += nz * extra;
         }
-        param += cts.s[k] * d;
+        param += s * d;
         wsum += d;
-        const sp = SURFACE_PROPS[w.surface[cts.tri[k]]];
-        if (sp) fric = sp.friction;
       }
       const pl = Math.hypot(pushx, pushy, pushz);
       if (pl < 1e-6) continue;

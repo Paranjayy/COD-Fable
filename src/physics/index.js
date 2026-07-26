@@ -27,8 +27,8 @@
  *   groundHeight(x, z, fromY?, mask?)      -> y of the floor, or -Infinity
  *
  *   Hit = { hit, point:Vector3, normal:Vector3, distance, surface:string,
- *           surfaceIndex, object, collider, body, ragdoll, actor, part,
- *           triangle, frontFace, fraction }
+ *           surfaceIndex, object, collider, body, ragdoll, boneIndex, actor,
+ *           part, triangle, frontFace, fraction }
  *   Records come from a 64-deep ring pool: read or copy now, never stash.
  *
  * CHARACTER  (player / ai)
@@ -79,7 +79,8 @@ import {
   surfaceIndex, surfaceName,
 } from './surfaces.js';
 import {
-  makeHitRecord, raySphere, rayCapsule, rayObb, closestPtSegSeg, makeClosest,
+  makeHitRecord, raySphere, rayCapsule, rayObb, capsuleExit, obbExit,
+  closestPtSegSeg, makeClosest,
 } from './math.js';
 
 const HIT_POOL = 64;
@@ -98,6 +99,7 @@ function makePublicHit() {
     collider: null,
     body: null,
     ragdoll: null,
+    boneIndex: -1,
     actor: null,
     part: null,
     triangle: -1,
@@ -166,6 +168,8 @@ class Collider {
 }
 
 const _v = new THREE.Vector3();
+const _n = new THREE.Vector3();
+const _ep = new THREE.Vector3();
 const _m4 = new THREE.Matrix4();
 const _m4i = new THREE.Matrix4();
 const _one = new THREE.Vector3(1, 1, 1);
@@ -398,6 +402,7 @@ export class PhysicsSystem {
     h.collider = null;
     h.body = null;
     h.ragdoll = null;
+    h.boneIndex = -1;
     h.actor = null;
     h.part = null;
     h.triangle = -1;
@@ -546,6 +551,12 @@ export class PhysicsSystem {
       out.body = b;
       out.collider = null;
       out.ragdoll = null;
+      out.boneIndex = -1;
+      // A nearer debris chunk owns the whole record: leaving an AI's actor/part
+      // behind would hand out free (and possibly headshot-multiplied) damage
+      // through cover.
+      out.actor = null;
+      out.part = null;
       out.triangle = -1;
     }
     return best;
@@ -582,6 +593,7 @@ export class PhysicsSystem {
         else out.normal.normalize();
         out.surfaceIndex = SURFACE.flesh;
         out.ragdoll = rd;
+        out.boneIndex = i;
         out.object = rd.actor;
         out.actor = rd.actor;
         out.part = rd.spec[i]?.name ?? null;
@@ -591,6 +603,108 @@ export class PhysicsSystem {
       }
     }
     return best;
+  }
+
+  /**
+   * How far a round entering at `hit.point` and travelling along (dx,dy,dz)
+   * stays inside the dynamic proxy it just struck, plus the outward normal of
+   * the face it leaves by (written into `outN`, a plain {x,y,z}).
+   *
+   * Hitbox colliders, ragdoll bones and debris are analytic convex volumes with
+   * no backface for `penetration.js` to find with a probe ray, so without this
+   * every one of them would be charged as a 1.8 cm sheet and a pistol round
+   * would sail through a queue of enemies at full damage. Returns 0 for level
+   * geometry, which is measured by probe ray as before.
+   */
+  shapeThickness(hit, dx, dy, dz, outN) {
+    const px = hit.point.x, py = hit.point.y, pz = hit.point.z;
+    const c = hit.collider;
+    if (c) {
+      if (c.shape === 'box') {
+        const t = obbExit(px, py, pz, dx, dy, dz, c.inverse.elements, c.hx, c.hy, c.hz);
+        if (t > 0) {
+          _ep.set(px + dx * t, py + dy * t, pz + dz * t);
+          // `_colliderNormal` faces the shooter; the exit face points the way.
+          this._colliderNormal(c, _ep, _n, dx, dy, dz);
+          outN.x = -_n.x; outN.y = -_n.y; outN.z = -_n.z;
+        }
+        return t;
+      }
+      const t = capsuleExit(
+        px, py, pz, dx, dy, dz, c.ax, c.ay, c.az, c.bx, c.by, c.bz, c.radius
+      );
+      if (t > 0) {
+        this._segmentExitNormal(
+          px + dx * t, py + dy * t, pz + dz * t,
+          c.ax, c.ay, c.az, c.bx, c.by, c.bz, dx, dy, dz, outN
+        );
+      }
+      return t;
+    }
+
+    const rd = hit.ragdoll;
+    if (rd && hit.boneIndex >= 0) {
+      const i = hit.boneIndex;
+      const a = rd.boneHead[i], b = rd.boneTail[i];
+      const t = capsuleExit(
+        px, py, pz, dx, dy, dz,
+        rd.px[a], rd.py[a], rd.pz[a],
+        rd.px[b], rd.py[b], rd.pz[b],
+        rd.boneRadius[i]
+      );
+      if (t > 0) {
+        this._segmentExitNormal(
+          px + dx * t, py + dy * t, pz + dz * t,
+          rd.px[a], rd.py[a], rd.pz[a], rd.px[b], rd.py[b], rd.pz[b],
+          dx, dy, dz, outN
+        );
+      }
+      return t;
+    }
+
+    const b = hit.body;
+    if (b) {
+      let t;
+      if (b.shape === 'sphere') {
+        t = capsuleExit(
+          px, py, pz, dx, dy, dz,
+          b.position.x, b.position.y, b.position.z,
+          b.position.x, b.position.y, b.position.z,
+          b.radius
+        );
+      } else {
+        _m4.compose(b.position, b.quaternion, _one);
+        _m4i.copy(_m4).invert();
+        t = b.shape === 'capsule'
+          ? obbExit(px, py, pz, dx, dy, dz, _m4i.elements, b.radius, b.halfHeight + b.radius, b.radius)
+          : obbExit(px, py, pz, dx, dy, dz, _m4i.elements, b.hx, b.hy, b.hz);
+      }
+      if (t > 0) {
+        // Radial, matching the entry-normal convention `_raycastBodies` uses.
+        let nx = px + dx * t - b.position.x;
+        let ny = py + dy * t - b.position.y;
+        let nz = pz + dz * t - b.position.z;
+        const l = Math.hypot(nx, ny, nz);
+        if (l < 1e-9 || nx * dx + ny * dy + nz * dz < 0) { nx = dx; ny = dy; nz = dz; }
+        else { nx /= l; ny /= l; nz /= l; }
+        outN.x = nx; outN.y = ny; outN.z = nz;
+      }
+      return t;
+    }
+
+    return 0;
+  }
+
+  /** Outward normal of a capsule at an exit point on its surface. */
+  _segmentExitNormal(ex, ey, ez, ax, ay, az, bx, by, bz, dx, dy, dz, outN) {
+    closestPtSegSeg(ex, ey, ez, ex, ey, ez, ax, ay, az, bx, by, bz, this._cl);
+    let nx = ex - this._cl.bx, ny = ey - this._cl.by, nz = ez - this._cl.bz;
+    const l = Math.hypot(nx, ny, nz);
+    if (l < 1e-9) { nx = dx; ny = dy; nz = dz; }
+    else { nx /= l; ny /= l; nz /= l; }
+    // An exit normal points the way the round is going, not back at the shooter.
+    if (nx * dx + ny * dy + nz * dz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    outN.x = nx; outN.y = ny; outN.z = nz;
   }
 
   /** Cheap occlusion test — statics only, no ordering, no record. */
