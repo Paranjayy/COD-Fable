@@ -9,6 +9,9 @@
  *   node tools/imagediff.mjs --a=shots/base --b=shots/opt [--tol=1] [--write-diff]
  *
  * tol is the per-channel 0-255 delta below which a pixel counts as unchanged.
+ *
+ * Exit code: 0 within epsilon, 1 when a shot changed or is missing on either
+ * side, 2 when there was nothing to compare at all.
  */
 import { PNG } from 'pngjs';
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
@@ -20,9 +23,36 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
 const A = resolve(args.a), B = resolve(args.b);
 const TOL = Number(args.tol ?? 0);
 
-const names = readdirSync(A).filter((f) => f.endsWith('.png')).sort();
+// `--write-diff` drops `<shot>.diff.png` into B, so those are excluded from
+// both listings, otherwise a second run would compare a diff against nothing.
+const shots = (dir) =>
+  (existsSync(dir) ? readdirSync(dir) : [])
+    .filter((f) => f.endsWith('.png') && !f.endsWith('.diff.png'))
+    .sort();
+
+const names = shots(A);
+const onlyInB = shots(B).filter((n) => !names.includes(n));
 const rows = [];
 let worst = null;
+
+// An empty comparison set is a broken run, not a pass: `every` on it is true,
+// so a baseline directory that exists but holds no shots (tools/baseline.mjs
+// creates the directory before capturing, and every shot can still fail) used
+// to certify any change as pixel-identical.
+if (names.length === 0 && onlyInB.length === 0) {
+  const why = !existsSync(A) ? `directory does not exist: ${A}`
+    : !existsSync(B) ? `directory does not exist: ${B}`
+    : `no .png shots found in ${A} or ${B}`;
+  console.log(JSON.stringify(
+    { a: A, b: B, tol: TOL, identical: false, withinEpsilon: false,
+      error: `nothing to compare: ${why}`, worst: null, rows: [] },
+    null, 2
+  ));
+  console.error(`imagediff: nothing to compare: ${why}`);
+  process.exit(2);
+}
+
+for (const n of onlyInB) rows.push({ shot: n, status: 'MISSING_IN_A' });
 
 for (const n of names) {
   const pb = join(B, n);

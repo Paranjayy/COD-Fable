@@ -3,15 +3,23 @@ import { el, setText, setStyle, clamp, Pool, mmss } from './util.js';
 const SPAN_DEG = 120; // degrees visible across the strip
 const STRIP_W = 470; // css px at k=1, must match .ow-compass width
 const PPD = STRIP_W / SPAN_DEG;
+/**
+ * Degrees of tape that must exist. `update` centres content degree `h + 360`
+ * under the caret, so the window is `[h + 300, h + 420]` and h runs up to
+ * 359.99. The tape therefore has to reach 780deg, or part of the strip right of
+ * the caret is blank for every heading above 295.
+ */
+const TAPE_DEG = 780;
 const CARD = { 0: 'N', 45: 'NE', 90: 'E', 135: 'SE', 180: 'S', 225: 'SW', 270: 'W', 315: 'NW' };
 
 /**
  * Heading strip, top centre.
  *
- * Ticks are laid out once across two full revolutions (0-720deg) with left
- * positions written as `calc(Npx * var(--k))`, so a resolution change re-scales
- * the whole strip with zero JS work. Only the strip's translateX is touched
- * per frame — one style write for 144 ticks.
+ * Ticks are laid out once across the full range the window can reach
+ * (0-780deg, see TAPE_DEG) with left positions written as
+ * `calc(Npx * var(--k))`, so a resolution change re-scales the whole strip with
+ * zero JS work. Only the strip's translateX is touched per frame: one style
+ * write for 157 ticks.
  */
 export class Compass {
   constructor(parent) {
@@ -20,7 +28,7 @@ export class Compass {
     el('div', 'ow-compass-base', this.root);
     el('div', 'ow-compass-caret', this.root);
 
-    for (let a = 0; a < 720; a += 5) {
+    for (let a = 0; a <= TAPE_DEG; a += 5) {
       const t = el('div', 'ow-tick' + (a % 15 === 0 ? ' maj' : ''), this.strip);
       t.style.left = `calc(${(a * PPD).toFixed(2)}px * var(--k))`;
       const c = CARD[a % 360];
@@ -29,7 +37,7 @@ export class Compass {
         l.style.left = `calc(${(a * PPD).toFixed(2)}px * var(--k))`;
       }
     }
-    setStyle(this.strip, 'width', `calc(${(720 * PPD).toFixed(0)}px * var(--k))`);
+    setStyle(this.strip, 'width', `calc(${(TAPE_DEG * PPD).toFixed(0)}px * var(--k))`);
 
     this.objPool = new Pool(
       5,

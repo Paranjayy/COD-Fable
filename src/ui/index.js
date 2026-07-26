@@ -134,6 +134,8 @@ export class UiSystem {
     this._lastKillAt = -10;
     this._regenTimer = 0;
     this._hadPointerLock = false;
+    this._lockSeq = ctx.input?.lockChanges ?? 0;
+    this._menuWasOpen = false;
     this._bakeFrame = 0;
 
     this._pos = new THREE.Vector3();
@@ -408,9 +410,25 @@ export class UiSystem {
     // ---- pause -----------------------------------------------------------
     if (ctx.input.enabled && !ctx.input.frozen) {
       if (ctx.input.actionPressed('pause')) this.menu.toggle();
-      // Losing pointer lock mid-match is the same intent as pressing Escape.
-      if (ctx.input.pointerLocked) this._hadPointerLock = true;
-      else if (this._hadPointerLock && !this.menu.open) {
+      // Losing pointer lock mid-match is the same intent as pressing Escape,
+      // but only for a lock that was actually ours. `menu.close()` asks for the
+      // lock back and that request is answered asynchronously, or refused
+      // outright when it lands inside the browser's post-exit cooldown, so
+      // `pointerLocked` still reads false on the frames right after Resume.
+      // Arming the latch straight off that flag re-showed the menu one frame
+      // after every resume. The latch is therefore armed only by an observed
+      // `pointerlockchange` that reported a lock, and dropped the moment the
+      // menu opens.
+      const seq = ctx.input.lockChanges ?? 0;
+      if (seq !== this._lockSeq) {
+        this._lockSeq = seq;
+        if (ctx.input.pointerLocked) this._hadPointerLock = true;
+      }
+      if (this.menu.open !== this._menuWasOpen) {
+        this._menuWasOpen = this.menu.open;
+        if (this.menu.open) this._hadPointerLock = false;
+      }
+      if (this._hadPointerLock && !this.menu.open && !ctx.input.pointerLocked) {
         this._hadPointerLock = false;
         this.menu.show();
       }
