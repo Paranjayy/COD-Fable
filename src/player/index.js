@@ -281,6 +281,16 @@ export class PlayerSystem {
     this._drainMovementEvents();
     this.health.update(dt);
 
+    // ---- grenade handling ----
+    if (this._grenadeCooldown > 0) this._grenadeCooldown -= dt;
+    const input = ctx.input;
+    if (this.controlEnabled && input && (input.actionPressed('grenade') || input.pressed('KeyG'))) {
+      if ((this._grenadeCooldown || 0) <= 0 && !this.health.dead) {
+        this._grenadeCooldown = 8.0;
+        this._throwGrenade(ctx);
+      }
+    }
+
     this.rig.update(dt, this.movement, this.health);
     if (this.controlEnabled) this.rig.applyTo(ctx.camera);
     else this.rig.forward.set(0, 0, -1).applyQuaternion(ctx.camera.quaternion);
@@ -299,6 +309,48 @@ export class PlayerSystem {
     const h = STANCE[m.stance].height;
     this.hitbox.setSegment(p.x, p.y + r, p.z, p.x, p.y + Math.max(r, h - r), p.z, r);
     this.hitbox.enabled = !this.health.dead;
+  }
+
+  _throwGrenade(ctx) {
+    const cam = ctx.camera;
+    const camDir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+    const spawnPos = cam.position.clone().addScaledVector(camDir, 0.8);
+    const throwVel = camDir.clone().multiplyScalar(18.0).add(new THREE.Vector3(0, 3.5, 0));
+    if (this.movement?.velocity) throwVel.add(this.movement.velocity);
+
+    ctx.peek('audio')?.play?.('grenade_warn');
+    ctx.peek('ui')?.spawnGrenade?.(spawnPos, 2.5);
+
+    const phys = this.physics;
+    let body = null;
+    let mesh = null;
+
+    if (phys?.spawnDebris) {
+      const geo = new THREE.IcosahedronGeometry(0.05, 1);
+      const mat = new THREE.MeshStandardMaterial({ color: 0x223322, roughness: 0.6, metalness: 0.8 });
+      mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(spawnPos);
+      ctx.scene.add(mesh);
+
+      body = phys.spawnDebris(spawnPos, throwVel, {
+        size: 0.05,
+        surface: 'metal',
+        mass: 0.4,
+        lifetime: 3.0,
+        restitution: 0.25,
+        object3D: mesh,
+      });
+    }
+
+    setTimeout(() => {
+      const detonatePos = body?.getPosition ? body.getPosition() : spawnPos.clone().addScaledVector(throwVel, 0.15);
+      if (mesh) mesh.removeFromParent();
+      if (body && phys?.removeRigidBody) phys.removeRigidBody(body);
+
+      ctx.events.emit('explosion', { position: detonatePos, radius: 8.5, damage: 220 });
+      this.addTrauma(0.85);
+      ctx.peek('audio')?.play?.('explosion');
+    }, 2500);
   }
 
   _updateAds(dt) {

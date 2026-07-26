@@ -7,6 +7,8 @@ import { WEAPON_DEFS, buildRecoilPattern, SPREAD_MODS } from './defs.js';
 import { buildRifle } from './models/rifle.js';
 import { buildSmg } from './models/smg.js';
 import { buildPistol } from './models/pistol.js';
+import { buildShotgun } from './models/shotgun.js';
+import { buildSniper } from './models/sniper.js';
 import { clamp, clamp01, lerp, damp, DEG } from './mathx.js';
 
 /**
@@ -146,9 +148,9 @@ export class WeaponSystem {
     this.viewmodel.onClipEvent = (name, clip) => this._onClipEvent(name, clip);
 
     const t0 = performance.now();
-    const builders = { rifle: buildRifle, smg: buildSmg, pistol: buildPistol };
+    const builders = { rifle: buildRifle, smg: buildSmg, pistol: buildPistol, shotgun: buildShotgun, sniper: buildSniper };
     let tris = 0;
-    for (const id of ['rifle', 'smg', 'pistol']) {
+    for (const id of ['rifle', 'smg', 'pistol', 'shotgun', 'sniper']) {
       const def = { ...WEAPON_DEFS[id] };
       def.cycleTime = 60 / def.rpm;
       const model = builders[id]();
@@ -386,18 +388,31 @@ export class WeaponSystem {
     // ---- projectile ----
     this.viewmodel.muzzleWorld(this._muzzle);
     const seed = this.rng.u32();
-    this.sim.spawn({
-      origin: this._muzzle,
-      dir: this._dir,
-      speed: def.muzzleVelocity,
-      damage: def.damage,
-      penetration: def.penetration,
-      dragK: def.dragK,
-      dropoff: def.dropoff,
-      maxRange: def.maxRange,
-      weapon: def,
-      tracer: this.stats.fired % def.tracerEvery === 0,
-    });
+    const pelletCount = def.pellets || 1;
+    for (let i = 0; i < pelletCount; i++) {
+      const pelletDir = this._dir.clone();
+      if (pelletCount > 1 || spreadRad > 1e-5) {
+        const d = this.rng.disc(this._disc ?? (this._disc = { x: 0, y: 0 }));
+        this._right.set(1, 0, 0).applyQuaternion(cam.quaternion);
+        this._up.set(0, 1, 0).applyQuaternion(cam.quaternion);
+        pelletDir
+          .addScaledVector(this._right, Math.tan(spreadRad) * d.x)
+          .addScaledVector(this._up, Math.tan(spreadRad) * d.y)
+          .normalize();
+      }
+      this.sim.spawn({
+        origin: this._muzzle,
+        dir: pelletDir,
+        speed: def.muzzleVelocity,
+        damage: def.damage,
+        penetration: def.penetration,
+        dragK: def.dragK,
+        dropoff: def.dropoff,
+        maxRange: def.maxRange,
+        weapon: def,
+        tracer: (this.stats.fired + i) % def.tracerEvery === 0,
+      });
+    }
 
     // ---- feedback ----
     this.viewmodel.addRecoil(pitch, yaw, first);
@@ -614,6 +629,8 @@ export class WeaponSystem {
       if (input.pressed('Digit1')) this.setWeapon('rifle');
       if (input.pressed('Digit2')) this.setWeapon('smg');
       if (input.pressed('Digit3')) this.setWeapon('pistol');
+      if (input.pressed('Digit4')) this.setWeapon('shotgun');
+      if (input.pressed('Digit5')) this.setWeapon('sniper');
       if (input.pressed('Tab')) this.nextWeapon();
       if (input.wheel) this.nextWeapon();
       this._runTrigger(dt, input.fire, input.firePressed, def, s);

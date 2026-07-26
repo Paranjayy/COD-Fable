@@ -134,9 +134,10 @@ export const WEAPON_MATERIALS = {
        *      in which the detail layer, the wear mask, the grime and the hue
        *      separation from the polymer can be seen at all.
        *
-       * The hue is unchanged: 0.285/0.302/0.349 is the same cool blue-grey ratio.
+       * With viewmodel light rig calibrated to physical world irradiance,
+       * the albedo is restored to true physical anodised aluminium linear reflectance (0.026-0.032).
        */
-      tint: c(0.285, 0.302, 0.349),
+      tint: c(0.82, 0.86, 0.98),
       /**
        * `roughness` is [scale, offset, minimum] against the surface's own ORM
        * green channel (see materials/shader.js), so raising the scale raises the

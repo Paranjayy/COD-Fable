@@ -438,20 +438,17 @@ export class RenderSystem {
       // source because the balance is a lighting decision, not an art one.
       practicalGain: 0.55,
       // Sky the viewmodel can actually see, past the shooter's own body.
-      viewFillOcclusion: 0.45,
-      // Viewmodel 3-point rig. The key is scaled off the scene's own light
-      // level (see _updateViewRig); fill, rim and hemisphere are ratios of it.
-      viewKeyScale: 0.55,
-      viewKeyMax: 2.6,
-      viewFillRatio: 0.3,
-      viewRimRatio: 0.5,
-      // 0.35 hemisphere against a ~2.2 daylight key, expressed as a ratio so it
-      // follows the time of day instead of blowing the gun out at night.
-      viewHemiRatio: 0.16,
-      // Warm ground bounce from below. Sized to lift the glove out of the
-      // handguard's cast shadow without competing with the key: at 0.34 of the
-      // key it is ~1.5 stops down, which is about what a sand street returns.
-      viewBounceRatio: 0.34,
+      viewFillOcclusion: 0.22,
+      // Viewmodel 3-point rig. Calibrated to match physical world irradiance:
+      // key is scaled off scene light level and normalized to physical albedo.
+      viewKeyScale: 0.18,
+      viewKeyMax: 0.85,
+      viewFillRatio: 0.18,
+      viewRimRatio: 0.22,
+      // 0.08 hemisphere ratio so the viewmodel irradiance matches world levels.
+      viewHemiRatio: 0.08,
+      // Warm ground bounce from below.
+      viewBounceRatio: 0.15,
       viewKeyGamma: 0.65,
       shadowStrength: 1.0,
       sunSoftness: 0.024,

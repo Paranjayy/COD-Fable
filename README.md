@@ -15,7 +15,8 @@ npm run dev          # http://127.0.0.1:5173
 ```
 
 Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
-R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
+R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, G throw frag grenade,
+Digits 1-5 switch weapon (1: M4A1, 2: MPX-9, 3: P-19, 4: M870 Shotgun, 5: Intervention Sniper), Esc release.
 
 ## What's in it
 

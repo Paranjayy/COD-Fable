@@ -190,14 +190,35 @@ export class UiSystem {
         );
       }
       if (e.killed) {
-        this._lastKillAt = ctx.time.elapsed;
+        const now = ctx.time.elapsed;
+        if (this._lastKillTime && (now - this._lastKillTime) < 3.8) {
+          this._multiKillCount = (this._multiKillCount || 1) + 1;
+        } else {
+          this._multiKillCount = 1;
+        }
+        this._lastKillTime = now;
+        this._lastKillAt = now;
+
+        let streakTitle = 'ENEMY ELIMINATED';
+        let xpText = e.headshot ? '+150 XP · HEADSHOT' : '+100 XP';
+        if (this._multiKillCount === 2) {
+          streakTitle = 'DOUBLE KILL!';
+          xpText = '+200 XP · MULTI-KILL';
+        } else if (this._multiKillCount === 3) {
+          streakTitle = 'TRIPLE KILL!';
+          xpText = '+300 XP · MULTI-KILL';
+        } else if (this._multiKillCount >= 4) {
+          streakTitle = 'MULTI KILL!';
+          xpText = '+500 XP · STREAK';
+        }
+
         this.killfeed.push({
           attacker: 'YOU',
           victim: e.target?.name ?? e.name ?? 'ENEMY',
           headshot: !!e.headshot,
           mine: true,
         });
-        this.banner.show('Enemy Eliminated', e.headshot ? '+150 XP · HEADSHOT' : '+100 XP');
+        this.banner.show(streakTitle, xpText);
         this.state.scoreUs++;
       }
     });
