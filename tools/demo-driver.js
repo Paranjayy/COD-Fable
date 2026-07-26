@@ -185,8 +185,8 @@
 
   function setHeld(codes) {
     const inp = E.input;
-    for (const c of codes) if (!held.has(c) && !inp.down.has(c)) inp._pendingDown.add(c);
-    for (const c of held) if (!codes.has(c)) inp._pendingUp.add(c);
+    for (const c of codes) if (!held.has(c) && !inp.down.has(c)) inp._queue(c, true);
+    for (const c of held) if (!codes.has(c)) inp._queue(c, false);
     held.clear();
     for (const c of codes) held.add(c);
   }

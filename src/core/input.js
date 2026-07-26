@@ -34,8 +34,16 @@ export class Input {
     this.down = new Set(); // codes currently held
     this._pressed = new Set(); // went down this frame
     this._released = new Set(); // went up this frame
-    this._pendingDown = new Set();
-    this._pendingUp = new Set();
+    /**
+     * Queued transitions in arrival order, as parallel arrays so recording one
+     * allocates no object. Order is the point: a release and a press for the same
+     * code can land in one frame (a fast tap, or blur queueing a release for a
+     * key that is still physically held) and draining all presses before all
+     * releases would let the release win. Since `_onKeyDown` filters `e.repeat`
+     * no further keydown ever arrives, so the key would stay stuck released.
+     */
+    this._pendingCodes = [];
+    this._pendingIsDown = [];
 
     /** Accumulated pointer delta for this frame, in radians after sensitivity. */
     this.look = { x: 0, y: 0 };
@@ -101,28 +109,34 @@ export class Input {
     }
   }
 
+  /** Record one transition, preserving the order it arrived in. */
+  _queue(code, isDown) {
+    this._pendingCodes.push(code);
+    this._pendingIsDown.push(isDown);
+  }
+
   _onKeyDown(e) {
     if (!this.enabled) return;
     if (e.repeat) return;
     // Let devtools/refresh through; swallow everything else the game binds.
     if (!e.metaKey && !e.ctrlKey) e.preventDefault();
-    this._pendingDown.add(e.code);
+    this._queue(e.code, true);
   }
 
   _onKeyUp(e) {
     if (!this.enabled) return;
-    this._pendingUp.add(e.code);
+    this._queue(e.code, false);
   }
 
   _onMouseDown(e) {
     if (!this.enabled) return;
     if (!this.pointerLocked && e.button === 0) this.requestPointerLock();
-    this._pendingDown.add(`Mouse${e.button}`);
+    this._queue(`Mouse${e.button}`, true);
   }
 
   _onMouseUp(e) {
     if (!this.enabled) return;
-    this._pendingUp.add(`Mouse${e.button}`);
+    this._queue(`Mouse${e.button}`, false);
   }
 
   _onMouseMove(e) {
@@ -144,7 +158,7 @@ export class Input {
 
   /** Losing focus must release every held key, or the player runs forever. */
   _onBlur() {
-    for (const code of this.down) this._pendingUp.add(code);
+    for (const code of this.down) this._queue(code, false);
     this._rawLook.x = 0;
     this._rawLook.y = 0;
   }
@@ -153,17 +167,21 @@ export class Input {
     this._pressed.clear();
     this._released.clear();
 
-    for (const code of this._pendingDown) {
-      if (!this.down.has(code)) {
-        this.down.add(code);
-        this._pressed.add(code);
+    const codes = this._pendingCodes;
+    const isDown = this._pendingIsDown;
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (isDown[i]) {
+        if (!this.down.has(code)) {
+          this.down.add(code);
+          this._pressed.add(code);
+        }
+      } else if (this.down.delete(code)) {
+        this._released.add(code);
       }
     }
-    for (const code of this._pendingUp) {
-      if (this.down.delete(code)) this._released.add(code);
-    }
-    this._pendingDown.clear();
-    this._pendingUp.clear();
+    codes.length = 0;
+    isDown.length = 0;
 
     const s = this.config.sensitivity;
     this.look.x = this.frozen ? 0 : this._rawLook.x * s;

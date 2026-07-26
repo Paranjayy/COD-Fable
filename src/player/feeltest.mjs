@@ -172,11 +172,12 @@ function runBench() {
 
   const input = eng.input;
   const DT = 1 / 60;
-  const dn = (c) => input._pendingDown.add(c);
-  const up = (c) => input._pendingUp.add(c);
+  const dn = (c) => input._queue(c, true);
+  const up = (c) => input._queue(c, false);
   const release = () => {
-    for (const c of [...input.down]) input._pendingUp.add(c);
-    input._pendingDown.clear();
+    input._pendingCodes.length = 0;
+    input._pendingIsDown.length = 0;
+    for (const c of [...input.down]) input._queue(c, false);
   };
   const step = (n = 1) => {
     for (let i = 0; i < n; i++) eng.step();

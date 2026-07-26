@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { Registry, EventBus } from './registry.js';
-import { FIXED_DT, MAX_SUBSTEPS } from './config.js';
+import { FIXED_DT, MAX_SUBSTEPS, MAX_FRAME_DT } from './config.js';
 import { Input } from './input.js';
 import { Rng } from './rng.js';
 
@@ -119,7 +119,7 @@ export class Engine {
   step(now = performance.now()) {
     const t = this.time;
     // Clamp so a tab-switch or a breakpoint doesn't teleport the simulation.
-    const rawDt = Math.min(0.1, Math.max(0, (now - this._last) / 1000));
+    const rawDt = Math.min(MAX_FRAME_DT, Math.max(0, (now - this._last) / 1000));
     this._last = now;
     t.raw += rawDt;
     t.dt = rawDt * t.scale;

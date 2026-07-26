@@ -22,6 +22,9 @@ export class Rng {
     this.s1 = next();
     this.s2 = next();
     this.s3 = next();
+    // The cached Box-Muller sample is part of the stream: leaving it behind
+    // would make a reseed hand out the previous seed's number first.
+    this._spare = undefined;
     return this;
   }
 

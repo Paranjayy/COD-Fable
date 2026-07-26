@@ -8,6 +8,10 @@ export const PHYSICS_HZ = 120;
 export const FIXED_DT = 1 / PHYSICS_HZ;
 /** Never simulate more than this many physics steps in one frame (spiral-of-death guard). */
 export const MAX_SUBSTEPS = 8;
+/** Longest frame delta the loop will believe, seconds. A tab-switch or a
+ *  breakpoint is clamped to this rather than teleporting the simulation.
+ *  Anything that sub-steps a raw frame dt must cover this whole range. */
+export const MAX_FRAME_DT = 0.1;
 
 /** Real-world units are metres, seconds, kilograms. */
 export const UNITS = {
@@ -95,9 +99,17 @@ export const DEFAULTS = {
 
 export function createConfig(overrides = {}) {
   const cfg = { ...DEFAULTS, ...overrides };
+  // `quality` arrives from the URL, so it can be anything. Spreading an unknown
+  // preset yields {} in silence and every renderer read becomes NaN.
+  // `Object.hasOwn`, not a truthiness test: `__proto__` and `toString` resolve
+  // truthy through the prototype chain.
+  if (!Object.hasOwn(QUALITY_PRESETS, cfg.quality)) {
+    console.warn(`[config] unknown quality preset "${cfg.quality}", using "${DEFAULTS.quality}"`);
+    cfg.quality = DEFAULTS.quality;
+  }
   cfg.q = { ...QUALITY_PRESETS[cfg.quality] };
   cfg.setQuality = (name) => {
-    if (!QUALITY_PRESETS[name]) throw new Error(`unknown quality preset "${name}"`);
+    if (!Object.hasOwn(QUALITY_PRESETS, name)) throw new Error(`unknown quality preset "${name}"`);
     cfg.quality = name;
     Object.assign(cfg.q, QUALITY_PRESETS[name]);
   };
