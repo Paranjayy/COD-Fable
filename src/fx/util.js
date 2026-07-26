@@ -44,9 +44,21 @@ const B = { tx: 0, ty: 0, tz: 0, bx: 0, by: 0, bz: 0 };
 
 /**
  * Random unit direction inside a cone of half-angle `spread` (radians) around
- * a unit axis. `power` > 1 biases toward the axis.
+ * an axis. `power` > 1 biases toward the axis.
+ *
+ * The axis is normalised here because the impact recipes build it as a blend of
+ * the reflected ray and the surface normal (`(V + n) * 0.5`, `V * 0.8 + n * 0.2`),
+ * which is unit length only for a head-on hit and shrinks to about 0.71-0.83 as
+ * the hit goes grazing. Un-normalised, the axis term carries |axis| into the
+ * caller's `V2.x * speed` while `basis()` normalises the tangent but not the
+ * bitangent, so oblique ejecta left at a fraction of the authored speed on a
+ * squashed, wider-than-asked-for cone.
  */
 export function cone(out, rng, ax, ay, az, spread, power = 1) {
+  const al = Math.hypot(ax, ay, az) || 1;
+  ax /= al;
+  ay /= al;
+  az /= al;
   basis(B, ax, ay, az);
   const u = Math.pow(rng.float(), power);
   const cosT = Math.cos(spread * u);

@@ -58,6 +58,18 @@ export const D = {
   TEAR: 15,
 };
 
+/**
+ * Decal tiles whose painter is drawn against gravity, and which therefore have
+ * to keep the world-up-projected tangent frame the decal projector builds.
+ *
+ * The blood tiles hang their runs and terminal beads off the bottom of the
+ * splat (-Y in tile space); rolling them randomly about the normal, which is
+ * what every other tile wants so a walked burst is not N copies of one sprite,
+ * points those runs sideways or straight up. The intent lives in the painter,
+ * so the exemption lives here rather than at each call site.
+ */
+export const D_GRAVITY_ALIGNED = new Set([D.BLOOD_A, D.BLOOD_B]);
+
 const ATLAS_COLS = 4;
 
 /* ========================================================================= */

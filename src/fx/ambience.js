@@ -204,7 +204,8 @@ export class Ambience {
     // On the first couple of frames fill the volume in one go so the air is
     // never visibly empty when a shot is captured.
     let n;
-    if (this._warm < 2) {
+    const warming = this._warm < 2;
+    if (warming) {
       this._warm++;
       n = this.moteCount;
     } else {
@@ -232,8 +233,10 @@ export class Ambience {
       s.size1 = s.size0;
       s.life = this.moteLife * rng.range(0.55, 1.45);
       // Spread the first fill through the lifetime so they do not all die at
-      // once and pulse the whole volume.
-      s.delay = this._warm <= 2 ? -rng.float() * s.life * 0.95 : -rng.float() * dt;
+      // once and pulse the whole volume. Every later mote is a replacement for
+      // one that just expired, so it is born at age 0 (minus a sub-frame jitter);
+      // pre-ageing those halves the steady-state population and pulses it.
+      s.delay = warming ? -rng.float() * s.life * 0.95 : -rng.float() * dt;
       s.drag = 0.22;
       s.gravity = -0.02;
       const b = bright * rng.range(0.35, 1.5);

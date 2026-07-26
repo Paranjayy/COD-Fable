@@ -24,6 +24,37 @@ const RAY_O = { x: 0, y: 0, z: 0 };
 const RAY_D = { x: 0, y: 0, z: 0 };
 
 /**
+ * Per-impact budget for the spark bounce trace, spent by {@link spark}.
+ *
+ * Every bounce leg is one closest-hit BVH walk on the main thread, and the leg
+ * it spawns is charged again: `metal()` asks for a dozen to eighteen of them per
+ * steel hit, so sustained automatic fire from several actors turns impact FX
+ * into a physics-query spike. The near budget is set above what a point-blank
+ * steel hit actually spends, so close impacts keep every bounce they had and
+ * only the pathological tail is clipped; the distance gate is what stops the
+ * paying, since a bounce 25 m out is a couple of pixels. A spark that cannot
+ * afford a trace still flies, arcs and fades, it just spawns no follow-up leg.
+ */
+const RAY_BUDGET_NEAR = 20;
+const RAY_BUDGET_MID = 6;
+/** Squared metres: full budget inside 10 m, reduced to 24 m, none beyond. */
+const RAY_NEAR_D2 = 100;
+const RAY_MID_D2 = 576;
+let rayBudget = 0;
+
+/** How many bounce traces this impact may spend, by distance from the camera. */
+function bounceBudget(fx, p) {
+  const m = fx.ctx?.camera?.matrixWorld?.elements;
+  if (!m) return RAY_BUDGET_NEAR;
+  const dx = m[12] - p.x;
+  const dy = m[13] - p.y;
+  const dz = m[14] - p.z;
+  const d2 = dx * dx + dy * dy + dz * dz;
+  if (d2 <= RAY_NEAR_D2) return RAY_BUDGET_NEAR;
+  return d2 <= RAY_MID_D2 ? RAY_BUDGET_MID : 0;
+}
+
+/**
  * One incandescent spark, authored the way a real one behaves.
  *
  *   - COLOUR is a blackbody ramp, 2500 K at birth down to 1200 K at death, so it
@@ -75,6 +106,8 @@ function spark(fx, x, y, z, dx, dy, dz, speed, o) {
   // enough predictor for a 0.2 s ballistic hop, and it costs one BVH walk.
   const ph = fx.physics;
   if (!ph?.raycast) return;
+  if (rayBudget <= 0) return;
+  rayBudget--;
   RAY_O.x = x; RAY_O.y = y; RAY_O.z = z;
   RAY_D.x = dx; RAY_D.y = dy - 0.35; RAY_D.z = dz;
   const l = Math.hypot(RAY_D.x, RAY_D.y, RAY_D.z) || 1;
@@ -932,5 +965,6 @@ export const IMPACTS = {
 
 /** Dispatch on surface name; unknown surfaces fall back to concrete. */
 export function spawnImpact(fx, point, normal, incident, surface, energy) {
+  rayBudget = bounceBudget(fx, point);
   (IMPACTS[surface] ?? IMPACTS.concrete)(fx, point, normal, incident, energy);
 }
