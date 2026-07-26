@@ -79,7 +79,13 @@ const SPAWNS = [
   [2.6, -32.0, 0, 'south street'],
   [-1.0, -39.0, 0, 'gate'],
   [10.5, 4.6, -Math.PI / 2, 'east alley'],
-  [-9.0, -10.2, Math.PI / 2, 'west alley'],
+  // Back down the alley from the palm at SET_PIECES.palms[6] (-9.0, -10.2): its
+  // trunk is a solid 0.38 m collision box, and standing on this point put the
+  // spawn (and the AI patrol waypoint that shares it) five metres up the tree.
+  // Far enough west that the palm's own planter scatter (+/-1.4 m) cannot reach
+  // it, still on the alley's open middle between W2 and W3, still looking out
+  // toward the street.
+  [-11.6, -9.5, Math.PI / 2, 'west alley'],
 ];
 
 export class WorldSystem {

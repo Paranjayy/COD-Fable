@@ -403,6 +403,8 @@ export class Assembler {
     this.collisionRoot.visible = false;
     root.add(this.collisionRoot);
     this.handles = [];
+    // kept so dispose() can hand the statics back before it frees their geometry
+    this.physics = physics ?? null;
     for (const [surface, acc] of this._collide) {
       if (acc.empty) continue;
       const geo = acc.build();
@@ -444,6 +446,19 @@ export class Assembler {
       if (!m.isInstancedMesh) m.geometry?.dispose();
       m.parent?.remove(m);
     }
+    /**
+     * Hand the collision proxies back to physics BEFORE freeing their geometry.
+     * The engine disposes systems in reverse registration order, so `world` goes
+     * first and `physics` still holds these meshes: dropping the buffers out
+     * from under a live staticWorld leaves it reading freed geometry until its
+     * own dispose() catches up.
+     */
+    if (this.physics) {
+      for (const h of this.handles ?? []) if (h >= 0) this.physics.removeStatic(h);
+      this.physics.rebuildStatic();
+    }
+    this.handles = [];
+    this.physics = null;
     for (const c of this.collisionRoot?.children ?? []) c.geometry?.dispose();
     this.meshes.length = 0;
     this.lodGroups.length = 0;
@@ -451,6 +466,8 @@ export class Assembler {
     this._protos.clear();
     this._static.clear();
     this._collide.clear();
+    // the materials system owns these, so drop the references without freeing
+    this._mats.clear();
   }
 }
 

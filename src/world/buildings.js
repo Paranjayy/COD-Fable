@@ -654,6 +654,10 @@ function buildInterior(A, rng, spec, info, t, groundH, upperH, floors) {
     const fh = f === 0 ? groundH - 0.13 : upperH;
     // partitions for this floor
     const plan = rooms[f] ?? rooms[rooms.length - 1] ?? null;
+    // Level-space copies of the partitions, for the furnishing pass: a furnish
+    // rect's edge is only somewhere you can hang a shelf if a wall actually
+    // stands on it.
+    const wallSegs = [];
     if (plan) {
       for (const wall of plan.walls) {
         const [ax, az, bx, bz, doorAt] = wall;
@@ -661,6 +665,7 @@ function buildInterior(A, rng, spec, info, t, groundH, upperH, floors) {
         const wz0 = z0 + az * id;
         const wx1 = x0 + bx * iw;
         const wz1 = z0 + bz * id;
+        wallSegs.push({ x0: wx0, z0: wz0, x1: wx1, z1: wz1 });
         const len = Math.hypot(wx1 - wx0, wz1 - wz0);
         const ry = Math.atan2(wx1 - wx0, wz1 - wz0) - Math.PI / 2;
         _e.set(0, ry, 0);
@@ -722,6 +727,13 @@ function buildInterior(A, rng, spec, info, t, groundH, upperH, floors) {
 
     // furnishing
     if (plan?.furnish) {
+      /**
+       * How far below the nominal ceiling line the first free air is. The slab
+       * overhead is 0.2 m (0.26 at the roof) and every enterable building hangs
+       * 0.16 m beams under everything but the roof, so anything dressed at the
+       * ceiling has to hang below this or it is inside solid concrete.
+       */
+      const soffit = f === floors - 1 ? 0.26 : 0.36;
       for (const r of plan.furnish) {
         furnishRoom(A, rng, {
           kind: r.kind,
@@ -733,6 +745,9 @@ function buildInterior(A, rng, spec, info, t, groundH, upperH, floors) {
           z1: z0 + r.z1 * id,
           y: fy,
           h: fh,
+          soffit,
+          walls: wallSegs,
+          plate: { x0, z0, x1: x0 + iw, z1: z0 + id },
           spec,
         });
       }
@@ -745,26 +760,37 @@ function buildInterior(A, rng, spec, info, t, groundH, upperH, floors) {
     const riw = rs.w - t * 2;
     const rid = rs.d - t * 2;
     const st = spec.stairFlights?.[spec.stairFlights.length - 1];
-    const px = rs.x - riw / 2 + (st?.x ?? 0.5) * riw;
-    const pz = rs.z - rid / 2 + (st?.z ?? 0.5) * rid + 3.6;
+    const pt = 0.22; // penthouse wall thickness
+    /**
+     * The penthouse has to ENCLOSE the roof stairwell, not stand beside it: its
+     * walls want solid slab all the way round the void and the last flight has
+     * to surface inside it. So when the roof slab is cut, take the box off the
+     * cut. The fixed box is kept as a fallback for a roofAccess building that
+     * never authored a hole at all.
+     */
+    const well = spec.stairHoles?.[floors] ?? null;
+    const px = well ? (well.x0 + well.x1) / 2 : rs.x - riw / 2 + (st?.x ?? 0.5) * riw;
+    const pz = well ? (well.z0 + well.z1) / 2 : rs.z - rid / 2 + (st?.z ?? 0.5) * rid + 3.6;
+    const pw = well ? well.x1 - well.x0 + pt * 2 : 2.4;
+    const pd = well ? well.z1 - well.z0 + pt * 2 : 2.6;
     const y = info.roofY;
     for (let side = 0; side < 4; side++) {
-      const pm = panelMatrix({ x: px, z: pz, w: 2.4, d: 2.6 }, side, y).clone();
+      const pm = panelMatrix({ x: px, z: pz, w: pw, d: pd }, side, y).clone();
       const holes = side === 2 ? [{ x: 0, y: 1.08, w: 1.05, h: 2.16 }] : [];
       facadeWall(A, pm, {
-        w: side === 0 || side === 2 ? 2.4 : 2.6,
+        w: side === 0 || side === 2 ? pw : pd,
         h: 2.5,
-        t: 0.22,
+        t: pt,
         key: spec.wallKey ?? 'plaster_cream',
         openings: holes,
         rng,
         warp: 0.015,
       });
     }
-    A.add('concrete', BOX(A), LL(IDENT, px, y + 2.6, pz, 0, 2.7, 0.2, 2.9), {
+    A.add('concrete', BOX(A), LL(IDENT, px, y + 2.6, pz, 0, pw + 0.3, 0.2, pd + 0.3), {
       masks: [0.5, 0.45, 0.2],
     });
-    A.box('concrete', px, y + 2.6, pz, 2.7, 0.2, 2.9);
+    A.box('concrete', px, y + 2.6, pz, pw + 0.3, 0.2, pd + 0.3);
   }
 }
 
