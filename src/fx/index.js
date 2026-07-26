@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { UNITS } from '../core/config.js';
-import { buildParticleAtlas, buildDecalAtlas, P, D } from './atlas.js';
+import { buildParticleAtlas, buildDecalAtlas, P, D, D_GRAVITY_ALIGNED } from './atlas.js';
 import { ParticleLayer, resetSpawn, disposeQuadSource } from './particles.js';
 import { DecalSystem } from './decals.js';
 import { HazeSystem } from './haze.js';
@@ -519,7 +519,13 @@ export class FxSystem {
     this._n.copy(normal);
     o.size = opts.size ?? 0.15;
     o.tile = opts.tile ?? 0;
-    o.roll = opts.roll ?? this.rng.float() * Math.PI * 2;
+    // A random roll about the normal is what stops a walked burst from being N
+    // copies of one sprite, but the gravity-aligned tiles are painted against
+    // the projector's world-up tangent and lose their meaning if it is spun.
+    // On a floor or a ceiling that tangent is arbitrary anyway (same 0.94 the
+    // projector uses to give up on world up), so those keep the random roll.
+    const held = D_GRAVITY_ALIGNED.has(o.tile) && Math.abs(this._n.y) <= 0.94;
+    o.roll = opts.roll ?? (held ? 0 : this.rng.float() * Math.PI * 2);
     o.life = opts.life ?? 60;
     o.fade = opts.fade ?? 0.72;
     o.opacity = opts.opacity ?? 1;
