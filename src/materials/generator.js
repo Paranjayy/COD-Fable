@@ -216,19 +216,27 @@ export class TextureForge {
     return rt;
   }
 
-  _material(key, glsl) {
+  /**
+   * `extraUniforms` lets a caller outside this subsystem bring its own inputs —
+   * lookup tables, palettes, calibration scalars — without this file having to
+   * know what they mean. Declared once when the program is first compiled; the
+   * values are refreshed per build in `build()`.
+   */
+  _material(key, glsl, extraUniforms) {
     let mat = this._programs.get(key);
     if (!mat) {
+      const uniforms = {
+        uSeed: { value: 0 },
+        uOutput: { value: 0 },
+        uTintA: { value: new THREE.Color(1, 1, 1) },
+        uTintB: { value: new THREE.Color(1, 1, 1) },
+        uParam: { value: new THREE.Vector4() },
+      };
+      for (const k in extraUniforms) uniforms[k] = { value: extraUniforms[k] };
       mat = new THREE.ShaderMaterial({
         vertexShader: VERT,
         fragmentShader: HEADER + NOISE_GLSL + RUST_HELPERS + glsl + FOOTER,
-        uniforms: {
-          uSeed: { value: 0 },
-          uOutput: { value: 0 },
-          uTintA: { value: new THREE.Color(1, 1, 1) },
-          uTintB: { value: new THREE.Color(1, 1, 1) },
-          uParam: { value: new THREE.Vector4() },
-        },
+        uniforms,
         depthTest: false,
         depthWrite: false,
       });
@@ -266,11 +274,17 @@ export class TextureForge {
     const prevAutoClear = r.autoClear;
     r.autoClear = false;
 
-    const mat = this._material(def.key, def.glsl);
+    const mat = this._material(def.key, def.glsl, def.uniforms);
     mat.uniforms.uSeed.value = def.seed ?? 0;
     if (def.tintA) mat.uniforms.uTintA.value.copy(def.tintA);
     if (def.tintB) mat.uniforms.uTintB.value.copy(def.tintB);
     if (def.param) mat.uniforms.uParam.value.copy(def.param);
+    // Refresh caller-supplied uniforms: the program is cached across builds, so
+    // a second bake of the same key with different values must not reuse the
+    // first bake's inputs.
+    for (const k in def.uniforms) {
+      if (mat.uniforms[k]) mat.uniforms[k].value = def.uniforms[k];
+    }
     this._mesh.material = mat;
 
     const albedoRT = this._target(size, { srgb: def.linearAlbedo !== true });
