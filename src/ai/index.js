@@ -48,7 +48,9 @@ import { GroundShadows } from './grounding.js';
 
 export class AiSystem {
   static id = 'ai';
-  static deps = ['physics', 'world'];
+  // `materials` was already guaranteed ahead of us transitively (world depends
+  // on it), but the camo bake asks it for a GPU surface now, so say so.
+  static deps = ['physics', 'world', 'materials'];
 
   async init(ctx) {
     this.ctx = ctx;
@@ -58,10 +60,21 @@ export class AiSystem {
     ctx.scene.add(this.root);
 
     const t0 = performance.now();
+    // The materials subsystem owns the GPU texture forge; ask for it at runtime
+    // rather than importing it (ARCHITECTURE rule 2). If it is unavailable the
+    // camo tiles bake on the CPU exactly as before.
+    let forge = null;
+    try {
+      const mats = ctx.get('materials');
+      if (typeof mats?.bakeSurface === 'function') forge = mats;
+    } catch {
+      forge = null;
+    }
     this.materials = new SoldierMaterials(this.rng.fork(), {
       size: 512,
       anisotropy: ctx.config.q.anisotropy ?? 8,
       camo: ['arid', 'woodland', 'urban'],
+      forge,
     });
     // Contact occlusion under every actor. Without it the cast shadow alone
     // leaves them hovering: see grounding.js.

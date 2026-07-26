@@ -22,6 +22,7 @@
  */
 
 import * as THREE from 'three';
+import { CAMO_GLSL, camoSobelStrength } from './camoglsl.js';
 
 /* ------------------------------------------------------------------ */
 /* Tileable value noise                                                */
@@ -525,6 +526,63 @@ export const RIM = { strength: 0.62, edge: 0.42, power: 1.9 };
 /* Public: the material set                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * TileNoise's two 4096-entry tables as 64x64 float textures, so the shader can
+ * reproduce `_h()` exactly instead of approximating it with a hash function.
+ * NearestFilter and no mips: these are lookup tables, not images.
+ */
+function camoNoiseTables(nz) {
+  const mk = (src) => {
+    const t = new THREE.DataTexture(
+      Float32Array.from(src), 64, 64, THREE.RedFormat, THREE.FloatType
+    );
+    t.minFilter = t.magFilter = THREE.NearestFilter;
+    t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+    t.generateMipmaps = false;
+    t.needsUpdate = true;
+    return t;
+  };
+  return { tab: mk(nz.tab), perm: mk(nz.perm) };
+}
+
+/** Evaluate one camo tile through the materials forge. */
+function bakeCamoGpu(forge, tables, name, cfg, B, pre, size) {
+  const set = forge.bakeSurface({
+    key: `ai-camo-${name}`,
+    glsl: CAMO_GLSL,
+    size,
+    seed: 0,
+    worldSize: 1,
+    relief: camoSobelStrength(size, 0.9),
+    uniforms: {
+      uAiTab: tables.tab,
+      uAiPerm: tables.perm,
+      uAiPale: new THREE.Vector3().fromArray(cfg.pale),
+      uAiBase: new THREE.Vector3().fromArray(cfg.base),
+      uAiMid: new THREE.Vector3().fromArray(cfg.mid),
+      uAiDark: new THREE.Vector3().fromArray(cfg.dark),
+      uAiOlive: new THREE.Vector3().fromArray(cfg.olive),
+      uAiCamo: new THREE.Vector2(cfg.macro, cfg.warp),
+      uAiBudget: new THREE.Vector4(B.mean, B.min, B.max, B.contrast),
+      uAiCal: new THREE.Vector2(B.sat, pre.mean),
+    },
+  });
+  return { albedo: set.albedo, orm: set.orm, normal: set.normal };
+}
+
+/** Push the coarse measurement through the same remap the shader applies. */
+function camoStatsFromMeasure(pre, B) {
+  const remap = (l) => Math.min(B.max, Math.max(B.min, B.mean + (l - pre.mean) * B.contrast));
+  return {
+    mean: remap(pre.mean),
+    sd: pre.sd * B.contrast,
+    min: remap(pre.min),
+    max: remap(pre.max),
+    was: pre.mean,
+    source: 'gpu',
+  };
+}
+
 export class SoldierMaterials {
   /**
    * @param rng   deterministic Rng
@@ -545,9 +603,31 @@ export class SoldierMaterials {
     // map actually is. A camo bake that is never measured drifts every time the
     // noise is touched, and the figure goes chalky without anybody noticing.
     this.camoStats = {};
+    // The three camo tiles were 688 ms of this constructor's 1168 ms. When a
+    // GPU forge is available they are evaluated as a fragment shader instead —
+    // same tables, same constants, see camoglsl.js. `opts.forge` is the
+    // materials subsystem, handed in at runtime by ai/index.js; without it this
+    // falls back to the CPU path unchanged, which is what selftest.mjs and any
+    // headless consumer still use.
+    const forge = opts.forge ?? null;
+    const camoTables = forge ? camoNoiseTables(nz) : null;
     for (const name of opts.camo ?? ['arid', 'woodland']) {
       const cfg = CAMO[name] ?? CAMO.arid;
-      const sample = makeCamoSampler(nz, cfg);
+      const B = budgetFor(cfg);
+      // Kept on the CPU deliberately: one scalar the shader needs before it can
+      // write any texel, for 3.5% of the cost. See camoglsl.js.
+      const pre = measureCamo(nz, cfg);
+
+      if (forge) {
+        this.sets[`camo_${name}`] = bakeCamoGpu(forge, camoTables, name, cfg, B, pre, size);
+        // The GPU path cannot accumulate per-texel statistics as it writes, so
+        // the reported spread comes from the same coarse grid the calibration
+        // used, remapped through the budget. Same numbers the remap targets.
+        this.camoStats[name] = camoStatsFromMeasure(pre, B);
+        continue;
+      }
+
+      const sample = makeCamoSampler(nz, cfg, B);
       let s = 0;
       let s2 = 0;
       let mn = Infinity;

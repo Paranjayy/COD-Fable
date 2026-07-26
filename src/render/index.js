@@ -2,6 +2,7 @@ import * as THREE from 'three';
 
 import { hdrTarget, blit } from './pass.js';
 import { CascadedShadowMaps } from './csm.js';
+import { StaticShadowProxy } from './shadowproxy.js';
 import { MaterialPatcher } from './materialpatch.js';
 import { GBuffer } from './prepass.js';
 import { Gtao } from './gtao.js';
@@ -193,6 +194,10 @@ export class RenderSystem {
       cascades: this.csm.cascades,
       quality: this.qLevel,
     });
+    /** Merges static casters so the cascades submit chunks, not 200 meshes. */
+    this.shadowProxy = new StaticShadowProxy();
+    /** Frame to bake on: late enough that the world and its dressing exist. */
+    this._proxyBakeFrame = 8;
 
     this.gbuffer = new GBuffer();
     this.gtao = q.gtao ? new Gtao() : null;
@@ -222,7 +227,46 @@ export class RenderSystem {
 
     // Always on: depthTexture/velocityTexture are part of the public contract
     // (soft particles, SSR, motion blur) even when our own effects are off.
+    // It also means every optional pass below can be switched off at RUNTIME
+    // without invalidating anything else in the frame.
     this.needsPrepass = true;
+
+    /**
+     * Live graphics settings.
+     *
+     * Everything here is switchable while the game is running. Before this
+     * existed the pause menu's preset buttons only rewrote `config.q` — nothing
+     * in the render system ever read it again after `init()`, so changing
+     * Ultra -> Low did precisely nothing and the only way to get a cheaper
+     * frame was to reload. `ui:quality` and `ui:setting` are now both honoured.
+     */
+    this.features = {
+      taa: !!q.taa,
+      gtao: !!q.gtao,
+      ssr: !!q.ssr,
+      contact: this.qLevel >= 1,
+      motionBlur: !!q.motionBlur,
+      dof: this.qLevel >= 1,
+      bloom: !!q.bloom,
+      shadows: true,
+      shadowProxy: true,
+      // Collapse multi-material objects to one draw call in the depth-only
+      // passes. Output-identical; exposed so it can be A/B'd against itself in
+      // a single session rather than across two builds.
+      mergeDepthDraws: true,
+    };
+    // Pass pool. Toggling an effect nulls the field the frame reads but keeps
+    // the object here, so switching it back on reuses the same targets instead
+    // of allocating a second set — and `resize()` keeps the pool sized even
+    // while a pass is off, so re-enabling it never binds a stale-resolution
+    // target.
+    this._taaPass = this.taa;
+    this._gtaoPass = this.gtao;
+    this._ssrPass = this.ssr;
+    this._contactPass = this.contact;
+    this._mbPass = this.motionBlur;
+    this._dofPass = this.dof;
+    this._bloomPass = this.bloom;
 
     this.hdrRt = null;
     this.viewRt = null;
@@ -470,6 +514,13 @@ export class RenderSystem {
     // the A/B switch the pixel gate was run through, and the escape hatch if a
     // subsystem ever ships geometry whose bounds lie about where it is.
     this._noCascadeCull = /[?&]owNoCascadeCull=1/.test(location.search);
+
+    // ---- depth-pass group collapse ----------------------------------------
+    // See `_collapseGroups`. Preallocated because this runs twice a frame.
+    this._groupSafe = new WeakMap();
+    this._collapsed = [];
+    this._collapsedMat = [];
+    this._nCollapsed = 0;
     this._visit = this._visit.bind(this);
     this._visitView = this._visitView.bind(this);
 
@@ -477,10 +528,157 @@ export class RenderSystem {
     const h = ctx.canvas.clientHeight || 1080;
     this.resize(w, h, ctx);
 
+    // The pause menu drives these; see `applyQuality` / `setFeature`.
+    ctx.events.on('ui:quality', (e) => this.applyQuality(e?.quality));
+    ctx.events.on('ui:setting', (e) => {
+      if (!e) return;
+      if (e.key === 'renderScale') this.setRenderScale(e.value);
+      else if (e.key in this.features) this.setFeature(e.key, e.value);
+    });
+
     console.info(
       `[render] WebGL2 · ${cfg.quality} · ${this.csm.cascades}x${this.csm.mapSize} CSM · ` +
         `taa:${!!this.taa} gtao:${!!this.gtao} ssr:${!!this.ssr} mb:${!!this.motionBlur}`
     );
+  }
+
+  // ==========================================================================
+  //  live graphics settings
+  // ==========================================================================
+
+  /**
+   * Build a pass on demand and size it to the current internal resolution.
+   * Passes are created lazily because a session that starts on Low must not pay
+   * the memory for SSR/TAA/GTAO targets it may never use.
+   */
+  _ensurePass(key, make) {
+    if (this[key]) return this[key];
+    const p = make();
+    p.setSize?.(this.screenSize.width, this.screenSize.height);
+    this[key] = p;
+    return p;
+  }
+
+  /**
+   * The FXAA path composites through an LDR intermediate; the TAA path does not
+   * and must not pay for a full-res RGBA8 target it never samples. Since TAA is
+   * now switchable at runtime, allocation has to follow `fxaa` rather than being
+   * decided once at resize — otherwise turning TAA off mid-session leaves
+   * `ldrRt` null and the composite dereferences it.
+   */
+  _syncLdrTarget() {
+    const want = !!this.fxaa;
+    if (want === !!this.ldrRt) return;
+    if (!want) {
+      this.ldrRt.dispose();
+      this.ldrRt = null;
+      return;
+    }
+    this.ldrRt = new THREE.WebGLRenderTarget(this.screenSize.width, this.screenSize.height, {
+      type: THREE.UnsignedByteType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+  }
+
+  /** Turn one effect on or off immediately. Returns the resolved state. */
+  setFeature(key, on) {
+    on = !!on;
+    if (!(key in this.features)) return false;
+    this.features[key] = on;
+
+    switch (key) {
+      case 'taa':
+        // FXAA replaces TAA when it is off, or nothing antialiases at all.
+        this.taa = on ? this._ensurePass('_taaPass', () => new Taa()) : null;
+        if (on) {
+          this.fxaa = null;
+        } else if (!this.fxaa) {
+          this.fxaa = createFxaa();
+          this.fxaa.uniforms.uTexel.value.set(1 / this.screenSize.width, 1 / this.screenSize.height);
+        }
+        this._syncLdrTarget();
+        this.taa?.reset();
+        break;
+      case 'gtao':
+        this.gtao = on ? this._ensurePass('_gtaoPass', () => new Gtao()) : null;
+        // Clear the AO the materials are still multiplying by.
+        if (!on) this.patcher.uniforms.owFeat.value.x = 0;
+        break;
+      case 'ssr':
+        this.ssr = on ? this._ensurePass('_ssrPass', () => new Ssr()) : null;
+        if (!on) this.patcher.uniforms.owFeat.value.z = 0;
+        break;
+      case 'contact':
+        this.contact = on ? this._ensurePass('_contactPass', () => new ContactShadows()) : null;
+        if (!on) this.patcher.uniforms.owFeat.value.y = 0;
+        break;
+      case 'motionBlur':
+        this.motionBlur = on ? this._ensurePass('_mbPass', () => new MotionBlur()) : null;
+        break;
+      case 'dof':
+        this.dof = on ? this._ensurePass('_dofPass', () => new DepthOfField()) : null;
+        break;
+      case 'bloom':
+        this.bloom = on ? this._ensurePass('_bloomPass', () => new Bloom(this.qLevel >= 2 ? 6 : 5)) : null;
+        break;
+      case 'shadows':
+        this.csm.enabled = on;
+        break;
+      case 'shadowProxy':
+        if (this.shadowProxy) this.shadowProxy.enabled = on;
+        break;
+      default:
+        break;
+    }
+    return on;
+  }
+
+  /**
+   * Internal render resolution as a fraction of the drawing buffer. The single
+   * biggest lever there is: every full-screen pass in the frame scales with it.
+   */
+  setRenderScale(v) {
+    const s = Math.max(0.4, Math.min(1, Number(v) || 1));
+    // Deliberately NOT short-circuited on `this.q.renderScale`: `this.q` IS
+    // `config.q`, and both `config.setQuality()` and the menu slider write the
+    // new value into it BEFORE this runs — so comparing against it always says
+    // "unchanged" and the targets never actually resize. `resize()` already
+    // early-outs when the pixel dimensions are genuinely the same, which is the
+    // guard that is actually true.
+    this.q.renderScale = s;
+    const c = this.ctx.canvas;
+    this.resize(c.clientWidth || innerWidth, c.clientHeight || innerHeight, this.ctx);
+    return s;
+  }
+
+  /** Apply a whole preset at runtime — what the menu's preset buttons do. */
+  applyQuality(name) {
+    const cfg = this.ctx?.config;
+    if (!cfg || !name) return;
+    if (cfg.quality !== name) {
+      try { cfg.setQuality(name); } catch { return; }
+    }
+    const q = cfg.q;
+    this.q = q;
+    this.qLevel = QUALITY_LEVEL[name] ?? this.qLevel;
+
+    this.setFeature('taa', q.taa);
+    this.setFeature('gtao', q.gtao);
+    this.setFeature('ssr', q.ssr);
+    this.setFeature('motionBlur', q.motionBlur);
+    this.setFeature('bloom', q.bloom);
+    this.setFeature('contact', this.qLevel >= 1);
+    this.setFeature('dof', this.qLevel >= 1);
+
+    // Shadow distance is free to retune; cascade COUNT is a shader permutation
+    // key (materialpatch bakes OW_CASCADES) so it stays fixed for the session.
+    if (q.shadowDistance) this.csm.maxDistance = q.shadowDistance;
+    this.setRenderScale(q.renderScale ?? 1);
+    this.ctx.events.emit('render:quality', { quality: name, features: { ...this.features } });
   }
 
   // ==========================================================================
@@ -898,25 +1096,18 @@ export class RenderSystem {
     // Only the no-TAA path composites through an LDR intermediate; with TAA on,
     // `fxaa` is null and this was a full-resolution RGBA8 target (13 MB at 3.34
     // MP) allocated on every resize and never sampled once.
-    this.ldrRt?.dispose();
-    this.ldrRt = null;
-    if (this.fxaa) this.ldrRt = new THREE.WebGLRenderTarget(rw, rh, {
-      type: THREE.UnsignedByteType,
-      format: THREE.RGBAFormat,
-      minFilter: THREE.LinearFilter,
-      magFilter: THREE.LinearFilter,
-      depthBuffer: false,
-      stencilBuffer: false,
-    });
+    this._syncLdrTarget();
 
     this.gbuffer.setSize(rw, rh);
-    this.gtao?.setSize(rw, rh);
-    this.contact?.setSize(rw, rh);
-    this.ssr?.setSize(rw, rh);
-    this.taa?.setSize(rw, rh);
-    this.motionBlur?.setSize(rw, rh);
-    this.dof?.setSize(rw, rh);
-    this.bloom?.setSize(rw, rh);
+    // Size the POOL, not the active fields: an effect switched off in the menu
+    // still has to come back at the right resolution.
+    this._gtaoPass?.setSize(rw, rh);
+    this._contactPass?.setSize(rw, rh);
+    this._ssrPass?.setSize(rw, rh);
+    this._taaPass?.setSize(rw, rh);
+    this._mbPass?.setSize(rw, rh);
+    this._dofPass?.setSize(rw, rh);
+    this._bloomPass?.setSize(rw, rh);
 
     this.patcher.setScreenSize(rw, rh);
     this.viewComposite.uniforms.uTexel.value.set(1 / rw, 1 / rh);
@@ -973,6 +1164,71 @@ export class RenderSystem {
     this._nDirLights = 0;
     this._foreignMeshes = 0;
     scene.traverseVisible(this._visit);
+  }
+
+  /**
+   * Do this geometry's groups tile the whole index buffer, contiguously and
+   * without gaps or overlap? Cached per geometry — the answer never changes.
+   *
+   * If they do, drawing the buffer ungrouped rasterises exactly the same
+   * triangles. If they do not, the grouped path was deliberately skipping
+   * something and collapsing would draw triangles that should not be there.
+   */
+  _groupsTileFully(geo) {
+    const cached = this._groupSafe.get(geo);
+    if (cached !== undefined) return cached;
+    const total = geo.index ? geo.index.count : (geo.attributes.position?.count ?? 0);
+    const groups = geo.groups;
+    let ok = false;
+    if (groups && groups.length && total > 0) {
+      const sorted = [...groups].sort((a, b) => a.start - b.start);
+      ok = true;
+      let cursor = 0;
+      for (const g of sorted) {
+        if (g.start !== cursor) { ok = false; break; }
+        cursor += g.count;
+      }
+      if (ok && cursor !== total) ok = false;
+    }
+    this._groupSafe.set(geo, ok);
+    return ok;
+  }
+
+  /**
+   * Collapse multi-material objects to a single material for a depth-only pass.
+   *
+   * The cascades and the prepass both bind ONE `scene.overrideMaterial`, so
+   * every group of a multi-material object draws with the identical program —
+   * but three still emits one draw call per group, because the split is decided
+   * by `Array.isArray(object.material)` when the render list is built, long
+   * before the override is applied.
+   *
+   * MEASURED: the AI soldiers carry nine material groups each and accounted for
+   * 189 of the cascade pass's 219 draw calls. Handing three a single material
+   * for the duration of the pass submits the whole index buffer in one call, for
+   * bit-identical depth.
+   */
+  _collapseGroups(list, n) {
+    this._nCollapsed = 0;
+    if (!this.features.mergeDepthDraws) return;
+    for (let i = 0; i < n; i++) {
+      const o = list[i];
+      const m = o.material;
+      if (!Array.isArray(m) || m.length < 2 || !o.geometry) continue;
+      if (!this._groupsTileFully(o.geometry)) continue;
+      this._collapsed[this._nCollapsed] = o;
+      this._collapsedMat[this._nCollapsed] = m;
+      this._nCollapsed++;
+      o.material = m[0];
+    }
+  }
+
+  _restoreGroups() {
+    for (let i = 0; i < this._nCollapsed; i++) {
+      this._collapsed[i].material = this._collapsedMat[i];
+      this._collapsedMat[i] = null;
+    }
+    this._nCollapsed = 0;
   }
 
   _hideList(list, n) {
@@ -1313,7 +1569,28 @@ export class RenderSystem {
       scene.background = null;
       this._hideList(this._hide, this._nHide);
       this._hideList(this._noShadow, this._nNoShadow);
-      this.csm.render(renderer, scene, this._noCascadeCull ? null : this._draw, this._nDraw);
+      this._collapseGroups(this._draw, this._nDraw);
+
+      // Bake the static casters once the world exists, then submit merged
+      // chunks instead of every individual mesh. Same triangles, same depths —
+      // this is a draw-call optimisation, not a quality one. See shadowproxy.js.
+      if (this.shadowProxy && !this._noCascadeCull) {
+        if (this.frame === this._proxyBakeFrame) {
+          this.shadowProxy.attach(scene);
+          this.shadowProxy.build(this._draw, this._nDraw, this._noShadow, this._nNoShadow);
+        }
+        const swap = this.shadowProxy.begin(this._draw, this._nDraw);
+        if (swap) {
+          this.csm.render(renderer, scene, swap.list, swap.n);
+          this.shadowProxy.end();
+        } else {
+          this.csm.render(renderer, scene, this._draw, this._nDraw);
+        }
+      } else {
+        this.csm.render(renderer, scene, this._noCascadeCull ? null : this._draw, this._nDraw);
+      }
+
+      this._restoreGroups();
       this._showList(this._noShadow, this._nNoShadow);
       this._showList(this._hide, this._nHide);
       scene.background = bg;
@@ -1330,7 +1607,10 @@ export class RenderSystem {
     if (this.needsPrepass) {
       scene.background = null;
       this._hideList(this._hide, this._nHide);
+      // Same single-override-material argument as the cascades above.
+      this._collapseGroups(this._draw, this._nDraw);
       gb.render(renderer, scene, camera, this._currVP, this._prevVP, true);
+      this._restoreGroups();
       this._showList(this._hide, this._nHide);
       scene.background = bg;
     }

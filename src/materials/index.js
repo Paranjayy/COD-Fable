@@ -154,6 +154,30 @@ export class MaterialSystem {
   }
 
   /**
+   * Bake one surface set straight off a caller-supplied `owSurface()` shader.
+   *
+   * This is the cross-subsystem entry point: `ai` generates its character cloth
+   * on the CPU, which cost 688 ms of the boot for the three camo patterns alone,
+   * and the machinery to do it on the GPU already lives here. Rather than have
+   * another subsystem import this module (ARCHITECTURE forbids it) or stand up a
+   * second forge, it asks for a bake at runtime via `ctx.get('materials')`.
+   *
+   * `def.uniforms` is passed through untouched — the caller owns their meaning.
+   * Returns the same `{ albedo, orm, normal, size, worldSize }` as the library
+   * bakes; the textures are owned by this system and freed with it.
+   */
+  bakeSurface(def) {
+    if (!this._forge) throw new Error('[materials] forge not ready');
+    this._idle = 0;
+    this._scratchFreed = false;
+    const t0 = performance.now();
+    const set = this._forge.build(def);
+    const ms = performance.now() - t0;
+    if (ms > 40) console.info(`[materials] bake ${def.key} ${def.size}px ${ms.toFixed(0)}ms`);
+    return set;
+  }
+
+  /**
    * Every bake happens while the level is loading, but the half-float scratch
    * height targets the Sobel pass reads were being held for the whole session
    * (~10.5 MB of VRAM for 1K/512/256). Release them once the bake burst has

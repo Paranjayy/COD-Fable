@@ -3,6 +3,21 @@ import { el, setText, setStyle, clamp, damp, ease } from './util.js';
 const PRESETS = ['low', 'medium', 'high', 'ultra'];
 
 /**
+ * Effects the player can switch off individually, cheapest-to-restore first.
+ * The key is the render system's `features` key — see RenderSystem.setFeature.
+ */
+const EFFECTS = [
+  ['motionBlur', 'Motion Blur'],
+  ['ssr', 'Screen Space Reflections'],
+  ['gtao', 'Ambient Occlusion'],
+  ['contact', 'Contact Shadows'],
+  ['bloom', 'Bloom'],
+  ['dof', 'ADS Depth Of Field'],
+  ['taa', 'Temporal AA'],
+  ['shadows', 'Sun Shadows'],
+];
+
+/**
  * Pause / settings menu.
  *
  * Wired straight into `ctx.config`: the quality segments call
@@ -55,6 +70,33 @@ export class PauseMenu {
       this.ctx.events.emit('ui:fov', { value: v });
       return String(v | 0);
     });
+
+    // ---- render scale ----------------------------------------------------
+    // The single biggest performance lever: every full-screen pass in the frame
+    // scales with it. 100% is native (already capped at 1.5x device pixels).
+    this.scale = this._slider('Resolution Scale', 50, 100, 5, (v) => {
+      const s = v / 100;
+      this.ctx.config.q.renderScale = s;
+      this.ctx.events.emit('ui:setting', { key: 'renderScale', value: s });
+      return `${v | 0}%`;
+    });
+
+    // ---- individual effect toggles ---------------------------------------
+    // A preset is a blunt instrument; these are what you actually reach for
+    // when one effect is the thing costing you the frame.
+    this.fxBtns = [];
+    for (const [key, label] of EFFECTS) {
+      const row = this._row(label);
+      const seg = el('div', 'ow-seg', row);
+      const pair = [];
+      for (const [text, val] of [['off', false], ['on', true]]) {
+        const b = el('button', null, seg, text);
+        b.type = 'button';
+        b.addEventListener('click', () => this.setFeature(key, val));
+        pair.push([b, val]);
+      }
+      this.fxBtns.push([key, pair]);
+    }
 
     // ---- invert look -----------------------------------------------------
     const invRow = this._row('Invert Look');
@@ -142,6 +184,12 @@ export class PauseMenu {
     this.syncFromConfig();
   }
 
+  /** Flip one effect. The render system owns the actual state. */
+  setFeature(key, value) {
+    this.ctx.events.emit('ui:setting', { key, value });
+    this.syncFromConfig();
+  }
+
   syncFromConfig() {
     const cfg = this.ctx.config;
     for (let i = 0; i < this.qBtns.length; i++)
@@ -149,6 +197,14 @@ export class PauseMenu {
     for (const [b, v] of this.invBtns) b.classList.toggle('on', !!cfg.invertY === v);
     this.sens?.set((cfg.sensitivity ?? 0.0022) / 0.0022);
     this.fov?.set(cfg.fov ?? 80);
+    this.scale?.set(Math.round((cfg.q?.renderScale ?? 1) * 100));
+    // Read the effect states back off the render system so the buttons show
+    // what is actually running, not what the preset nominally asked for.
+    const feats = this.ctx.peek?.('render')?.features;
+    if (feats) {
+      for (const [key, pair] of this.fxBtns)
+        for (const [b, v] of pair) b.classList.toggle('on', !!feats[key] === v);
+    }
   }
 
   toggle() {
