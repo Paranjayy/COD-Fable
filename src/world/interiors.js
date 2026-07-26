@@ -81,9 +81,12 @@ export function furnishRoom(A, rng, r) {
   dressWalls(A, rng, r);
   dressCeiling(A, rng, r);
 
-  // hanging bulb, roughly central, offset so it isn't dead centre
+  // Hanging bulb, roughly central, offset so it isn't dead centre. The rose has
+  // to sit on the SOFFIT, not on the nominal ceiling line: the slab and its
+  // beams hang below that line, and a rose at y + h - 0.05 was buried in them
+  // along with the top of its own flex.
   if (kind !== 'ruin' || rng.float() < 0.5) {
-    hangingBulb(A, rng, cx + rng.range(-0.8, 0.8), y + h - 0.05, cz + rng.range(-0.8, 0.8), rng);
+    hangingBulb(A, rng, cx + rng.range(-0.8, 0.8), y + h - (r.soffit ?? 0.36), cz + rng.range(-0.8, 0.8), rng);
   }
 }
 
@@ -109,6 +112,7 @@ export function furnishRoom(A, rng, r) {
  */
 function dressWalls(A, rng, r) {
   const { x0, z0, x1, z1, y, h, kind } = r;
+  const soffit = r.soffit ?? 0.36;
   const sides = [
     { px: (x0 + x1) / 2, pz: z0, tx: 1, tz: 0, nx: 0, nz: 1, len: x1 - x0, yaw: 0 },
     { px: x1, pz: (z0 + z1) / 2, tx: 0, tz: 1, nx: -1, nz: 0, len: z1 - z0, yaw: Math.PI / 2 },
@@ -121,7 +125,21 @@ function dressWalls(A, rng, r) {
   for (let side = 0; side < 4; side++) {
     const s = sides[side];
     if (s.len < 1.6) continue;
-    const half = s.len / 2 - 0.35;
+    /**
+     * The furnish rects and the authored `walls` are two independent sets of
+     * numbers, so a rect edge is not necessarily masonry. E1's ground-floor shop
+     * stops at x=0.62 where the partition on that line only runs z 0..0.42, the
+     * floor above has no partition there at all, and E3's ground floor stops its
+     * only partition at z=0.7. Dressing those edges hung shelves, conduit,
+     * junction boxes and cloth in mid-air. Take the span that is genuinely
+     * backed and work inside it, or skip the side when nothing backs it.
+     */
+    const backed = backedSpan(r, s, side);
+    if (!backed) continue;
+    const bLen = backed[1] - backed[0];
+    if (bLen < 1.6) continue;
+    const mid = (backed[0] + backed[1]) / 2;
+    const half = bLen / 2 - 0.35;
     /**
      * The building's street side is a shopfront: a 3 m hole, not a wall. Any
      * shelf, conduit run or leaning sheet placed on it hangs in mid-air across
@@ -136,8 +154,8 @@ function dressWalls(A, rng, r) {
      * outer 30% of its length, which is pier in every bay layout here.
      */
     const pierT = () =>
-      (rng.float() < 0.5 ? -1 : 1) * rng.range(half * 0.62, half) ;
-    const anyT = () => rng.range(-half, half);
+      mid + (rng.float() < 0.5 ? -1 : 1) * rng.range(half * 0.62, half);
+    const anyT = () => mid + rng.range(-half, half);
     const wallT = isOpening ? pierT : anyT;
 
     // ---- surface conduit: two drops and a run under the ceiling ----------
@@ -147,11 +165,13 @@ function dressWalls(A, rng, r) {
         fillMasks(g, 0.35, 0.5, 0.1);
         return g;
       });
-      const runY = y + h - rng.range(0.18, 0.4);
-      const t0 = isOpening ? wallT() : rng.range(-half, 0);
+      // Measured from the soffit, not from the nominal ceiling line: the top of
+      // the old range ran the pipe up inside the slab.
+      const runY = y + h - soffit - rng.range(0.14, 0.36);
+      const t0 = isOpening ? wallT() : mid + rng.range(-half, 0);
       const t1 = isOpening
-        ? t0 + Math.sign(-t0 || 1) * rng.range(0.3, 0.55)
-        : t0 + rng.range(0.8, Math.max(1.0, half - t0));
+        ? t0 + Math.sign(mid - t0 || 1) * rng.range(0.3, 0.55)
+        : t0 + rng.range(0.8, Math.max(1.0, mid + half - t0));
       const [rx0, rz0] = at(s, (t0 + t1) / 2, 0.045);
       A.add(
         'metal_dark',
@@ -179,10 +199,10 @@ function dressWalls(A, rng, r) {
     // ---- a plank shelf on two brackets, with goods --------------------------
     if (kind !== 'ruin' && rng.float() < 0.55) {
       const sy = y + rng.range(1.05, 1.65);
-      const sLen = Math.min(rng.range(isOpening ? 0.6 : 0.9, isOpening ? 1.0 : 1.8), s.len - 0.6);
+      const sLen = Math.min(rng.range(isOpening ? 0.6 : 0.9, isOpening ? 1.0 : 1.8), bLen - 0.6);
       const st = isOpening
         ? wallT()
-        : rng.range(-half + sLen / 2, half - sLen / 2);
+        : mid + rng.range(-half + sLen / 2, half - sLen / 2);
       const [sx, sz] = at(s, st, 0.15);
       A.add('wood_prop_dark', BOX(A), LL(IDENT, sx, sy, sz, s.yaw, sLen, 0.035, 0.28), {
         masks: [0.85, 0.5, 0.15],
@@ -210,7 +230,7 @@ function dressWalls(A, rng, r) {
     // ---- something leaning on it -------------------------------------------
     if (!isOpening && rng.float() < 0.5) {
       const lean = rng.range(0.13, 0.22);
-      const lt = rng.range(-half, half);
+      const lt = mid + rng.range(-half, half);
       const lh = rng.range(1.1, 1.8);
       const lw = rng.range(0.5, 1.0);
       const off = 0.06 + (Math.sin(lean) * lh) / 2;
@@ -232,7 +252,7 @@ function dressWalls(A, rng, r) {
     // ---- objects standing against the skirting ------------------------------
     const nBase = rng.int(2, 5);
     for (let i = 0; i < nBase; i++) {
-      const bt = rng.range(-half, half);
+      const bt = mid + rng.range(-half, half);
       const [bx, bz] = at(s, bt, rng.range(0.18, 0.42));
       A.put(
         rng.pick([
@@ -258,9 +278,9 @@ function dressWalls(A, rng, r) {
     // ---- swept dust and plaster fall in the junction ------------------------
     // A wall does not meet a floor on a line. Three flat lobes straddling the
     // join plus a handful of chips is the cheapest thing that grounds a room.
-    const nWedge = Math.max(2, Math.round(s.len / 1.5));
+    const nWedge = Math.max(2, Math.round(bLen / 1.5));
     for (let i = 0; i < nWedge; i++) {
-      const wt = ((i + rng.range(0.2, 0.8)) / nWedge - 0.5) * s.len;
+      const wt = backed[0] + ((i + rng.range(0.2, 0.8)) / nWedge) * bLen;
       const [wx, wz] = at(s, wt, rng.range(0.05, 0.3));
       const g = patchGeometry(rng, rng.range(0.3, 0.75), { lobes: 9, wobble: 0.55 });
       A.addOnce('dirt', g, LL(IDENT, wx, y + 0.011, wz, rng.float() * 6.28, 1, 1, rng.range(0.35, 0.6)), {
@@ -310,6 +330,49 @@ function insert(xz, y) {
 }
 
 /**
+ * The stretch of one furnish-rect edge that a real wall stands on, expressed in
+ * the side's own tangent parameter `t` (the same `t` the dressing places props
+ * along), or null when nothing backs it at all.
+ *
+ * Two things can back an edge: the building's own shell, when the edge sits on
+ * the floor plate, or one of the authored partitions. Where two partitions both
+ * touch the edge we take the longer overlap rather than their hull, so a pair of
+ * stubs with a doorway between them never claims the gap.
+ */
+function backedSpan(r, s, side) {
+  const eps = 0.06;
+  const alongX = side === 0 || side === 2;
+  const line = alongX ? (side === 0 ? r.z0 : r.z1) : side === 1 ? r.x1 : r.x0;
+  const a0 = alongX ? Math.min(r.x0, r.x1) : Math.min(r.z0, r.z1);
+  const a1 = alongX ? Math.max(r.x0, r.x1) : Math.max(r.z0, r.z1);
+  let lo = 0;
+  let hi = -1;
+  const p = r.plate;
+  const edge = p ? (alongX ? (side === 0 ? p.z0 : p.z1) : side === 1 ? p.x1 : p.x0) : null;
+  if (edge === null || Math.abs(line - edge) < eps) {
+    // on the shell: backed end to end
+    lo = a0;
+    hi = a1;
+  } else {
+    for (const w of r.walls ?? []) {
+      const runsX = Math.abs(w.z1 - w.z0) < eps;
+      if (runsX !== alongX) continue;
+      if (Math.abs((runsX ? w.z0 : w.x0) - line) > eps) continue;
+      const q0 = Math.max(a0, runsX ? Math.min(w.x0, w.x1) : Math.min(w.z0, w.z1));
+      const q1 = Math.min(a1, runsX ? Math.max(w.x0, w.x1) : Math.max(w.z0, w.z1));
+      if (q1 - q0 > hi - lo) {
+        lo = q0;
+        hi = q1;
+      }
+    }
+    if (hi <= lo) return null;
+  }
+  // side 3's tangent runs the other way, so its span flips with it
+  if (alongX) return [lo - s.px, hi - s.px];
+  return s.tz > 0 ? [lo - s.pz, hi - s.pz] : [s.pz - hi, s.pz - lo];
+}
+
+/**
  * Exposed structure overhead. A ceiling plane with nothing on it reads as the
  * inside of a box; joists, a conduit run and a hanging cable give the top of
  * the frame something to occlude and something for the bulb to rim-light.
@@ -319,6 +382,10 @@ function dressCeiling(A, rng, r) {
   const w = x1 - x0;
   const d = z1 - z0;
   if (h < 2.1 || w < 1.6 || d < 1.6) return;
+  // Underside of the slab and of the structural beams already hanging off it.
+  // These joists used to sit at y + h - 0.06, i.e. entirely inside 0.2 m of
+  // concrete, which is a lot of triangles for something nobody could ever see.
+  const soffit = r.soffit ?? 0.36;
   const alongX = w < d;
   const span = alongX ? w : d;
   const runLen = alongX ? d : w;
@@ -333,7 +400,7 @@ function dressCeiling(A, rng, r) {
       LL(
         IDENT,
         jx,
-        y + h - 0.06,
+        y + h - soffit - 0.055,
         jz,
         alongX ? 0 : Math.PI / 2,
         span - 0.05,

@@ -659,11 +659,19 @@ export function shopfront(A, pm, o, rng, opts = {}) {
 
 /** Corrugated roller shutter, 1 m tall, scaled by the caller. */
 function rollerShutter(w, h) {
-  const g = new THREE.PlaneGeometry(w, h, 2, 14);
+  /**
+   * The slat count and the tessellation have to be locked together. The old
+   * profile ran at 14.3 ribs per unit height across 14 rows, so the sine was
+   * sampled a hair over once per period and the whole corrugation aliased away
+   * into one gentle bow. Four rows per rib, with the rows landing exactly on the
+   * crests and troughs, is the cheapest sampling that actually reads as ribbed.
+   */
+  const RIBS = 14;
+  const g = new THREE.PlaneGeometry(w, h, 2, RIBS * 4);
   const pa = g.getAttribute('position');
   for (let i = 0; i < pa.count; i++) {
     const y = pa.getY(i);
-    pa.setZ(i, Math.sin(y * 90) * 0.008);
+    pa.setZ(i, Math.sin((y / h) * Math.PI * 2 * RIBS) * 0.008);
   }
   g.computeVertexNormals();
   const g2 = g.clone();
@@ -790,13 +798,28 @@ export function stairRun(A, pm, x, y, z, w, steps, rise, run, opts = {}) {
     const wp = worldOf(pm, x, sy, sz);
     A.box(A.surfaceOf(key), wp[0], wp[1], wp[2], w, rise, run, ryOf(pm));
   }
-  // side stringer / spine so it doesn't read as floating slabs
+  // Side stringers so the flight doesn't read as floating slabs. A single solid
+  // prism across the whole run (which is what used to be here) is 2% wider
+  // than the treads and starts a step below them, so it swallows every step but
+  // the last and the flight reads as a ramp. Two thin rails set just OUTSIDE the
+  // tread width carry the same "this is built, not stacked" cue and leave the
+  // treads standing proud.
   const H = steps * rise;
   const D = steps * run;
   if (opts.stringer !== false) {
-    A.add(key, box, LL(pm, x, y + H / 2 - 0.1, z + D / 2, 0, w * 1.02, H, D * 0.99), {
-      masks: [0.4, 0.6, 0.4],
-    });
+    const st = 0.07;
+    const ang = Math.atan2(H, D);
+    const len = Math.hypot(H, D);
+    for (const sx of [-1, 1]) {
+      A.add(
+        key,
+        box,
+        // Centred on the nosing line and dropped half its own depth, so the rail
+        // sits under the tread noses the way a real stringer does.
+        LL(pm, x + sx * (w / 2 + st / 2), y + H / 2 - 0.16, z + D / 2, 0, st, 0.34, len, -ang),
+        { masks: [0.4, 0.6, 0.4] }
+      );
+    }
   }
   if (opts.railing) {
     const bar = BOX_THIN(A);

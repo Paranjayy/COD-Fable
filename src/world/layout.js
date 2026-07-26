@@ -191,13 +191,26 @@ export const BUILDINGS = [
     enterable: true,
     roofAccess: true,
     roofProps: 6,
+    // Three flights, one per floor: the roof is `roofAccess`, and without the
+    // top flight (and the matching hole at level 3, the roof slab) the penthouse
+    // and its doorway sat on sealed concrete.
     stairFlights: [
       { floor: 0, x: 0.72, z: 0.12, ry: 0, w: 1.2, railing: 'right' },
       { floor: 1, x: 0.72, z: 0.12, ry: 0, w: 1.2, railing: 'right' },
+      { floor: 2, x: 0.72, z: 0.12, ry: 0, w: 1.2, railing: 'right' },
     ],
     stairHoles: {
       1: { x0: 16.3, x1: 18.1, z0: 9.4, z1: 16.2 },
       2: { x0: 16.3, x1: 18.1, z0: 9.4, z1: 16.2 },
+      /**
+       * The roof void is shorter than the two below it. The 16-step top flight
+       * runs out of standing headroom under the 0.26 m roof slab at step 5
+       * (z 11.55); cutting from z 11.0 gives the character capsule's trailing
+       * radius room to clear the edge as well. It ends on the nose of the top
+       * landing at z 15.68, so the penthouse built around the void still lands
+       * on concrete the whole way round.
+       */
+      3: { x0: 16.3, x1: 18.1, z0: 11.0, z1: 15.68 },
     },
     rooms: [
       {

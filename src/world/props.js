@@ -651,6 +651,45 @@ function plank(rng) {
 }
 
 /**
+ * A flat unit disc in XZ with `rings` concentric rings of `seg` vertices around
+ * a single centre vertex.
+ *
+ * The skirt used to be a zero-height CylinderGeometry, which is the wrong tool
+ * twice over: a torso of zero height is 208 degenerate triangles, and three's
+ * cap generator ignores `heightSegments` altogether, so the rings the profile
+ * needs never existed and the falloff collapsed to a straight cone between the
+ * rim and the centre. This gives real radial rings and no degenerate triangles.
+ */
+function discFan(seg, rings) {
+  const pos = [0, 0, 0];
+  const uv = [0, 0];
+  const idx = [];
+  for (let j = 1; j <= rings; j++) {
+    const r = j / rings;
+    for (let i = 0; i < seg; i++) {
+      const a = (i / seg) * Math.PI * 2;
+      pos.push(Math.cos(a) * r, 0, Math.sin(a) * r);
+      uv.push(Math.cos(a) * r, Math.sin(a) * r);
+    }
+  }
+  // inner fan, then one quad band per ring gap
+  for (let i = 0; i < seg; i++) idx.push(0, 1 + ((i + 1) % seg), 1 + i);
+  for (let j = 0; j < rings - 1; j++) {
+    const a0 = 1 + j * seg;
+    const b0 = a0 + seg;
+    for (let i = 0; i < seg; i++) {
+      const i1 = (i + 1) % seg;
+      idx.push(a0 + i, b0 + i1, b0 + i, a0 + i, a0 + i1, b0 + i1);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return g;
+}
+
+/**
  * The swept fillet of dust and grit that piles against anything left standing
  * on a street. Unit radius (put() scales it), 2.5 cm proud at the object and
  * feathering to nothing at the rim, with a jagged outline so it never reads as
@@ -658,9 +697,9 @@ function plank(rng) {
  * grime darkens the contact line.
  */
 function dustSkirt(rng) {
-  const RAD = 4;
+  const RAD = 5;
   const SEG = 26;
-  const g = new THREE.CylinderGeometry(1, 1, 0, SEG, RAD);
+  const g = discFan(SEG, RAD);
   const pa = g.getAttribute('position');
   const col = new Float32Array(pa.count * 3);
   for (let i = 0; i < pa.count; i++) {

@@ -62,9 +62,38 @@ export function inBuilding(x, z, m = 0.3) {
   return false;
 }
 
+/**
+ * The three solid gate masses as [x0, x1, zFront]. They all share the same back
+ * face; the east block and the tower stand proud of it by different amounts.
+ * The archway between xL1 and xR0 is a way through, so it is not in the list.
+ */
+const GATE_MASSES = [
+  [GATE.xL0, GATE.xL1, GATE.z + GATE.depth / 2],
+  [GATE.xR0, GATE.xR1, GATE.z + GATE.depth / 2 + GATE.eastProud],
+  [GATE.xT0, GATE.xT1, GATE.z + GATE.depth / 2 + GATE.towerProud],
+];
+const GATE_BACK = GATE.z - GATE.depth / 2;
+
+/**
+ * True inside (or within `m` of) the gate masonry.
+ *
+ * The GATE is neither a building nor an alley, and the west and east blocks sit
+ * squarely inside the street strip, so without this every occupancy test called
+ * five metres of solid masonry walkable and the scatter loops posted debris and
+ * drift berms inside it.
+ */
+export function inGate(x, z, m = 0.3) {
+  if (z < GATE_BACK - m) return false;
+  for (let i = 0; i < GATE_MASSES.length; i++) {
+    const g = GATE_MASSES[i];
+    if (x > g[0] - m && x < g[1] + m && z < g[2] + m) return true;
+  }
+  return false;
+}
+
 /** True on the street, a pavement or an alley — i.e. somewhere props can sit. */
 export function isOpen(x, z, m = 0.3) {
-  if (inBuilding(x, z, m)) return false;
+  if (inBuilding(x, z, m) || inGate(x, z, m)) return false;
   if (Math.abs(x) < STREET.kerb - 0.1 && z > STREET.zMin && z < STREET.zMax) return true;
   for (const a of ALLEYS) {
     const [x0, z0, x1, z1] = a.rect;
@@ -2156,7 +2185,9 @@ export function buildGate(A, rng) {
   for (let i = 0; i < 24; i++) {
     const px = rng.range(-outerW / 2, outerW / 2);
     const pz = z + rng.range(-5, 5);
-    if (Math.abs(px) > span / 2 && Math.abs(pz - z) < t / 2 + 0.3) continue;
+    // The hand-rolled keep-out that used to live here missed the east block's
+    // and the tower's proud faces; `inGate` is the same test done properly.
+    if (inGate(px, pz, 0.2)) continue;
     A.put(
       rng.pick(['brick_a', 'brick_b', 'rock_b', 'litter', 'cinder', 'can', 'weeds', 'plank_b']),
       px,
