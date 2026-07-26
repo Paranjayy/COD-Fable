@@ -130,6 +130,11 @@ export class AmmoPanel {
     const pipCount = Math.min(MAX_PIPS, magSize);
     if (pipCount !== this._lastPips) {
       this._lastPips = pipCount;
+      // A swap changes which pips exist, and the newly revealed ones carry
+      // whatever classes the previous magazine left on them. The lit count can
+      // land on the same number across the swap (mag 30 at 10 rounds, then mag
+      // 17 at 10 rounds), so the class pass below has to be forced to re-run.
+      this._lastCount = -1;
       for (let i = 0; i < MAX_PIPS; i++)
         setStyle(this.pips[i], 'display', i < pipCount ? '' : 'none');
     }

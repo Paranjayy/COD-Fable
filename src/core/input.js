@@ -44,6 +44,13 @@ export class Input {
     this._pendingWheel = 0;
 
     this.pointerLocked = false;
+    /**
+     * Bumped on every `pointerlockchange`. `requestPointerLock` is answered
+     * asynchronously (and may never be answered at all, see the note there),
+     * so this is the only way for a reader to tell "the lock state changed"
+     * from "a request is still outstanding".
+     */
+    this.lockChanges = 0;
     this.enabled = true;
     /** Set true by capture mode so scripted shots aren't fought by real input. */
     this.frozen = false;
@@ -139,6 +146,7 @@ export class Input {
 
   _onLockChange() {
     this.pointerLocked = document.pointerLockElement === this.canvas;
+    this.lockChanges++;
     if (!this.pointerLocked) this._onBlur();
   }
 
