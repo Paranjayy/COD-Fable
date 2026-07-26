@@ -372,8 +372,19 @@ export function rayCapsule(
         if (k >= 0 && k <= 1) best = t;
       }
     }
-  } else if (C <= 0) {
-    best = 0; // ray parallel to axis and already inside the cylinder
+  } else if (C <= 0 && Math.abs(m) > EPS) {
+    // Ray parallel to the axis and inside the *infinite* cylinder. C says
+    // nothing about the segment extent, so a shot fired straight down at a
+    // standing hitbox from 50 m up would otherwise report t = 0. Clip against
+    // the two cap planes instead: k = n + t*m must land inside [0, 1].
+    const ta = -n / m;
+    const tb = (1 - n) / m;
+    let tin = ta < tb ? ta : tb;
+    const tout = ta < tb ? tb : ta;
+    if (tout >= 0) {
+      if (tin < 0) tin = 0; // origin already between the caps
+      if (tin <= maxDist) best = tin;
+    }
   }
   const t1 = raySphere(ox, oy, oz, dx, dy, dz, ax, ay, az, r, maxDist);
   if (t1 >= 0 && (best < 0 || t1 < best)) best = t1;
@@ -397,4 +408,96 @@ export function rayObb(ox, oy, oz, dx, dy, dz, inv, hx, hy, hz, maxDist) {
     maxDist
   );
   return t === Infinity ? -1 : t;
+}
+
+/* ------------------------------------------------------------------ */
+/* Exit distances: how far a round travels *through* a convex proxy    */
+/* ------------------------------------------------------------------ */
+
+/** Far root of a ray against a sphere, or -Infinity when it misses. */
+function sphereExit(ox, oy, oz, dx, dy, dz, cx, cy, cz, r) {
+  const mx = ox - cx, my = oy - cy, mz = oz - cz;
+  const b = mx * dx + my * dy + mz * dz;
+  const c = mx * mx + my * my + mz * mz - r * r;
+  const disc = b * b - c;
+  if (disc < 0) return -Infinity;
+  return -b + Math.sqrt(disc);
+}
+
+/**
+ * Distance from a point on/inside a capsule to where the ray leaves it.
+ * A capsule is convex, so the line meets it in one interval and the exit is the
+ * far end of the cylinder body or of either cap, whichever is furthest.
+ * Returns 0 when the origin is not inside the shape.
+ */
+export function capsuleExit(ox, oy, oz, dx, dy, dz, ax, ay, az, bx, by, bz, r) {
+  let exit = sphereExit(ox, oy, oz, dx, dy, dz, ax, ay, az, r);
+  const e2 = sphereExit(ox, oy, oz, dx, dy, dz, bx, by, bz, r);
+  if (e2 > exit) exit = e2;
+
+  const abx = bx - ax, aby = by - ay, abz = bz - az;
+  const abab = abx * abx + aby * aby + abz * abz;
+  if (abab > EPS) {
+    const aox = ox - ax, aoy = oy - ay, aoz = oz - az;
+    const m = (abx * dx + aby * dy + abz * dz) / abab;
+    const n = (abx * aox + aby * aoy + abz * aoz) / abab;
+    const qx = dx - abx * m, qy = dy - aby * m, qz = dz - abz * m;
+    const sx = aox - abx * n, sy = aoy - aby * n, sz = aoz - abz * n;
+    const A = qx * qx + qy * qy + qz * qz;
+    const B = 2 * (qx * sx + qy * sy + qz * sz);
+    const C = sx * sx + sy * sy + sz * sz - r * r;
+    // t-interval inside the infinite cylinder
+    let lo = -Infinity, hi = Infinity;
+    if (A > EPS) {
+      const disc = B * B - 4 * A * C;
+      if (disc < 0) { lo = 1; hi = 0; }
+      else {
+        const sq = Math.sqrt(disc);
+        lo = (-B - sq) / (2 * A);
+        hi = (-B + sq) / (2 * A);
+      }
+    } else if (C > 0) { lo = 1; hi = 0; }
+    // ...intersected with the t-interval between the two cap planes
+    if (Math.abs(m) > EPS) {
+      const ta = -n / m, tb = (1 - n) / m;
+      const k0 = ta < tb ? ta : tb;
+      const k1 = ta < tb ? tb : ta;
+      if (k0 > lo) lo = k0;
+      if (k1 < hi) hi = k1;
+    } else if (n < 0 || n > 1) { lo = 1; hi = 0; }
+    if (hi >= lo && hi > exit) exit = hi;
+  }
+  return exit > 0 ? exit : 0;
+}
+
+/**
+ * Distance from a point on/inside an oriented box to where the ray leaves it.
+ * `inv` is the world->local matrix elements. Returns 0 when outside.
+ */
+export function obbExit(ox, oy, oz, dx, dy, dz, inv, hx, hy, hz) {
+  const lx = inv[0] * ox + inv[4] * oy + inv[8] * oz + inv[12];
+  const ly = inv[1] * ox + inv[5] * oy + inv[9] * oz + inv[13];
+  const lz = inv[2] * ox + inv[6] * oy + inv[10] * oz + inv[14];
+  const ldx = inv[0] * dx + inv[4] * dy + inv[8] * dz;
+  const ldy = inv[1] * dx + inv[5] * dy + inv[9] * dz;
+  const ldz = inv[2] * dx + inv[6] * dy + inv[10] * dz;
+  let lo = -Infinity, hi = Infinity;
+  // three slabs, unrolled so the hot path allocates nothing
+  let t0 = (-hx - lx) / (ldx || 1e-30), t1 = (hx - lx) / (ldx || 1e-30);
+  if (Math.abs(ldx) < 1e-12) { t0 = lx < -hx || lx > hx ? 1 : -Infinity; t1 = lx < -hx || lx > hx ? 0 : Infinity; }
+  if (t0 > t1) { const s = t0; t0 = t1; t1 = s; }
+  if (t0 > lo) lo = t0;
+  if (t1 < hi) hi = t1;
+  t0 = (-hy - ly) / (ldy || 1e-30); t1 = (hy - ly) / (ldy || 1e-30);
+  if (Math.abs(ldy) < 1e-12) { t0 = ly < -hy || ly > hy ? 1 : -Infinity; t1 = ly < -hy || ly > hy ? 0 : Infinity; }
+  if (t0 > t1) { const s = t0; t0 = t1; t1 = s; }
+  if (t0 > lo) lo = t0;
+  if (t1 < hi) hi = t1;
+  t0 = (-hz - lz) / (ldz || 1e-30); t1 = (hz - lz) / (ldz || 1e-30);
+  if (Math.abs(ldz) < 1e-12) { t0 = lz < -hz || lz > hz ? 1 : -Infinity; t1 = lz < -hz || lz > hz ? 0 : Infinity; }
+  if (t0 > t1) { const s = t0; t0 = t1; t1 = s; }
+  if (t0 > lo) lo = t0;
+  if (t1 < hi) hi = t1;
+  if (hi < lo || hi <= 0) return 0;
+  return hi;
 }

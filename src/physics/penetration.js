@@ -185,10 +185,29 @@ export class Ballistics {
       backface: false,
     });
 
+    // Hitboxes, ragdoll bones and debris are analytic convex volumes: they have
+    // no backface for the probe ray to land on, so measure them algebraically.
+    // Otherwise a torso costs a sheet's worth of the budget (3% of flesh) and a
+    // pistol round passes through a whole file of enemies at full damage.
+    const solid = phys.shapeThickness(entry, dx, dy, dz, out.normal);
+    if (solid > 0) {
+      out.distance = solid;
+      out.point.x = entry.point.x + dx * solid;
+      out.point.y = entry.point.y + dy * solid;
+      out.point.z = entry.point.z + dz * solid;
+      out.backface = true;
+      return out;
+    }
+
     const h = phys.raycast(ox, oy, oz, dx, dy, dz, probe, mask);
+    // Identity has to be established on something that is actually set. Two
+    // unrelated statics both carry `collider === null`, so an unqualified
+    // `h.collider === entry.collider` would call every wall in the level the
+    // same solid and measure drywall as 1.6 m thick.
     const sameSolid =
       h.hit && !h.frontFace &&
-      (h.object === entry.object || h.collider === entry.collider);
+      ((h.object !== null && h.object === entry.object) ||
+        (h.collider !== null && h.collider === entry.collider));
 
     if (sameSolid) {
       out.distance = h.distance + eps;

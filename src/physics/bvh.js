@@ -768,6 +768,10 @@ export class StaticWorld {
     const nrm = this.nrm;
     const cl = this._cl2;
     const r2 = r * r;
+    // Which side of a face the capsule actually sits on decides which way it
+    // gets pushed; taking the raw face normal would drive a capsule that ended
+    // up behind a one-sided wall straight through it.
+    const midx = (p0x + p1x) * 0.5, midy = (p0y + p1y) * 0.5, midz = (p0z + p1z) * 0.5;
     let k = 0;
     for (let c = 0; c < n && k < cts.capacity; c++) {
       const tri = cand[c];
@@ -781,19 +785,25 @@ export class StaticWorld {
       );
       if (d2 >= r2) continue;
       const d = Math.sqrt(d2);
+      const fx = nrm[tri * 3], fy = nrm[tri * 3 + 1], fz = nrm[tri * 3 + 2];
       let nx, ny, nz;
-      if (d > 1e-6) {
+      let useFace = d <= 1e-6;
+      if (!useFace) {
         nx = (cl.ax - cl.bx) / d;
         ny = (cl.ay - cl.by) / d;
         nz = (cl.az - cl.bz) / d;
         // Deep contacts can pick a normal pointing into the solid; fall back to
         // the face normal when the closest-point direction disagrees with it.
-        const fn = nx * nrm[tri * 3] + ny * nrm[tri * 3 + 1] + nz * nrm[tri * 3 + 2];
-        if (fn < 0.05) {
-          nx = nrm[tri * 3]; ny = nrm[tri * 3 + 1]; nz = nrm[tri * 3 + 2];
-        }
-      } else {
-        nx = nrm[tri * 3]; ny = nrm[tri * 3 + 1]; nz = nrm[tri * 3 + 2];
+        useFace = nx * fx + ny * fy + nz * fz < 0.05;
+      }
+      if (useFace) {
+        // Signed side of the capsule centre against the triangle's plane, so a
+        // capsule that has ended up behind the face is pushed back out the way
+        // it came rather than through the wall.
+        const side =
+          (midx - pos[p]) * fx + (midy - pos[p + 1]) * fy + (midz - pos[p + 2]) * fz;
+        const sgn = side < 0 ? -1 : 1;
+        nx = fx * sgn; ny = fy * sgn; nz = fz * sgn;
       }
       cts.nx[k] = nx; cts.ny[k] = ny; cts.nz[k] = nz;
       cts.px[k] = cl.bx; cts.py[k] = cl.by; cts.pz[k] = cl.bz;
