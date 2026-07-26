@@ -21,7 +21,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   vec2 p = uv * P + uSeed * 6.9;
 
   // ---- binder: dark, slightly blue-grey, sun-bleached in patches ----
-  float macro = owFbm01(p * 0.55, P * 0.5, 4, 0.6);
+  float macro = owFbm01(p * 0.5, P * 0.5, 4, 0.6);
   float mid   = owFbm01(p * 3.0, P * 3.0, 5, 0.5);
   float fine  = owFbm01(p * 16.0, P * 16.0, 4, 0.5);
 
@@ -43,7 +43,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   vec2 ap = owWarp(p, P, 0.10, 3);
   vec4 big = owWorley(ap * 12.0, P * 12.0, 1.0);
   float bigM = smoothstep(0.40, 0.16, big.x);
-  float bigExposed = bigM * smoothstep(0.30, 0.62, owFbm01(p * 2.2 + 3.0, P * 2.0, 4, 0.5) + big.w * 0.5);
+  float bigExposed = bigM * smoothstep(0.30, 0.62, owFbm01(p * 2.25 + 3.0, P * 2.25, 4, 0.5) + big.w * 0.5);
   vec4 small = owWorley(ap * 22.0 + 7.0, P * 22.0, 1.0);
   float smallM = smoothstep(0.36, 0.10, small.x);
   float smallExposed = smallM * step(0.30, small.w);
@@ -72,7 +72,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // ---- tyre polish: two smooth bands where wheels track ----
   float lane = abs(fract(uv.x * 1.0 + 0.25) - 0.5) * 2.0;
   float polish = (1.0 - smoothstep(0.10, 0.62, lane)) *
-                 smoothstep(0.25, 0.65, owFbm01(vec2(p.x * 0.7, p.y * 5.0), vec2(P.x, P.y * 5.0), 4, 0.5));
+                 smoothstep(0.25, 0.65, owFbm01(vec2(p.x * 0.75, p.y * 5.0), vec2(P.x * 0.75, P.y * 5.0), 4, 0.5));
   rough -= polish * 0.16;
   h -= polish * 0.012;
   c = mix(c, c * 0.78 + owSRGB(vec3(0.045, 0.045, 0.048)), polish * 0.45);
@@ -92,8 +92,8 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   c = mix(c, owSRGB(vec3(0.055, 0.055, 0.058)), tar * 0.7);
 
   // ---- alligator cracking + long thermal cracks ----
-  float gator = owCracks(p * 3.4, P * 3.4, 0.9, 0.032, 0.56);
-  float thermal = owCracks(p * 0.9 + 41.0, P * 0.9, 0.75, 0.05, 0.70);
+  float gator = owCracks(p * 3.375, P * 3.375, 0.9, 0.032, 0.56);
+  float thermal = owCracks(p * 0.875 + 41.0, P * 0.875, 0.75, 0.05, 0.70);
   float crack = clamp(gator + thermal, 0.0, 1.0);
   h -= crack * 0.16;
   ao -= crack * 0.30;
@@ -101,7 +101,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   rough += crack * 0.12;
 
   // ---- oil stains, dark and slightly glossy ----
-  float oil = smoothstep(0.68, 0.90, owFbm01(owWarp(p * 1.8 + 31.0, P * 1.8, 0.9, 3), P * 1.8, 4, 0.55));
+  float oil = smoothstep(0.68, 0.90, owFbm01(owWarp(p * 1.75 + 31.0, P * 1.75, 0.9, 3), P * 1.75, 4, 0.55));
   c = mix(c, owSRGB(vec3(0.045, 0.043, 0.046)), oil * 0.6);
   rough -= oil * 0.16;
 
@@ -125,12 +125,12 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
 
   // ---- wind ripples: sheared sine, gently warped so the crests meander ----
   vec2 rp = owShear(p * 1.0, 1.0, 1.0);
-  float warp = owFbm(p * 0.9, P * 0.9, 3, 0.55);
+  float warp = owFbm(p * 0.875, P * 0.875, 3, 0.55);
   float ripple = sin((rp.y * 1.0 + warp * 0.55) * 6.28318);
   // asymmetric profile: gentle windward slope, sharp lee crest
   ripple = ripple * 0.5 + 0.5;
   ripple = pow(ripple, 1.7) * 0.75 + ripple * 0.25;
-  float rippleAmp = smoothstep(0.20, 0.70, owFbm01(p * 0.7, P * 0.7, 3, 0.6));
+  float rippleAmp = smoothstep(0.20, 0.70, owFbm01(p * 0.75, P * 0.75, 3, 0.6));
   float secondary = sin((p.y * 3.0 + p.x * 1.0 + warp * 0.8) * 6.28318) * 0.5 + 0.5;
 
   float dune = owFbm01(p * 0.5, P * 0.5, 4, 0.6);
@@ -183,7 +183,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   const vec2 P = vec2(8.0);
   vec2 p = uv * P + uSeed * 3.4;
 
-  float macro = owFbm01(p * 0.6, P * 0.6, 4, 0.62);
+  float macro = owFbm01(p * 0.625, P * 0.625, 4, 0.62);
   float clump = owBillow(owWarp(p * 3.0, P * 3.0, 0.6, 3), P * 3.0, 5, 0.55);
   float fine  = owFbm01(p * 14.0, P * 14.0, 4, 0.5);
   float micro = owFbm01(p * 22.0, P * 22.0, 3, 0.5);
@@ -204,7 +204,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
 
   // dried mud cracks in the flat pans
   float pan = smoothstep(0.35, 0.65, macro);
-  float mud = owCracks(p * 2.4, P * 2.4, 0.85, 0.045, 0.35) * pan;
+  float mud = owCracks(p * 2.375, P * 2.375, 0.85, 0.045, 0.35) * pan;
   h -= mud * 0.16;
   ao -= mud * 0.32;
   c = mix(c, cWet * 0.7, mud * 0.75);
@@ -252,7 +252,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   const vec2 P = vec2(8.0);
   vec2 p = uv * P + uSeed * 2.7;
 
-  float bed = owFbm01(p * 1.3, P * 1.3, 4, 0.55);
+  float bed = owFbm01(p * 1.25, P * 1.25, 4, 0.55);
 
   /**
    * This is the street. Not a bed of loose chippings — compacted dust and grit
@@ -344,7 +344,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // Wheel and foot traffic sweeps the loose grit into drifts and polishes bare
   // lanes: 0.5-1.5 m form inside the tile, which is the scale the eye uses to
   // decide whether a road is a surface or a pattern.
-  float drift = owFbm01(owWarp(p * 0.9 + 17.0, P * 0.9, 0.8, 3), P * 0.9, 4, 0.6);
+  float drift = owFbm01(owWarp(p * 0.875 + 17.0, P * 0.875, 0.8, 3), P * 0.875, 4, 0.6);
   h += (drift - 0.5) * 0.10;
   c *= 0.86 + 0.28 * drift;
   rough += (drift - 0.5) * 0.10;
@@ -354,7 +354,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   c = mix(c, cBed * (0.92 + 0.22 * drift), smoothstep(0.55, 0.88, drift) * 0.72);
 
   // Dried tyre tracks and dragged-heel scuffs — long, shallow, low contrast.
-  float scuff = owFbm01(owShear(p * 2.2, 0.0, 6.0), owShearPer(P * 2.2, 6.0), 4, 0.5);
+  float scuff = owFbm01(owShear(p * 2.25, 0.0, 6.0), owShearPer(P * 2.25, 6.0), 4, 0.5);
   c *= 1.0 - smoothstep(0.55, 0.92, scuff) * 0.10;
   rough -= smoothstep(0.6, 0.95, scuff) * 0.08;
 

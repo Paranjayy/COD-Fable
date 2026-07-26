@@ -114,12 +114,12 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   ao -= joint * 0.55;
   c = mix(c, cDark * 0.62, joint * 0.65);
   // trowel arcs left by the power float
-  float swirl = owFbm01(owWarp(p * 1.1 + 3.0, P * 1.1, 1.4, 3), P * 1.1, 3, 0.6);
+  float swirl = owFbm01(owWarp(p * 1.125 + 3.0, P * 1.125, 1.4, 3), P * 1.125, 3, 0.6);
   rough -= jointAmt * smoothstep(0.35, 0.85, swirl) * 0.10;
   c *= 1.0 - jointAmt * smoothstep(0.4, 0.9, swirl) * 0.07;
 
   // ---- structural cracks: branch from the seams and corners ----
-  float crk = owCracks(p * 2.6, P * 2.6, 0.85, 0.028, 0.50);
+  float crk = owCracks(p * 2.625, P * 2.625, 0.85, 0.028, 0.50);
   float crkFine = owCracks(p * 7.0 + 31.0, P * 7.0, 0.9, 0.020, 0.60) * 0.55;
   float crack = clamp(crk + crkFine, 0.0, 1.0);
   h -= crack * 0.12;
@@ -128,7 +128,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   rough += crack * 0.12;
 
   // ---- spalling: a chunk of the skin has broken off, aggregate showing ----
-  vec4 sp = owWorley(p * 1.1 + 7.3, P * 1.1, 0.9);
+  vec4 sp = owWorley(p * 1.125 + 7.3, P * 1.125, 0.9);
   float spallCell = step(0.90, sp.w);
   float spall = spallCell * smoothstep(0.44, 0.16, sp.x) *
                 smoothstep(0.42, 0.62, owFbm01(p * 4.0 + 2.0, P * 4.0, 4, 0.5));
@@ -142,7 +142,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
 
   // ---- small chips: 2-5 cm bites out of the skin showing darker, wetter
   //      concrete plus the sand fraction underneath (~3% of the surface) ----
-  vec4 ck = owWorley(owWarp(p * 5.6 + 19.0, P * 5.6, 0.6, 3), P * 5.6, 0.95);
+  vec4 ck = owWorley(owWarp(p * 5.625 + 19.0, P * 5.625, 0.6, 3), P * 5.625, 0.95);
   float ckSel = step(0.90, ck.w);
   float ckSize = 0.20 + 0.16 * ck.z;
   float ckShape = smoothstep(ckSize, ckSize * 0.3,
@@ -229,7 +229,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
 
   // some joints are struck flush, some are raked deep, some crumbled out.
   // 0.10-0.15 of a 0.055 m relief = 5-8 mm of real recess.
-  float jointDepth = 0.10 + 0.05 * owFbm01(p * 1.2, P * 1.2, 3, 0.5);
+  float jointDepth = 0.10 + 0.05 * owFbm01(p * 1.25, P * 1.25, 3, 0.5);
   float crumble = smoothstep(0.62, 0.86, owFbm01(p * 9.0 + 4.0, P * 9.0, 4, 0.5));
   jointDepth += crumble * 0.09;
   // the mortar bed itself is not flat — it holds the trowel's sand texture
@@ -302,24 +302,24 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
 
   // ---------------- weathering over the whole wall ----------------
   // The 0.1-1 m band — see the long note in PLASTER.
-  float soilB = owFbm01(owWarp(p * 1.8 + 27.0, P * 1.8, 0.6, 3), P * 1.8, 4, 0.58);
+  float soilB = owFbm01(owWarp(p * 1.75 + 27.0, P * 1.75, 0.6, 3), P * 1.75, 4, 0.58);
   soilB = clamp((soilB - 0.5) * 2.5 + 0.5, 0.0, 1.0);
   c *= 0.845 + 0.33 * soilB;
 
   // efflorescence: salt bloom, strongest around joints
-  float efflo = smoothstep(0.62, 0.96, owFbm01(owWarp(p * 2.6, P * 2.6, 0.8, 3), P * 2.6, 4, 0.5));
+  float efflo = smoothstep(0.62, 0.96, owFbm01(owWarp(p * 2.625, P * 2.625, 0.8, 3), P * 2.625, 4, 0.5));
   efflo *= mix(1.0, 0.35, m);
   c = mix(c, owSRGB(vec3(0.66, 0.652, 0.632)), efflo * 0.5);
   rough += efflo * 0.10;
 
   // soot / rain runoff — short, shallow and only ~3:1 stretched; the long runs
   // are added at runtime where a real ledge sheds water.
-  float streak = owFbm01(vec2(p.x * 7.0, p.y * 2.3), vec2(P.x * 7.0, P.y * 2.0), 5, 0.55);
+  float streak = owFbm01(vec2(p.x * 7.0, p.y * 2.25), vec2(P.x * 7.0, P.y * 2.25), 5, 0.55);
   float runoff = smoothstep(0.50, 0.92, streak);
   c *= 1.0 - runoff * 0.16;
 
   // hairline cracks stepping through the joints
-  float crack = owCracks(p * 2.2, P * 2.2, 0.85, 0.038, 0.58);
+  float crack = owCracks(p * 2.25, P * 2.25, 0.85, 0.038, 0.58);
   h -= crack * 0.10;
   ao -= crack * 0.45;
   c = mix(c, c * 0.35, crack * 0.7);
@@ -345,7 +345,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   float trowel = owFbm01(sw, owShearPer(P * 1.5, 3.0), 5, 0.55);
   float skim   = owFbm01(p * 12.0, P * 12.0, 5, 0.5);
   float micro  = owFbm01(p * 24.0, P * 24.0, 3, 0.5);
-  float macro  = owFbm01(p * 0.6, P * 0.6, 3, 0.6);
+  float macro  = owFbm01(p * 0.625, P * 0.625, 3, 0.6);
 
   vec3 cBase = owSRGB(vec3(0.598, 0.578, 0.538));
   vec3 cWarm = owSRGB(vec3(0.512, 0.462, 0.395));
@@ -366,7 +366,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // lifted off. This is the mid-frequency signal that separates plaster from
   // paint at 2-5 m — without it the wall is one value plus a sprinkle of specks.
   vec2 lapUv = owShear(p * 0.7, 1.0, 1.0);
-  float lapF = lapUv.y + owFbm01(p * 1.1, P * 1.1, 3, 0.6) * 1.4;
+  float lapF = lapUv.y + owFbm01(p * 1.125, P * 1.125, 3, 0.6) * 1.4;
   float lapI = floor(lapF);
   float lapT = fract(lapF);
   float lapR = owHash11(lapI * 1.71 + uSeed * 2.3);
@@ -386,11 +386,11 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   // 0-1, so writing 0.86 + 0.30 * n gives a +/-6% wash and not the +/-20%
   // the numbers suggest — the same trap the macro layer documents. Every band
   // here is re-centred and expanded before it is used.
-  float dampB = owFbm01(owWarp(p * 1.6 + 3.7, P * 1.6, 0.7, 3), P * 1.6, 4, 0.58);
+  float dampB = owFbm01(owWarp(p * 1.625 + 3.7, P * 1.625, 0.7, 3), P * 1.625, 4, 0.58);
   dampB = clamp((dampB - 0.5) * 2.6 + 0.5, 0.0, 1.0);
   c *= 0.80 + 0.42 * dampB;
   rough += (dampB - 0.5) * 0.12;
-  float soil2 = owFbm01(owWarp(p * 3.4 + 21.0, P * 3.4, 0.55, 3), P * 3.4, 4, 0.55);
+  float soil2 = owFbm01(owWarp(p * 3.375 + 21.0, P * 3.375, 0.55, 3), P * 3.375, 4, 0.55);
   soil2 = clamp((soil2 - 0.5) * 2.4 + 0.5, 0.0, 1.0);
   c *= 0.875 + 0.26 * soil2;
   float wash = owFbm01(p * 8.0 + 6.0, P * 8.0, 4, 0.5);
@@ -437,7 +437,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   c = mix(c, owSRGB(vec3(0.300, 0.278, 0.250)), crack * 0.8);
 
   // blown plaster: patches spalled off, revealing render/brick beneath
-  float blowMask = owFbm01(owWarp(p * 1.05 + 9.0, P * 1.05, 1.1, 3), P * 1.05, 4, 0.55);
+  float blowMask = owFbm01(owWarp(p * 1.0 + 9.0, P * 1.0, 1.1, 3), P * 1.0, 4, 0.55);
   float blow = smoothstep(0.775, 0.845, blowMask);
   float blowEdge = smoothstep(0.745, 0.790, blowMask) - blow;
   vec3 substrate = mix(owSRGB(vec3(0.360, 0.245, 0.195)), owSRGB(vec3(0.430, 0.400, 0.360)),
@@ -456,7 +456,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   //      sprinkle of 3 cm dark dots on a facade reads as fly dirt, not as damage,
   //      and it is the one thing that survives at every distance and so gives the
   //      whole wall a screen-space texture.
-  vec4 ck = owWorley(owWarp(p * 4.2 + 13.0, P * 4.2, 0.6, 3), P * 4.2, 0.95);
+  vec4 ck = owWorley(owWarp(p * 4.25 + 13.0, P * 4.25, 0.6, 3), P * 4.25, 0.95);
   float ckSel = step(0.930, ck.w);
   float ckSize = 0.22 + 0.20 * ck.z;
   float ckShape = smoothstep(ckSize, ckSize * 0.3,
@@ -475,7 +475,7 @@ void owSurface(vec2 uv, out vec3 alb, out float h, out float rough, out float me
   h += ckLip * 0.010;
 
   // water staining: tide marks and slow brown bleed
-  float stain = owFbm01(vec2(p.x * 1.6, p.y * 3.2), vec2(P.x * 1.6, P.y * 3.0), 5, 0.6);
+  float stain = owFbm01(vec2(p.x * 1.625, p.y * 3.25), vec2(P.x * 1.625, P.y * 3.25), 5, 0.6);
   float tide = smoothstep(0.60, 0.78, stain) * (1.0 - smoothstep(0.78, 0.94, stain));
   c = mix(c, owSRGB(vec3(0.400, 0.330, 0.245)), tide * 0.45);
   c *= 1.0 - smoothstep(0.50, 0.95, stain) * 0.34;

@@ -139,40 +139,57 @@ function ok(t0, peak) {
   return Number.isFinite(t0) && Number.isFinite(peak) && t0 >= 0;
 }
 
+/**
+ * The same guard for the *durations*. Every schedule time below is t0 plus a
+ * duration, so a non-finite attack/decay/sustain/release throws inside
+ * exponentialRampToValueAtTime exactly as a non-finite t0 does, and forty of
+ * those latch AudioSystem.failed and kill the whole subsystem. sweep() has
+ * always validated its duration; hit/ad/adsr now do too.
+ */
+function okDur(...ds) {
+  for (let i = 0; i < ds.length; i++) if (!Number.isFinite(ds[i])) return false;
+  return true;
+}
+
 /** Instant-attack exponential decay — the workhorse for transients. */
 export function hit(param, t0, peak, decay) {
-  if (!ok(t0, peak)) return t0;
+  if (!ok(t0, peak) || !okDur(decay)) return t0;
+  const dc = Math.max(decay, 0);
   const p = Math.max(peak, FLOOR * 4);
   param.setValueAtTime(p, t0);
-  param.exponentialRampToValueAtTime(FLOOR, t0 + decay);
-  param.setValueAtTime(0, t0 + decay + 0.002);
-  return t0 + decay + 0.002;
+  param.exponentialRampToValueAtTime(FLOOR, t0 + dc);
+  param.setValueAtTime(0, t0 + dc + 0.002);
+  return t0 + dc + 0.002;
 }
 
 /** Attack/decay with an exponential contour on both halves. */
 export function ad(param, t0, peak, attack, decay) {
-  if (!ok(t0, peak)) return t0;
+  if (!ok(t0, peak) || !okDur(attack, decay)) return t0;
+  const at = Math.max(attack, 0);
+  const dc = Math.max(decay, 0);
   const p = Math.max(peak, FLOOR * 4);
   param.setValueAtTime(FLOOR, t0);
-  if (attack > 0.0008) param.exponentialRampToValueAtTime(p, t0 + attack);
+  if (at > 0.0008) param.exponentialRampToValueAtTime(p, t0 + at);
   else param.setValueAtTime(p, t0 + 0.0004);
-  param.exponentialRampToValueAtTime(FLOOR, t0 + attack + decay);
-  param.setValueAtTime(0, t0 + attack + decay + 0.002);
-  return t0 + attack + decay + 0.002;
+  param.exponentialRampToValueAtTime(FLOOR, t0 + at + dc);
+  param.setValueAtTime(0, t0 + at + dc + 0.002);
+  return t0 + at + dc + 0.002;
 }
 
 /** Full ADSR for sustained material (voices, wind gusts). */
 export function adsr(param, t0, peak, a, d, s, sustainLevel, r) {
-  if (!ok(t0, peak)) return t0;
+  if (!ok(t0, peak) || !okDur(a, d, s, r)) return t0;
+  const at = Math.max(a, 0), dc = Math.max(d, 0);
+  const su = Math.max(s, 0), re = Math.max(r, 0);
   const p = Math.max(peak, FLOOR * 4);
   const sl = Math.max(p * sustainLevel, FLOOR * 4);
   param.setValueAtTime(FLOOR, t0);
-  param.exponentialRampToValueAtTime(p, t0 + a);
-  param.exponentialRampToValueAtTime(sl, t0 + a + d);
-  param.setValueAtTime(sl, t0 + a + d + s);
-  param.exponentialRampToValueAtTime(FLOOR, t0 + a + d + s + r);
-  param.setValueAtTime(0, t0 + a + d + s + r + 0.002);
-  return t0 + a + d + s + r + 0.002;
+  param.exponentialRampToValueAtTime(p, t0 + at);
+  param.exponentialRampToValueAtTime(sl, t0 + at + dc);
+  param.setValueAtTime(sl, t0 + at + dc + su);
+  param.exponentialRampToValueAtTime(FLOOR, t0 + at + dc + su + re);
+  param.setValueAtTime(0, t0 + at + dc + su + re + 0.002);
+  return t0 + at + dc + su + re + 0.002;
 }
 
 /** Exponential parameter sweep, guarded against zero/negative targets. */
