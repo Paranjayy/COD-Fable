@@ -78,7 +78,9 @@ export class Health {
    * @param {object} opts { yaw, type, suppress }
    */
   damage(amount, from, opts = {}) {
-    if (this.dead || amount <= 0) return 0;
+    // `NaN <= 0` is false, so the finite check has to come first: one NaN here
+    // would poison health, the severity curve and every spring it feeds.
+    if (this.dead || !Number.isFinite(amount) || amount <= 0) return 0;
     const before = this.value;
     this.value = Math.max(0, this.value - amount);
     this.lastDamageTime = this.ctx.time.elapsed;
@@ -133,7 +135,12 @@ export class Health {
   }
 
   heal(amount) {
+    if (this.dead || !Number.isFinite(amount) || amount <= 0) return 0;
+    const before = this.value;
     this.value = Math.min(this.max, this.value + amount);
+    const healed = this.value - before;
+    if (healed > 0) this._emitState(true);
+    return healed;
   }
 
   addSuppression(a) {
@@ -151,9 +158,12 @@ export class Health {
       if (!oldest || i.life > oldest.life) oldest = i;
     }
     slot = slot ?? oldest ?? this.indicators[0];
+    // A recycled *expired* slot must not fold its stale amount into this hit,
+    // so read the flag before claiming the slot.
+    const wasActive = slot.active;
     slot.active = true;
     slot.angle = angle;
-    slot.amount = Math.max(slot.active ? slot.amount * 0.5 : 0, amount);
+    slot.amount = Math.max(wasActive ? slot.amount * 0.5 : 0, amount);
     slot.life = 0;
     slot.worldX = from.x; slot.worldY = from.y; slot.worldZ = from.z;
   }

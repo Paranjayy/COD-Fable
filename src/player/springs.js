@@ -6,14 +6,23 @@
  * 33 ms hitch produce the same visible motion.
  */
 
+import { MAX_FRAME_DT } from '../core/config.js';
+
 export const TAU = Math.PI * 2;
 export const DEG = Math.PI / 180;
 
+/**
+ * Both clamps are the NaN barrier every caller assumes them to be: a bare
+ * comparison chain lets NaN through (both tests are false for it), and one NaN
+ * reaching a spring latches there forever and takes the camera with it.
+ */
 export function clamp(v, a, b) {
+  if (Number.isNaN(v)) return a;
   return v < a ? a : v > b ? b : v;
 }
 
 export function clamp01(v) {
+  if (Number.isNaN(v)) return 0;
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
@@ -84,6 +93,13 @@ export function hashNoise(x, seed = 0) {
 }
 
 const MAX_SUB_DT = 1 / 360;
+/**
+ * Enough sub-steps to integrate the engine's whole frame-dt clamp (36 of them
+ * at 1/360), plus one so float residue in the last slice is never left behind.
+ * A lower cap silently drops part of a long frame and the spring freezes
+ * mid-travel, which pops the moment the framerate recovers.
+ */
+const MAX_SUB_STEPS = Math.ceil(MAX_FRAME_DT / MAX_SUB_DT) + 1;
 
 /**
  * Damped harmonic oscillator, driven by frequency (Hz) and damping ratio.
@@ -125,7 +141,7 @@ export class Spring {
     // Sub-step so a stiff spring stays stable through a dropped frame.
     let remaining = dt;
     let guard = 0;
-    while (remaining > 1e-7 && guard++ < 24) {
+    while (remaining > 1e-7 && guard++ < MAX_SUB_STEPS) {
       const h = remaining > MAX_SUB_DT ? MAX_SUB_DT : remaining;
       remaining -= h;
       const a = -k * (this.value - this.target) - c * this.velocity;

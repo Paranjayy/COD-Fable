@@ -9,11 +9,16 @@
 export const TAU = Math.PI * 2;
 export const DEG = Math.PI / 180;
 
+/** Both clamps trap NaN: a bare comparison chain passes it straight through
+ *  (every test is false for NaN) and it then latches in whatever spring or
+ *  pose it reaches. */
 export function clamp(v, a, b) {
+  if (Number.isNaN(v)) return a;
   return v < a ? a : v > b ? b : v;
 }
 
 export function clamp01(v) {
+  if (Number.isNaN(v)) return 0;
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 

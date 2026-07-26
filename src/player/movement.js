@@ -89,7 +89,17 @@ export class Movement {
     this._footLeft = false;
     this._footHold = 0;
     this._tacSprintRequested = false;
-    this._edgeFrame = -1;
+
+    /**
+     * One-shot press buffers. `latchInput` sets them on the rising edge and the
+     * next fixed step drains them, so a rendered frame that contains no fixed
+     * step (anything above the 120 Hz physics rate) cannot eat a press, and a
+     * frame that contains several cannot fire one twice.
+     */
+    this._pressJump = false;
+    this._pressCrouch = false;
+    this._pressProne = false;
+    this._pressSprint = false;
 
     /** One-shot flags consumed (and cleared) by PlayerSystem each frame. */
     this.jumped = false;
@@ -177,7 +187,9 @@ export class Movement {
   /**
    * Latch the input snapshot for this rendered frame. Called from the first
    * fixed step of the frame (and from update() if the frame had none), so edge
-   * detection is exact regardless of how many substeps run.
+   * detection is exact regardless of how many substeps run. Press edges go into
+   * one-shot buffers rather than straight into `cmd`, because a frame latched
+   * from update() has no step left to consume them.
    */
   latchInput(frame) {
     if (frame === this._cmdFrame) return;
@@ -194,6 +206,7 @@ export class Movement {
       cmd.leanL = false; cmd.leanR = false;
       cmd.ads = false;
       prev.jump = prev.crouch = prev.prone = prev.sprint = false;
+      this._pressJump = this._pressCrouch = this._pressProne = this._pressSprint = false;
       return;
     }
 
@@ -206,12 +219,13 @@ export class Movement {
     const prone = input.action('prone');
     const sprint = input.action('sprint') || Math.abs(this.ctx.input.stick.moveY) > 0.92;
 
-    cmd.jump = jump && !prev.jump;
+    const jumpEdge = jump && !prev.jump;
+    const crouchEdge = crouch && !prev.crouch;
+    const proneEdge = prone && !prev.prone;
+    const sprintEdge = sprint && !prev.sprint;
+
     cmd.jumpHeld = jump;
-    cmd.crouchPressed = crouch && !prev.crouch;
-    cmd.pronePressed = prone && !prev.prone;
     cmd.sprintHeld = sprint;
-    cmd.sprintPressed = sprint && !prev.sprint;
     cmd.leanL = input.action('leanLeft');
     cmd.leanR = input.action('leanRight');
     cmd.ads = input.ads;
@@ -221,8 +235,16 @@ export class Movement {
     prev.prone = prone;
     prev.sprint = sprint;
 
-    if (cmd.jump) this._jumpBuffer = MOVE.jumpBuffer;
-    if (cmd.sprintPressed) {
+    // Buffer, never overwrite: an edge latched on a frame with no fixed step
+    // stays pending until a step drains it.
+    if (jumpEdge) {
+      this._pressJump = true;
+      this._jumpBuffer = MOVE.jumpBuffer;
+    }
+    if (crouchEdge) this._pressCrouch = true;
+    if (proneEdge) this._pressProne = true;
+    if (sprintEdge) {
+      this._pressSprint = true;
       const now = this.ctx.time.elapsed;
       if (now - this._lastSprintPress < MOVE.tacSprintTapWindow && this._tacSprintLock <= 0) {
         this._tacSprintRequested = true;
@@ -241,19 +263,16 @@ export class Movement {
     const cmd = this.cmd;
 
     // A rendered frame contains 0..N fixed steps but only ever *one* key press.
-    // Edge flags are therefore consumed by the first substep of the frame; the
-    // rest see them cleared. (Without this a 60 fps frame runs two substeps and
-    // toggles crouch twice — i.e. never crouches, and cancels a slide on the
-    // same step that started it.)
-    const frame = this.ctx.time.frame;
-    if (frame !== this._edgeFrame) {
-      this._edgeFrame = frame;
-    } else {
-      cmd.jump = false;
-      cmd.crouchPressed = false;
-      cmd.pronePressed = false;
-      cmd.sprintPressed = false;
-    }
+    // Drain the press buffers here so the first step after a press consumes it
+    // and every later step sees the flags cleared. (Without this a 60 fps frame
+    // runs two substeps and toggles crouch twice, i.e. never crouches, and it
+    // cancels a slide on the same step that started it. And a frame above
+    // 120 fps, which runs no step at all, would drop the press outright.)
+    cmd.jump = this._pressJump;
+    cmd.crouchPressed = this._pressCrouch;
+    cmd.pronePressed = this._pressProne;
+    cmd.sprintPressed = this._pressSprint;
+    this._pressJump = this._pressCrouch = this._pressProne = this._pressSprint = false;
 
     this.prevPosition.copy(this.position);
     this.stateTime += h;
@@ -979,6 +998,7 @@ export class Movement {
     this._bobPhase = 0;
     this._footHold = 0;
     this._jumpBuffer = 0;
+    this._pressJump = this._pressCrouch = this._pressProne = this._pressSprint = false;
     this.landEvent.pending = false;
     this.stepEvent.pending = false;
     this._setState('stand');

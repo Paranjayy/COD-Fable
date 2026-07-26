@@ -426,7 +426,9 @@ export class PlayerSystem {
   _onExplosion(e) {
     if (!e?.position) return;
     const eye = this.ctx.camera.position;
-    const r = e.radius ?? 5;
+    // `??` would accept 0 and NaN, and either makes `1 - d / r` non-finite,
+    // which latches trauma at NaN for the rest of the session.
+    const r = Number.isFinite(e.radius) && e.radius > 0 ? e.radius : 5;
     const d = this._tmp.copy(e.position).distanceTo(eye);
     if (d > r * 1.6) return;
     // Occluded blasts still shake you, they just do not wound you.
