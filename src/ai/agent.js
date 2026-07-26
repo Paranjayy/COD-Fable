@@ -213,7 +213,10 @@ export class Agent {
     this.peekSide = 0;
     this.peeking = false;
     this.peekTimer = this.rng.range(0.5, 2.5);
+    /** where the lean-out puts us: an offset from the cover anchor, not the anchor */
+    this.peekPos = new THREE.Vector3();
     this.grenadeCooldown = this.rng.range(9, 22);
+    /** carries grenades at all; `grenadeCooldown` is the ration timer between throws */
     this.hasGrenade = true;
 
     /* ---------------- navigation ---------------- */
@@ -422,6 +425,7 @@ export class Agent {
         if (!this.hasMoveTarget || this.position.distanceTo(this.moveTarget) < 1.2 || this.stateTime > 7) {
           this._setState(STATE.COMBAT);
           this.cover = null;
+          this.repathTimer = 0; // arriving on the flank looks for cover at once
         }
         if (this.suppression > 1.0) this._setState(STATE.COMBAT);
         break;
@@ -474,8 +478,11 @@ export class Agent {
       }
     }
 
-    // no cover yet, or the current one no longer protects: find one
-    if (!this.cover || this.repathTimer <= 0) {
+    // no cover yet, or the current one no longer protects: find one.
+    // The timer alone gates this: keying it on `!this.cover` as well meant an
+    // agent that found nothing re-ran the whole cover scan every single frame,
+    // because a failed pick leaves `cover` null and re-opens the gate.
+    if (this.repathTimer <= 0) {
       const pick = this.ai.cover?.pick(this.position, target, {
         id: this.id,
         squad: sq?.members,
@@ -483,7 +490,9 @@ export class Agent {
         maxRange: 30,
         maxTravel: this.cover ? 12 : 26,
       });
-      this.repathTimer = this.rng.range(2.2, 4.5);
+      // back off after a miss too, just less far: nothing about the map changed
+      // this frame, and the agent still shoots from where it stands meanwhile
+      this.repathTimer = pick ? this.rng.range(2.2, 4.5) : this.rng.range(0.9, 1.8);
       if (pick && pick !== this.cover) {
         this.cover = pick;
         this.coverPos.set(pick.x, pick.y, pick.z);
@@ -527,8 +536,11 @@ export class Agent {
         this.peeking = allowed && this.targetVisible !== false;
         this.peekTimer = this.peeking ? this.rng.range(1.1, 2.4) : this.rng.range(0.7, 1.8);
         if (this.peeking && this.cover) {
-          this.peekSide = this.ai.cover.peekOffset(this.cover, target, this.eyeHeight, this._v2);
-          this.coverPos.copy(this._v2);
+          // the lean-out goes in `peekPos`. Writing it into `coverPos` moved the
+          // anchor the drop test and `atCover` measure against, so two peeks to
+          // opposite sides put the agent 1.24 m from its "own" cover and it threw
+          // away a perfectly good spot.
+          this.peekSide = this.ai.cover.peekOffset(this.cover, target, this.eyeHeight, this.peekPos);
         }
       }
       this.crouch = this.cover ? !this.cover.high || !this.peeking : false;
@@ -540,11 +552,14 @@ export class Agent {
       }
     }
 
-    // flank when the player has been static and we have friends shooting
+    // flank when we have held this position a while and friends are shooting.
+    // (There was a `grenadeCooldown < 0 === false` term here, which precedence
+    // turned into "only while the grenade is not ready": nothing to do with
+    // flanking, and it killed the behaviour outright once the timer went
+    // negative, which it does within seconds and never comes back from.)
     if (
       sq &&
       this.stateTime > 4 &&
-      this.grenadeCooldown < 0 === false &&
       sq.canFlank(this) &&
       this.rng.float() < dt * 0.25
     ) {
@@ -787,8 +802,10 @@ export class Agent {
   }
 
   _throwGrenade(target) {
+    // The cooldown is the ration: a soldier carries more than one grenade, so
+    // clearing `hasGrenade` here retired him from throwing for the rest of the
+    // firefight and made both this reset and Squad.requestGrenade dead code.
     this.grenadeCooldown = this.rng.range(16, 34);
-    this.hasGrenade = false;
     const from = this._v.copy(this.animator.muzzleWorld);
     this.ai.throwGrenade(this, from, target);
   }

@@ -376,6 +376,22 @@ export class CoverMap {
     this.grid = grid;
     this.physics = physics;
     this.points = [];
+    /** claim id -> the point that agent holds, so a release is O(1) */
+    this.claims = new Map();
+    /**
+     * Coarse uniform buckets over `points`, built once by `build()`. `pick` only
+     * walks the buckets inside the caller's travel radius, which is the
+     * difference between a scan over every point on the map and a scan over the
+     * local neighbourhood. CSR layout (`bucketStart` offsets into `bucketItems`)
+     * so there is no per-bucket array and nothing to allocate at query time.
+     */
+    this.bucketSize = 4;
+    this.bucketMinX = 0;
+    this.bucketMinZ = 0;
+    this.bucketNX = 0;
+    this.bucketNZ = 0;
+    this.bucketStart = null;
+    this.bucketItems = null;
     this._v = new THREE.Vector3();
     this._v2 = new THREE.Vector3();
     this._v3 = new THREE.Vector3();
@@ -423,8 +439,56 @@ export class CoverMap {
         }
       }
     }
+    this.claims.clear();
+    this._buildBuckets();
     this.buildMs = performance.now() - t0;
     return this;
+  }
+
+  /** Bucket index for a world position, clamped to the grid. */
+  _bucketOf(x, z) {
+    const s = this.bucketSize;
+    let bx = Math.floor((x - this.bucketMinX) / s);
+    let bz = Math.floor((z - this.bucketMinZ) / s);
+    if (bx < 0) bx = 0; else if (bx >= this.bucketNX) bx = this.bucketNX - 1;
+    if (bz < 0) bz = 0; else if (bz >= this.bucketNZ) bz = this.bucketNZ - 1;
+    return bz * this.bucketNX + bx;
+  }
+
+  /** Counting sort of the points into the bucket grid: tally, prefix sum, scatter. */
+  _buildBuckets() {
+    const pts = this.points;
+    if (pts.length === 0) {
+      this.bucketNX = 0;
+      this.bucketNZ = 0;
+      this.bucketStart = new Int32Array(1);
+      this.bucketItems = new Int32Array(0);
+      return;
+    }
+    let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.z < minZ) minZ = p.z;
+      if (p.z > maxZ) maxZ = p.z;
+    }
+    this.bucketMinX = minX;
+    this.bucketMinZ = minZ;
+    this.bucketNX = Math.floor((maxX - minX) / this.bucketSize) + 1;
+    this.bucketNZ = Math.floor((maxZ - minZ) / this.bucketSize) + 1;
+    const n = this.bucketNX * this.bucketNZ;
+    const start = new Int32Array(n + 1);
+    for (let i = 0; i < pts.length; i++) start[this._bucketOf(pts[i].x, pts[i].z) + 1]++;
+    for (let b = 0; b < n; b++) start[b + 1] += start[b];
+    const items = new Int32Array(pts.length);
+    const cursor = new Int32Array(n);
+    for (let i = 0; i < pts.length; i++) {
+      const b = this._bucketOf(pts[i].x, pts[i].z);
+      items[start[b] + cursor[b]++] = i;
+    }
+    this.bucketStart = start;
+    this.bucketItems = items;
   }
 
   /**
@@ -444,45 +508,72 @@ export class CoverMap {
     let best = null;
     let bestScore = -Infinity;
     const tx = threat.x, tz = threat.z;
-    for (let i = 0; i < this.points.length; i++) {
-      const p = this.points[i];
-      if (p.claimed >= 0 && p.claimed !== claimId) continue;
-      const toThreatX = tx - p.x, toThreatZ = tz - p.z;
-      const dT = Math.hypot(toThreatX, toThreatZ);
-      if (dT < 2.5 || dT > 40) continue;
-      const travel = Math.hypot(p.x - pos.x, p.z - pos.z);
-      if (travel > maxTravel) continue;
-      if (yRef !== null && Math.abs(p.y - yRef) > yTol) continue;
-      // protection: the blocker must be on the threat side
-      const prot = (toThreatX / dT) * p.dx + (toThreatZ / dT) * p.dz;
-      if (prot < 0.25) continue;
-      let score = prot * 5 + (p.high ? 2.2 : 1.0);
-      // range preference
-      if (dT < wantMin) score -= (wantMin - dT) * 0.55;
-      else if (dT > wantMax) score -= (dT - wantMax) * 0.28;
-      score -= travel * 0.16;
-      // do not bunch up
-      if (squad) {
-        for (const other of squad) {
-          if (!other || other.id === claimId || !other.alive) continue;
-          const d = Math.hypot(other.position.x - p.x, other.position.z - p.z);
-          if (d < 3.2) score -= (3.2 - d) * 1.4;
+    const pts = this.points;
+    const start = this.bucketStart;
+    const items = this.bucketItems;
+    if (!start || this.bucketNX === 0) return null;
+    // Only the buckets that can hold a point within `maxTravel` of the agent: a
+    // point further than that is rejected by the travel test anyway, so walking
+    // the whole map to find it is wasted work.
+    const s = this.bucketSize;
+    const maxTravel2 = maxTravel * maxTravel;
+    const bx0 = Math.max(0, Math.floor((pos.x - maxTravel - this.bucketMinX) / s));
+    const bx1 = Math.min(this.bucketNX - 1, Math.floor((pos.x + maxTravel - this.bucketMinX) / s));
+    const bz0 = Math.max(0, Math.floor((pos.z - maxTravel - this.bucketMinZ) / s));
+    const bz1 = Math.min(this.bucketNZ - 1, Math.floor((pos.z + maxTravel - this.bucketMinZ) / s));
+    for (let bz = bz0; bz <= bz1; bz++) {
+      const row = bz * this.bucketNX;
+      for (let bx = bx0; bx <= bx1; bx++) {
+        const b = row + bx;
+        for (let k = start[b]; k < start[b + 1]; k++) {
+          const p = pts[items[k]];
+          // distance first: it is two multiplies and rejects the corners of the
+          // bucket window before any of the scoring work
+          const trX = p.x - pos.x, trZ = p.z - pos.z;
+          const travel2 = trX * trX + trZ * trZ;
+          if (travel2 > maxTravel2) continue;
+          if (p.claimed >= 0 && p.claimed !== claimId) continue;
+          if (yRef !== null && Math.abs(p.y - yRef) > yTol) continue;
+          const toThreatX = tx - p.x, toThreatZ = tz - p.z;
+          const dT = Math.hypot(toThreatX, toThreatZ);
+          if (dT < 2.5 || dT > 40) continue;
+          // protection: the blocker must be on the threat side
+          const prot = (toThreatX / dT) * p.dx + (toThreatZ / dT) * p.dz;
+          if (prot < 0.25) continue;
+          let score = prot * 5 + (p.high ? 2.2 : 1.0);
+          // range preference
+          if (dT < wantMin) score -= (wantMin - dT) * 0.55;
+          else if (dT > wantMax) score -= (dT - wantMax) * 0.28;
+          score -= Math.sqrt(travel2) * 0.16;
+          // do not bunch up
+          if (squad) {
+            for (const other of squad) {
+              if (!other || other.id === claimId || !other.alive) continue;
+              const d = Math.hypot(other.position.x - p.x, other.position.z - p.z);
+              if (d < 3.2) score -= (3.2 - d) * 1.4;
+            }
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            best = p;
+          }
         }
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        best = p;
       }
     }
     if (best && claimId >= 0) {
-      for (const p of this.points) if (p.claimed === claimId) p.claimed = -1;
+      const held = this.claims.get(claimId);
+      if (held && held !== best) held.claimed = -1;
       best.claimed = claimId;
+      this.claims.set(claimId, best);
     }
     return best;
   }
 
   release(claimId) {
-    for (const p of this.points) if (p.claimed === claimId) p.claimed = -1;
+    const held = this.claims.get(claimId);
+    if (!held) return;
+    held.claimed = -1;
+    this.claims.delete(claimId);
   }
 
   /**
