@@ -108,8 +108,12 @@ void main() {
 
   for ( int i = 0; i < SQRT_SAMPLES; i ++ ) {
     for ( int j = 0; j < SQRT_SAMPLES; j ++ ) {
-      // Uniform on the sphere: theta linear, cos(phi) linear.
-      float theta = SK_PI * ( float( i ) + 0.5 ) / float( SQRT_SAMPLES );
+      // Uniform on the sphere: theta linear over the FULL turn, cos(phi) linear.
+      // Half a turn covers only the sun-facing half of the sphere (rayDir.x is
+      // then never negative, and the sun sits at x >= 0), while invSamples still
+      // averages as if the whole sphere had been sampled, so psi_ms came back
+      // systematically too high, amplified again by the 1/(1-fms) series below.
+      float theta = 2.0 * SK_PI * ( float( i ) + 0.5 ) / float( SQRT_SAMPLES );
       float phi = skSafeAcos( 1.0 - 2.0 * ( float( j ) + 0.5 ) / float( SQRT_SAMPLES ) );
       float cp = cos( phi ), sp = sin( phi );
       vec3 rayDir = vec3( sp * sin( theta ), cp, sp * cos( theta ) );

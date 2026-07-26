@@ -25,6 +25,32 @@ const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
  */
 const PRACTICAL_RANGE = 30;
 
+/**
+ * The settings that only reach their uniform through `_applySettings()`.
+ *
+ * Everything else in `settings` is read straight out of the object by the frame
+ * loop (vignette, shutter, exposureKey, the dof block, the fill budgets, the
+ * viewmodel rig) and is therefore live by construction. These are not: they are
+ * pushed into a uniform or into a sub-pass once and then never looked at again,
+ * so the frame has to notice when one of them moves. Comparing thirteen numbers
+ * per frame is cheaper than the writes it replaces.
+ */
+const APPLIED_SETTINGS = [
+  'chromatic',
+  'vignette',
+  'grain',
+  'bloomStrength',
+  'lutStrength',
+  'sharpen',
+  'bloomThreshold',
+  'bloomKnee',
+  'shadowStrength',
+  'aoRadius',
+  'aoIntensity',
+  'contactLength',
+  'contactStrength',
+];
+
 // Full-daylight key intensity (SUN_ILLUMINANCE_TOP through a clear atmosphere).
 // Only used to normalise the viewmodel rig, never to light anything.
 const REF_DAYLIGHT = 4.6;
@@ -71,7 +97,8 @@ const REF_DAYLIGHT = 4.6;
  *   r.renderer                THREE.WebGLRenderer (do not change state mid-frame)
  *   r.screenSize              { width, height } of the internal HDR target
  *   r.displaySize             { width, height } of the canvas backbuffer
- *   r.depthTexture            R32F linear view depth in METRES (positive)
+ *   r.depthTexture            R32F linear view depth in METRES (positive), or
+ *                             R16F without EXT_color_buffer_float
  *   r.velocityTexture         RG16F screen-space velocity as a UV delta
  *   r.normalTexture           RGBA16F oct-encoded VIEW normal (xy), coverage (z:
  *                             1 = static geometry, 0.7 = skinned/morphed, 0 =
@@ -194,7 +221,7 @@ export class RenderSystem {
       quality: this.qLevel,
     });
 
-    this.gbuffer = new GBuffer();
+    this.gbuffer = new GBuffer(renderer);
     this.gtao = q.gtao ? new Gtao() : null;
     this.contact = this.qLevel >= 1 ? new ContactShadows() : null;
     this.ssr = q.ssr ? new Ssr() : null;
@@ -456,6 +483,7 @@ export class RenderSystem {
       shadowStrength: 1.0,
       sunSoftness: 0.024,
     };
+    this._appliedSettings = {};
     this._applySettings();
 
     this.probe = new RenderProbeScene(this.rng.fork());
@@ -841,6 +869,17 @@ export class RenderSystem {
     return { cols, rows, cells: res };
   }
 
+  /**
+   * Push every setting in APPLIED_SETTINGS into the uniform or sub-pass that
+   * owns it, and remember what was written.
+   *
+   * `r.settings` is documented as live tuning, and for most of it that is true
+   * because `render()` reads the value itself every frame. For this handful it
+   * was not: they were written here, once, during init, so `settings.aoIntensity
+   * = 2` (or the grain, the CA, the LUT strength, the contact shadow length, the
+   * shadow strength...) silently did nothing after boot and every debug slider
+   * and accessibility toggle built on the documented API was inert.
+   */
   _applySettings() {
     const s = this.settings;
     const cu = this.composite.uniforms;
@@ -859,6 +898,22 @@ export class RenderSystem {
       this.contact.setLength(s.contactLength);
       this.contact.setStrength(s.contactStrength);
     }
+    const last = this._appliedSettings;
+    for (let i = 0; i < APPLIED_SETTINGS.length; i++) {
+      const k = APPLIED_SETTINGS[i];
+      last[k] = s[k];
+    }
+  }
+
+  /** True when a setting `_applySettings` owns has moved since it last ran. */
+  _settingsDirty() {
+    const s = this.settings;
+    const last = this._appliedSettings;
+    for (let i = 0; i < APPLIED_SETTINGS.length; i++) {
+      const k = APPLIED_SETTINGS[i];
+      if (s[k] !== last[k]) return true;
+    }
+    return false;
   }
 
   // ==========================================================================
@@ -1283,6 +1338,9 @@ export class RenderSystem {
     this._camPos.setFromMatrixPosition(camera.matrixWorld);
     this._cullLights(this._camPos);
     this._adsT = this._readAds();
+    // Ahead of the cascades and the AO/contact passes, so a setting changed
+    // between two frames is in effect for the whole of the next one.
+    if (this._settingsDirty()) this._applySettings();
 
     if (ctx.scene.environment !== this.envMap) {
       // somebody installed a better environment — adopt it everywhere
@@ -1386,9 +1444,19 @@ export class RenderSystem {
       this._tmpV3.setFromMatrixPosition(viewCamera.matrixWorld);
       const coherent = this._tmpV3.distanceToSquared(this._camPos) < 0.25;
       const prevStrength = this.csm.uniforms.owCsmParams.value.x;
-      const prevFeat = feat.y;
+      const prevFeatX = feat.x;
+      const prevFeatY = feat.y;
+      const prevFeatZ = feat.z;
       if (!coherent) this.csm.uniforms.owCsmParams.value.x = 0;
-      feat.y = 0; // contact shadows are a world-space buffer; not for the gun
+      // GTAO, contact shadows and SSR are all WORLD screen-space buffers, and
+      // every one of them is fetched at `gl_FragCoord.xy * owScreenTexel`. The
+      // viewmodel target is the same resolution as the world one, so a gun pixel
+      // reads whatever world geometry happens to be BEHIND it: the AO of a wall
+      // sliding across the receiver as the player turns, and the street swimming
+      // in the optic glass and the anodised rail. All three are excluded.
+      feat.x = 0;
+      feat.y = 0;
+      feat.z = 0;
       this.csm.uniforms.owSunDirView.value
         .copy(this.sunDir)
         .transformDirection(viewCamera.matrixWorldInverse)
@@ -1423,7 +1491,9 @@ export class RenderSystem {
       renderer.setClearColor(0x000000, 1);
 
       this.csm.uniforms.owCsmParams.value.x = prevStrength;
-      feat.y = prevFeat;
+      feat.x = prevFeatX;
+      feat.y = prevFeatY;
+      feat.z = prevFeatZ;
       uSky.copy(this._fillSkySave);
       uGnd.copy(this._fillGroundSave);
       this.patcher.uniforms.owIndirect.value.z = roomN;

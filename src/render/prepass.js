@@ -7,7 +7,8 @@ import { COMMON } from './glsl.js';
  * Three MRT attachments:
  *   0  RGBA16F  octahedral view normal (xy), coverage (z), material id (w)
  *   1  RG16F    screen-space velocity as a UV delta (current - previous)
- *   2  R32F     linear view depth in metres (positive)
+ *   2  R32F     linear view depth in metres (positive); R16F where the driver
+ *               has no EXT_color_buffer_float (see pickDepthType)
  *
  * Coverage is 1.0 for ordinary geometry and OW_COVERAGE_DYNAMIC (0.7) for
  * geometry whose *vertices* move independently of its transform — skinned
@@ -30,11 +31,43 @@ import { COMMON } from './glsl.js';
 /** Coverage written for skinned / morphed geometry. See the class note. */
 export const OW_COVERAGE_DYNAMIC = 0.7;
 
+/**
+ * Type for the linear-depth attachment.
+ *
+ * WebGL2 makes RGBA16F/RG16F/R16F colour-renderable, but NOT R32F: that needs
+ * EXT_color_buffer_float, and an implementation that ships only
+ * EXT_color_buffer_half_float is entitled to refuse it. One refused attachment
+ * makes the whole three-target framebuffer INCOMPLETE, so the prepass writes
+ * nothing and GTAO, contact shadows, SSR, TAA, motion blur and the ADS DOF all
+ * read garbage, with no diagnostic beyond a raw GL warning.
+ *
+ * Half float costs precision, not range: 65504 is far past the 1200 m far plane,
+ * the sky sentinel of exactly 0 is exact, and the ULP is 6 cm at 100 m and 1 m at
+ * the far plane. Every consumer either reconstructs a view position against a
+ * geometric scale orders of magnitude coarser (GTAO's ~0.9 m radius, SSR's 24 m
+ * ray, the DOF ramps, the fog's 900 m march) or compares depths *relatively*
+ * (TAA's closest-of-9, motion blur's background reject). GTAO's own temporal
+ * reject and both bilateral blurs already run off half-precision depth copies
+ * today. Contact shadows have the least headroom (a 0.0025*d slope bias against
+ * a 0.00098*d ULP) and soft particles the least of all, since an 8 cm fade band
+ * stops resolving past ~64 m. Degrading those two beats an incomplete FBO.
+ */
+function pickDepthType(renderer) {
+  if (renderer && renderer.extensions.has('EXT_color_buffer_float')) return THREE.FloatType;
+  console.warn(
+    '[prepass] EXT_color_buffer_float unavailable: linear depth falls back to ' +
+      'R16F (6 cm precision at 100 m, 1 m at the far plane)'
+  );
+  return THREE.HalfFloatType;
+}
+
 export class GBuffer {
-  constructor() {
+  /** @param {THREE.WebGLRenderer} [renderer] queried once for float renderability */
+  constructor(renderer) {
     this.rt = null;
     this.width = 1;
     this.height = 1;
+    this.depthType = pickDepthType(renderer);
     this.prev = new Map();
     this._seen = new Set();
 
@@ -163,7 +196,7 @@ export class GBuffer {
     rt.textures[1].name = 'gb-velocity';
 
     rt.textures[2].format = THREE.RedFormat;
-    rt.textures[2].type = THREE.FloatType;
+    rt.textures[2].type = this.depthType;
     rt.textures[2].name = 'gb-depth';
 
     for (const t of rt.textures) {
