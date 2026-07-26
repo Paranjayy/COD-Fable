@@ -38,6 +38,12 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.004, 60);
+// The viewmodel owns its view camera's FOV (it drives it off the ADS blend), so
+// the framing camera has to be a different object, exactly as the engine keeps
+// `camera` and `viewCamera` apart. Sharing one camera let the first tick stamp
+// 60 degrees over the 34 to 40 degree field the static views solve their
+// distance from, which mis-framed every captured shot.
+const viewCamera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.004, 60);
 
 /* ----------------------------------------------------------------- studio -- */
 const skyMat = new THREE.ShaderMaterial({
@@ -97,7 +103,7 @@ const ctx = {
   scene,
   camera,
   viewScene: scene,
-  viewCamera: camera,
+  viewCamera,
   canvas,
   config: { quality: 'ultra', q: { anisotropy: 16 } },
   events,
@@ -115,6 +121,10 @@ vm.trackCamera = FIRST_PERSON;
 if (!FIRST_PERSON) {
   vm.rigOverride = { position: new THREE.Vector3(), quaternion: new THREE.Quaternion() };
 }
+// First-person views want the gun seen through the viewmodel's own lens (the
+// tracked pose and the ADS-blended FOV); the static views want the framing
+// camera solved below, which nothing else is allowed to touch.
+const renderCamera = FIRST_PERSON ? viewCamera : camera;
 
 const builders = { rifle: buildRifle, smg: buildSmg, pistol: buildPistol };
 const stats = {};
@@ -264,7 +274,7 @@ function tick() {
     }
     vm.update(dt, state);
   }
-  renderer.render(scene, camera);
+  renderer.render(scene, renderCamera);
   if (++frames === Math.max(4, GRAB)) {
     window.__INFO__ = {
       weapon: WEAPON,
@@ -292,4 +302,6 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight, false);
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
+  viewCamera.aspect = innerWidth / innerHeight;
+  viewCamera.updateProjectionMatrix();
 });

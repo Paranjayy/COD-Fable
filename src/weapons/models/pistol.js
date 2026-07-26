@@ -216,6 +216,13 @@ export function buildPistol() {
   });
   const opticY = bore + slideH * 0.5 + 0.0018 + 0.021 * 0.56;
   const opticZ = zSlideRear - 0.038 + 0.0455 * 0.14;
+  // The reflex was built in SLIDE space, and the slide group rides at
+  // slideRest.pos = [0, bore, 0]. The viewmodel reads `optic.center` as weapon
+  // space, so lift the lens centre onto the bore the way `sight` already is.
+  const opticGlass = {
+    ...reflex,
+    center: [reflex.center[0], reflex.center[1] + bore, reflex.center[2]],
+  };
 
   const magazine = new Assembly('pistol-mag');
   const mag = buildMagazine(magazine, null, {
@@ -281,7 +288,7 @@ export function buildPistol() {
       slideTravel: [0, 0, 0.0225],
       triggerPivot: { pos: [0, bore - 0.0135, -0.0165], rot: [0, 0, 0] },
       triggerPull: -0.3,
-      opticGlass: reflex,
+      opticGlass,
       slideGeom: slide,
     },
     shell: { caseLen: 0.0192, rimR: 0.00478 },
