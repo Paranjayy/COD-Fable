@@ -22,8 +22,37 @@ npm install
 npm run dev          # http://127.0.0.1:5173
 ```
 
-Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
-R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
+## How to play
+
+1. **Open** `http://127.0.0.1:5173` in your browser
+2. **Click** the canvas to lock your mouse cursor
+3. **Move** with WASD keys
+4. **Aim** with your mouse
+5. **Shoot** with left mouse button (LMB)
+6. **Press Esc** to release the cursor and access menus
+
+### Controls
+
+| Action | Key |
+|---|---|
+| Move | `W` `A` `S` `D` |
+| Aim | Mouse |
+| Fire | Left Mouse Button |
+| Aim Down Sights (ADS) | Right Mouse Button |
+| Reload | `R` |
+| Sprint | `Shift` |
+| Crouch | `Ctrl` |
+| Jump | `Space` |
+| Lean Left/Right | `Q` / `E` |
+| Release Cursor | `Esc` |
+
+### Tips
+
+- **Sprint** holds `Shift` while moving — great for closing distance quickly
+- **Crouch** (`Ctrl`) reduces your profile and makes you harder to hit
+- **Lean** (`Q`/`E`) lets you peek around corners without fully exposing yourself
+- **ADS** (Right Mouse Button) gives you better accuracy but slower movement
+- **Jump** (`Space`) to reach higher ground or avoid incoming fire
 
 ## Quality presets
 
