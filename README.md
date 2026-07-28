@@ -9,13 +9,67 @@ A first-person shooter built in the browser with Three.js r180 and WebGL2. Rough
 procedurally at load time from code. No models, no HDRIs, no image files, no audio
 files. The only runtime dependency is `three`.
 
+## Prerequisites
+
+- **Node.js >= 18** (tested on v22.22.2)
+- **npm >= 9**
+- **WebGL2-capable browser** (Chrome 110+, Firefox 120+, Safari 16+)
+
+## Quick start
+
 ```bash
 npm install
 npm run dev          # http://127.0.0.1:5173
 ```
 
-Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
-R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
+## How to play
+
+1. **Open** `http://127.0.0.1:5173` in your browser
+2. **Click** the canvas to lock your mouse cursor
+3. **Move** with WASD keys
+4. **Aim** with your mouse
+5. **Shoot** with left mouse button (LMB)
+6. **Press Esc** to release the cursor and access menus
+
+### Controls
+
+| Action | Key |
+|---|---|
+| Move | `W` `A` `S` `D` |
+| Aim | Mouse |
+| Fire | Left Mouse Button |
+| Aim Down Sights (ADS) | Right Mouse Button |
+| Reload | `R` |
+| Sprint | `Shift` |
+| Crouch | `Ctrl` |
+| Jump | `Space` |
+| Lean Left/Right | `Q` / `E` |
+| Release Cursor | `Esc` |
+
+### Tips
+
+- **Sprint** holds `Shift` while moving — great for closing distance quickly
+- **Crouch** (`Ctrl`) reduces your profile and makes you harder to hit
+- **Lean** (`Q`/`E`) lets you peek around corners without fully exposing yourself
+- **ADS** (Right Mouse Button) gives you better accuracy but slower movement
+- **Jump** (`Space`) to reach higher ground or avoid incoming fire
+
+## Quality presets
+
+The game ships with four quality presets. Choose one at launch:
+
+| URL | Target |
+|---|---|
+| `http://127.0.0.1:5173/?q=low` | Integrated GPU, 1080p, 30 fps |
+| `http://127.0.0.1:5173/?q=medium` | Mid-range GPU, 1080p, 60 fps |
+| `http://127.0.0.1:5173/?q=high` | Desktop GPU, 1440p, 60 fps |
+| `http://127.0.0.1:5173/?q=ultra` | Flagship GPU, 4K, 60+ fps |
+
+Omitting `?q=` defaults to `high`.
+
+> **Performance warning:** At `ultra` on Retina / HiDPI displays the internal
+> render target exceeds 3 MP. Expect 20–30 fps on mid-range hardware. Use
+> `?q=medium` or `?q=low` if the game feels unplayable.
 
 ## What's in it
 
@@ -49,18 +103,13 @@ The interesting part of this repo is arguably the harness, not the game.
 | `tools/profile.mjs` | Gameplay profiler at real device pixel ratio. Frame-time *distribution* and hitch attribution via per-frame WebGL program counts |
 | `tools/playtest.mjs` | Scripted movement/fire smoke test |
 
-Two findings worth recording, because both invalidated earlier measurements:
+### Screenshot tools require Playwright
 
-**Median frame time hides the actual problem.** A static-camera benchmark reported
-94 fps while the game was unplayable. Real gameplay at Retina DPR (internal 3.34 MP,
-not 2.07) ran 12–17 fps with **728–1236 ms stalls** caused by 34+ WebGL programs
-compiling lazily mid-frame. `profile.mjs` reports p50/p95/p99 and attributes each
-hitch, which is what surfaced it.
+The capture and profiling tools use headless Chromium via Playwright. Install it once:
 
-**Captures were not reproducible.** `shotset.mjs` reuses one page across all 11
-shots, so particle age, decal buffers and exposure state leak forward — two identical
-runs differed on 10 of 11 shots. `baseline.mjs` isolates each shot in a fresh page,
-which is bit-identical and is what makes `imagediff.mjs` a usable gate.
+```bash
+npx playwright install chromium
+```
 
 ## Performance
 
@@ -83,6 +132,19 @@ Shader pre-warm (`src/core/prewarm.js`) is what removed the stalls. Making it
 *provably* pixel-neutral required first fixing subsystems that animated off
 `performance.now()` instead of the engine clock, since any change to boot duration
 otherwise shifted output.
+
+### Two findings worth recording
+
+**Median frame time hides the actual problem.** A static-camera benchmark reported
+94 fps while the game was unplayable. Real gameplay at Retina DPR (internal 3.34 MP,
+not 2.07) ran 12–17 fps with **728–1236 ms stalls** caused by 34+ WebGL programs
+compiling lazily mid-frame. `profile.mjs` reports p50/p95/p99 and attributes each
+hitch, which is what surfaced it.
+
+**Captures were not reproducible.** `shotset.mjs` reuses one page across all 11
+shots, so particle age, decal buffers and exposure state leak forward — two identical
+runs differed on 10 of 11 shots. `baseline.mjs` isolates each shot in a fresh page,
+which is bit-identical and is what makes `imagediff.mjs` a usable gate.
 
 ## Honest assessment
 
