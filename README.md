@@ -17,6 +17,14 @@ npm run dev          # http://127.0.0.1:5173
 Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
 R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
 
+## Screenshots
+
+![Screenshot 1](public/screenshots/Screenshot%202026-07-29%20003343.png)
+![Screenshot 2](public/screenshots/Screenshot%202026-07-29%20003449.png)
+![Screenshot 3](public/screenshots/Screenshot%202026-07-29%20003544.png)
+![Screenshot 4](public/screenshots/Screenshot%202026-07-29%20004003.png)
+![Screenshot 5](public/screenshots/Screenshot%202026-07-29%20004045.png)
+
 ## What's in it
 
 | subsystem | what it does |
