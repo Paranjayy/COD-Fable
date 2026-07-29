@@ -84,6 +84,7 @@ try {
 
   for (const name of wanted) {
     if (!all.includes(name)) {
+      report.ok = false;
       report.shots.push({ shot: name, ok: false, error: 'unknown shot' });
       continue;
     }
@@ -92,6 +93,11 @@ try {
       ({ s, settle }) => window.__APPLY_SHOT__(s, { grabFrame: settle }),
       { s: name, settle: SETTLE }
     );
+    if (!applied || typeof applied !== 'object' || applied.error) {
+      report.ok = false;
+      report.shots.push({ shot: name, ok: false, error: applied?.error ?? 'shot API unavailable' });
+      continue;
+    }
     await page.evaluate(
       (n) =>
         new Promise((done) => {
@@ -106,7 +112,7 @@ try {
     const info = await page.evaluate('window.__RENDER_INFO__ ?? null');
     report.shots.push({
       shot: name,
-      ok: !applied?.error,
+      ok: true,
       file,
       doc: await page.evaluate((s) => window.__SHOTS__[s]?.doc ?? '', name),
       info,
