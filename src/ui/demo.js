@@ -1,4 +1,13 @@
-import * as THREE from 'three';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+
+/**
+ * カメラのローカル軸。scene.useRightHandedSystem = true なので前方は -Z。
+ * getDirectionToRef はカメラのワールド行列を使うので、FreeCamera が
+ * rotationQuaternion ではなく Euler の rotation で駆動されていても正しく動く
+ * (player/camera.js は rotation を書いている)。
+ */
+const FORWARD_LOCAL = new Vector3(0, 0, -1);
+const RIGHT_LOCAL = new Vector3(1, 0, 0);
 
 /**
  * Scripted mid-combat HUD state for `debugState('combat')`.
@@ -19,8 +28,8 @@ export class CombatDemo {
   constructor() {
     this.active = false;
     this.frame = 0;
-    this._p = new THREE.Vector3();
-    this._q = new THREE.Vector3();
+    this._p = new Vector3();
+    this._q = new Vector3();
   }
 
   start(ui) {
@@ -71,9 +80,9 @@ export class CombatDemo {
     }
 
     ui.setObjectives([
-      { position: new THREE.Vector3(-6.5, 1.4, -2.5), label: 'A', name: 'PLANT' },
-      { position: new THREE.Vector3(15.5, 1.4, -11), label: 'B', name: 'HOLD' },
-      { position: new THREE.Vector3(-19, 1.4, 25), label: 'C', name: 'EXFIL' },
+      { position: new Vector3(-6.5, 1.4, -2.5), label: 'A', name: 'PLANT' },
+      { position: new Vector3(15.5, 1.4, -11), label: 'B', name: 'HOLD' },
+      { position: new Vector3(-19, 1.4, 25), label: 'C', name: 'EXFIL' },
     ]);
 
     // Enemy / friendly contacts around the player for the minimap.
@@ -94,12 +103,26 @@ export class CombatDemo {
     ui.clearPrompt();
   }
 
-  /** Point `d` metres ahead of the camera, offset sideways/up, for hit FX. */
+  /**
+   * カメラの前方 `forward` m、右に `side` m の点。高さはカメラ基準で `up` m。
+   *
+   * 返すのは共有スクラッチ (`this._p`)。呼び出し側は次の _worldPoint() まで
+   * しか保持できない — markers 側は受け取った直後に copyFromFloats で自分の
+   * 領域へ写しているので問題ない。
+   *
+   * add() ではなく addInPlace() を使うのは毎フレームのアロケーション禁止
+   * (ARCHITECTURE Hard rule 5) のため。Babylon の add() は新しい Vector3 を返す。
+   */
   _worldPoint(ui, forward, side, up) {
     const cam = ui.ctx.camera;
-    this._p.set(0, 0, -1).applyQuaternion(cam.quaternion).multiplyScalar(forward);
-    this._q.set(1, 0, 0).applyQuaternion(cam.quaternion).multiplyScalar(side);
-    return this._p.add(this._q).add(cam.position).setY(cam.position.y + up);
+    const eye = cam.globalPosition;
+    cam.getDirectionToRef(FORWARD_LOCAL, this._p);
+    this._p.scaleInPlace(forward);
+    cam.getDirectionToRef(RIGHT_LOCAL, this._q);
+    this._q.scaleInPlace(side);
+    this._p.addInPlace(this._q).addInPlace(eye);
+    this._p.y = eye.y + up;
+    return this._p;
   }
 
   _fire(ui) {

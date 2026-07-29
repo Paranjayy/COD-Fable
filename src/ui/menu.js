@@ -46,11 +46,19 @@ export class PauseMenu {
 
     // ---- field of view ---------------------------------------------------
     this.fov = this._slider('Field Of View', 65, 120, 1, (v) => {
+      // config.fov は「垂直 FOV の度数」で、これが SSOT (src/core/engine.js 参照)。
       this.ctx.config.fov = v;
       const cam = this.ctx.camera;
       if (cam) {
-        cam.fov = v;
-        cam.updateProjectionMatrix();
+        // **Babylon の camera.fov はラジアン。** 度をそのまま代入すると画角が
+        // 数十倍になって世界が裏返る。また Babylon には Three の
+        // updateProjectionMatrix() に相当するものは無く、fov を書き換えれば
+        // 次のフレームで投影行列が作り直される (Camera のキャッシュ比較による)。
+        //
+        // player が居るときは player/camera.js が毎フレーム config.fov から
+        // camera.fov を上書きするので、ここでの代入は「player 不在でも FOV
+        // スライダが効く」ための保険。
+        cam.fov = (v * Math.PI) / 180;
       }
       this.ctx.events.emit('ui:fov', { value: v });
       return String(v | 0);

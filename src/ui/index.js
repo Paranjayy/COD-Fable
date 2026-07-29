@@ -1,5 +1,6 @@
-import * as THREE from 'three';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { installStyles, removeStyles } from './style.js';
+import { CameraView } from './camera-view.js';
 import { el, clamp, clamp01, damp, setStyle } from './util.js';
 import { Crosshair } from './crosshair.js';
 import { Hitmarkers } from './hitmarkers.js';
@@ -59,6 +60,22 @@ const MAX_BLIPS = 48;
  * Events consumed: weapon:fire, weapon:reload, damage:dealt, damage:taken,
  * actor:death, player:state, explosion, resize.
  * Events emitted:  ui:pause, ui:quality, ui:sensitivity, ui:fov, ui:setting.
+ *
+ * ---------------------------------------------------------------------------
+ * Babylon 移植メモ
+ * ---------------------------------------------------------------------------
+ * この subsystem は DOM/CSS の HUD なので描画ライブラリにほとんど依存しない。
+ * Babylon 固有なのは次の 3 点だけで、すべて `CameraView` に閉じ込めてある:
+ *
+ *   - ワールド → 画面ピクセルの射影 (markers)
+ *   - カメラの水平基底と方位 (damage arcs / compass / minimap)
+ *   - `camera.fov` がラジアンであること (minimap の視野コーン)
+ *
+ * 座標を扱うときの共通の罠として、**Babylon の `Vector3.copyFrom()` はプレーンな
+ * `{x,y,z}` を受け付けない** (内部で `source._x` を読む) 点に注意。イベント
+ * ペイロードは素のオブジェクトであることがあるので、外部由来の座標は必ず
+ * `_copyPoint()` / `copyFromFloats()` 経由で取り込む。黙って NaN になり、HUD の
+ * 要素が画面から消えるだけで例外は出ないため、事故に気づきにくい。
  */
 export class UiSystem {
   static id = 'ui';
@@ -134,12 +151,12 @@ export class UiSystem {
     this._lastKillAt = -10;
     this._regenTimer = 0;
     this._hadPointerLock = false;
-    this._bakeFrame = 0;
 
-    this._pos = new THREE.Vector3();
-    this._prevPos = new THREE.Vector3();
-    this._dir = new THREE.Vector3();
-    this._tmp = new THREE.Vector3();
+    /** カメラ由来の情報 (射影・基底・方位・FOV) の SSOT。 */
+    this.view = new CameraView();
+
+    this._pos = new Vector3();
+    this._prevPos = new Vector3();
     this._objectives = [];
     this._compassObjs = [];
     this._blips = new Array(MAX_BLIPS);
@@ -209,9 +226,10 @@ export class UiSystem {
       let dx = 0;
       let dz = 1;
       if (e?.from) {
-        this._tmp.copy(e.from).sub(this._playerPos());
-        dx = this._tmp.x;
-        dz = this._tmp.z;
+        // e.from は Vector3 とは限らない (素の {x,y,z} が飛んでくる)。成分で読む。
+        const p = this._playerPos();
+        dx = e.from.x - p.x;
+        dz = e.from.z - p.z;
       }
       this.hurt(amount, dx, dz);
     });
@@ -227,8 +245,8 @@ export class UiSystem {
 
     on('explosion', (e) => {
       if (!e?.position) return;
-      this._tmp.copy(e.position).sub(this._playerPos());
-      const d = this._tmp.length();
+      const p = this._playerPos();
+      const d = Math.hypot(e.position.x - p.x, e.position.y - p.y, e.position.z - p.z);
       if (d < (e.radius ?? 6) * 2.5) this.crosshair.onFlinch(0.6);
     });
 
@@ -241,7 +259,7 @@ export class UiSystem {
     });
 
     this.resize(ctx.canvas.clientWidth || innerWidth, ctx.canvas.clientHeight || innerHeight, ctx);
-    this._prevPos.copy(this._playerPos());
+    this._prevPos.copyFrom(this._playerPos());
   }
 
   /* ------------------------------------------------------------- helpers -- */
@@ -266,11 +284,30 @@ export class UiSystem {
     return s && typeof s === 'object' ? s : null;
   }
 
+  /**
+   * プレイヤーの足元座標。常に `this._pos` (共有スクラッチ) を返す。
+   *
+   * **Babylon 移植で挙動が変わった箇所。** Three 版は `p.position` をプロパティと
+   * 見なして `pos.isVector3` で検査していたが、
+   *   - Babylon の Vector3 に `isVector3` は無い
+   *   - この repo の PlayerSystem は `position` を **メソッド**として公開している
+   *     (src/player/index.js)
+   * ので、旧コードは常にフォールバックしてカメラ位置 (= 目線の高さ) を返していた。
+   * 移動速度由来のレティクル bloom とダメージ方向がプレイヤーではなくカメラ基準に
+   * なるため、そのままだとスライディング中などで無視できないズレになる。
+   *
+   * 取得順は getHudState().position → position プロパティ → position() メソッド →
+   * カメラ。どの経路でも成分でコピーする (copyFrom は素のオブジェクトを受けない)。
+   */
   _playerPos() {
     const p = this.ctx.peek('player');
-    const pos = p?.position ?? p?.getPosition?.();
-    if (pos && pos.isVector3) return this._pos.copy(pos);
-    return this._pos.copy(this.ctx.camera.position);
+    const pos =
+      this._playerState()?.position ??
+      (typeof p?.position === 'function' ? p.position() : p?.position) ??
+      p?.getPosition?.();
+    if (pos && Number.isFinite(pos.x)) return this._pos.copyFromFloats(pos.x, pos.y, pos.z);
+    const c = this.ctx.camera.globalPosition;
+    return this._pos.copyFromFloats(c.x, c.y, c.z);
   }
 
   /** Fire-and-forget audio; the audio subsystem may not exist yet. */
@@ -448,20 +485,26 @@ export class UiSystem {
       if (ps.crouch !== undefined) s.crouch = !!ps.crouch;
       if (ps.ads !== undefined) s.ads = !!ps.ads;
       if (ps.airborne !== undefined) s.airborne = !!ps.airborne;
-    } else if (player && typeof player.health === 'number') {
+    } else if (!s.simulate && player && typeof player.health === 'number') {
+      // `!s.simulate` は移植時に足した。上の `ps` には simulate ガードが掛かって
+      // いるのにこのフォールバックだけ抜けていて、debugState('combat') 中でも
+      // 生きた player.health が毎フレーム書き戻されていた。結果 hud ショットの
+      // 体力は常に満タンで、デモが仕込んだ 62 → 低体力演出が一度も映らない。
+      // 下の回復処理が `!ps && !s.simulate` で守られていることからも、
+      // ここにガードが必要だったのは明らか。
       s.health = player.health;
     }
 
     // ---- movement-derived reticle bloom (works with any player system) ----
     const pos = this._playerPos();
     if (!ps && !s.simulate) {
-      this._dir.copy(pos).sub(this._prevPos);
-      this._dir.y = 0;
-      const speed = dt > 0 ? this._dir.length() / dt : 0;
+      // 水平成分だけの移動速度。落下でレティクルが開かないよう y は無視する。
+      const speed =
+        dt > 0 ? Math.hypot(pos.x - this._prevPos.x, pos.z - this._prevPos.z) / dt : 0;
       s.move = damp(s.move, clamp01(speed / 6.2), 12, Math.max(rawDt, 1e-3));
       if (!this._weaponState()) s.ads = ctx.input.ads && ctx.input.enabled;
     }
-    this._prevPos.copy(pos);
+    this._prevPos.copyFrom(pos);
 
     // ---- health regeneration when nobody else owns health ----------------
     if (!ps && !s.simulate && s.health < s.maxHealth) {
@@ -483,18 +526,11 @@ export class UiSystem {
     this._collectBlips();
 
     // ---- camera basis ----------------------------------------------------
-    const m = ctx.camera.matrixWorld.elements;
-    let rx = m[0];
-    let rz = m[2];
-    let fx = -m[8];
-    let fz = -m[10];
-    const rl = Math.hypot(rx, rz) || 1;
-    const fl = Math.hypot(fx, fz) || 1;
-    rx /= rl;
-    rz /= rl;
-    fx /= fl;
-    fz /= fl;
-    const heading = (Math.atan2(fx, -fz) * 180) / Math.PI;
+    // 射影行列と基底をここで 1 回だけ更新する。markers / arcs / compass /
+    // minimap はすべてこの結果を読む (SSOT)。
+    const view = this.view;
+    view.update(ctx.camera, this.vw, this.vh);
+    const heading = view.heading;
 
     // ---- widgets ---------------------------------------------------------
     const hudGoal = this.hudTarget * (this.menu.open ? 0.15 : 1);
@@ -505,7 +541,7 @@ export class UiSystem {
 
     this.crosshair.update(dt, s);
     this.hit.update(dt);
-    this.arcs.update(dt, rx, rz, fx, fz);
+    this.arcs.update(dt, view.rx, view.rz, view.fx, view.fz);
     this.health.update(dt, s);
     this.ammo.update(dt, s);
     this.killfeed.update(dt);
@@ -516,21 +552,22 @@ export class UiSystem {
     this._buildCompassObjectives(pos);
     this.compass.update(heading, this._compassObjs);
 
-    this.markers.updateObjectives(this._objectives, ctx.camera, this.vw, this.vh, this.k);
-    this.markers.updateGrenades(dt, ctx.camera, this.vw, this.vh, this.k);
-    this.markers.updateDamage(dt, ctx.camera, this.vw, this.vh, this.k);
+    this.markers.updateObjectives(this._objectives, view, this.k);
+    this.markers.updateGrenades(dt, view, this.k);
+    this.markers.updateDamage(dt, view, this.k);
 
     // ---- minimap ---------------------------------------------------------
-    if (!this.minimap.bakeDone && ++this._bakeFrame > 6 && this._bakeFrame % 20 === 0) {
-      this.minimap.tryBake(ctx);
-    }
+    // ベイクは layout.js の静的データからの一発描きなので、ワールドの構築を待つ
+    // 必要が無い (旧: シーンの深度ベイクだったため数フレーム待って再試行していた)。
+    this.minimap.tryBake();
     this._blipView.length = this._blipCount;
     for (let i = 0; i < this._blipCount; i++) this._blipView[i] = this._blips[i];
     this._mmState = this._mmState ?? { x: 0, z: 0, heading: 0, fov: 80, blips: null, objectives: null };
     this._mmState.x = pos.x;
     this._mmState.z = pos.z;
     this._mmState.heading = heading;
-    this._mmState.fov = ctx.camera.fov;
+    // Babylon の camera.fov はラジアン。度で渡さないと視野コーンが潰れて消える。
+    this._mmState.fov = view.fovDeg;
     this._mmState.blips = this._blipView;
     this._mmState.objectives = this._mmObjs ?? (this._mmObjs = []);
     this._mmObjs.length = 0;
