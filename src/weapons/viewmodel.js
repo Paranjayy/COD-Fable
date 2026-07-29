@@ -57,6 +57,48 @@ const _m = new Matrix();
 const _NEG_Z = new Vector3(0, 0, -1);
 const _POS_Z = new Vector3(0, 0, 1);
 
+/**
+ * ビューモデルの「見かけ FOV」補正 (度)。
+ *
+ * この構成にはビューモデル専用のカメラ/投影が無い (core/engine.js RENDER_GROUP の
+ * 代償) ので、ワールド FOV (既定 80°、ADS で絞られる) がそのまま武器に掛かる。
+ * 一方 defs.js のポーズ・ADS 寸法は Three 版の 60° view camera を前提に作られている。
+ *
+ * ## なぜ「位置とスケールを同じ k で縮める」では駄目か (実測済み)
+ *
+ * カメラ原点まわりの一様スケールは**相似変換**で、透視投影では画面上の見えが
+ * 一切変わらない (px/pz が不変)。実際にリグの position と scaling へ同じ k を
+ * 掛けて撮り比べたところ、キャプチャは 1 px も変わらなかった。近接クリップとの
+ * 距離が変わるだけの no-op なので、この形の補正は捨てた。
+ *
+ * ## 正しいエミュレーション: カメラ空間で x,y **のみ**をスケールする
+ *
+ * 焦点距離 f の投影は screen = (px·f/-pz, py·f/-pz)。ビューモデルだけ別の
+ * FOV で描くことは、カメラ空間で (x,y) を c 倍・z を等倍にする線形変換と
+ * 投影上等価になる:
+ *
+ *   c = tan(VIEWMODEL_FOV/2) / tan(camera.fov/2)
+ *
+ * これを anchor (カメラに追従する親) の scaling = (c, c, 1) として与える。
+ * 直線と結線は保たれるので、レティクルの共線性 (コリメータの数学) もそのまま成立。
+ * ADS でカメラ FOV が絞られると c → 1 に近づき、60° 設計の ADS 寸法が
+ * 素の値で効く — camera.fov は毎フレーム読む (この FOV 追従が weapons の仕事)。
+ *
+ * ## グリップの画面アンカー
+ *
+ * x,y スケールは画面中心へ向かって縮めるので、素のままだと銃が画面中央へ
+ * 浮き上がる。基準点 (hip のグリップ位置) が画面上で動かないよう、
+ * Δ = hip·(1-c)/c をリグ位置に足して打ち消す。ADS 中はサイトが光軸上
+ * (x=y=0、スケールで不動) に乗る必要があるので、このアンカー補正は
+ * ads で 0 へブレンドする。
+ *
+ * 代償 (承知の上): x,y と z のスケールが異なるため法線がわずかに歪み、
+ * スペキュラの写り込みが厳密には変わる。c=0.69〜1.0 の範囲では目視で
+ * 判別できないことをキャプチャで確認済み。
+ */
+const VIEWMODEL_FOV = 60;
+const VIEWMODEL_TAN = Math.tan((VIEWMODEL_FOV * Math.PI) / 360);
+
 /** Right-handed hand basis from a finger direction and a back-of-hand direction. */
 function handBasis(out, finger, back) {
   _v.set(-finger[0], -finger[1], -finger[2]).normalize(); // hand +Z
@@ -220,6 +262,10 @@ export class Viewmodel {
     this._handQuatL = new Quaternion();
     this._sightLocal = new Vector3();
     this._muzzleWorld = new Vector3();
+    /** 縮める前 (仮想 60° 空間) のリグ位置。IK とレティクルはこちらを読む。 */
+    this._composedPos = new Vector3();
+    /** 今フレームの FOV 補正係数 k。 */
+    this._fovScale = 1;
 
     this.debugFrozen = false;
     /** キャプチャ以外でカメラ追従を切りたいハーネス用フック。 */
@@ -635,14 +681,27 @@ export class Viewmodel {
     }
 
     /* -------- compose -------------------------------------------------- */
-    this.rig.position.set(this._basePos.x + px, this._basePos.y + py, this._basePos.z + pz);
+    this._composedPos.set(this._basePos.x + px, this._basePos.y + py, this._basePos.z + pz);
     quatXYZToRef(rx, ry, rz, _q);
     // Three 版の rig.quaternion.copy(base).multiply(q) と同じ合成順 (base ⊗ 加算層)。
     this._baseQuat.multiplyToRef(_q, this.rig.rotationQuaternion);
     if (this.rigOverride) {
-      this.rig.position.copyFrom(this.rigOverride.position);
+      this._composedPos.copyFrom(this.rigOverride.position);
       this.rig.rotationQuaternion.copyFrom(this.rigOverride.rotationQuaternion);
     }
+    /**
+     * FOV 補正 (VIEWMODEL_FOV の長注参照)。anchor の x,y スケールが投影 FOV の
+     * 差を吸収し、グリップのアンカー補正が銃を画面右下に留める。z は等倍なので
+     * ニアクリップ (camera.minZ = 0.05 m) との関係は補正前と変わらない。
+     */
+    const c = VIEWMODEL_TAN / Math.tan(cam.fov / 2);
+    this._fovScale = c;
+    this.anchor.scaling.set(c, c, 1);
+    // グリップ画面アンカー: hip 基準点の投影位置を保つ (ADS では光軸整列を優先)。
+    const anchorK = ((1 - c) / Math.max(0.2, c)) * (1 - ads);
+    this._composedPos.x += hipP[0] * anchorK;
+    this._composedPos.y += hipP[1] * anchorK;
+    this.rig.position.copyFrom(this._composedPos);
     this.rig.computeWorldMatrix(true);
 
     /* -------- hands (first: the magazine can be held by one) ---------- */
@@ -729,11 +788,13 @@ export class Viewmodel {
 
   _solveHands(w, res) {
     // Shoulders are body-fixed: express the camera-space anchor in rig space.
+    // **縮める前の仮想 60° 空間**で解く (_composedPos) — リグ根元の k はここで
+    // 解いた腕ごと一括で縮めるので、肩・骨長・リーチの比率は 60° 設計のまま。
     this.rig.rotationQuaternion.conjugateToRef(_q);
-    _v.copyFrom(this.shoulderR).subtractInPlace(this.rig.position);
+    _v.copyFrom(this.shoulderR).subtractInPlace(this._composedPos);
     _v.rotateByQuaternionToRef(_q, _v);
     this.armR.shoulder.copyFrom(_v);
-    _v.copyFrom(this.shoulderL).subtractInPlace(this.rig.position);
+    _v.copyFrom(this.shoulderL).subtractInPlace(this._composedPos);
     _v.rotateByQuaternionToRef(_q, _v);
     this.armL.shoulder.copyFrom(_v);
 
@@ -773,10 +834,12 @@ export class Viewmodel {
       this.reticle.setEnabled(false);
       return;
     }
-    // Optic axis and lens centre, both in camera (anchor) space.
+    // Optic axis and lens centre — 仮想 60° 空間 (_composedPos) で計算する。
+    // 比率で決まる量 (ビネットの off/aperture、ドットの角サイズ) は k で不変なので
+    // そのまま使え、実寸で置く量 (位置・半径) だけ最後に k を掛ける。
     _v.set(optic.center[0], optic.center[1], optic.center[2]);
     _v.rotateByQuaternionToRef(this.rig.rotationQuaternion, _v);
-    _v.addInPlace(this.rig.position);
+    _v.addInPlace(this._composedPos);
     _v3.copyFrom(_NEG_Z);
     _v3.rotateByQuaternionToRef(this.rig.rotationQuaternion, _v3);
     _v3.normalize();
@@ -800,14 +863,16 @@ export class Viewmodel {
       return;
     }
     this.reticle.setEnabled(true);
-    this.reticle.position.copyFrom(_v2);
     // 板 (+Z 法線) を目 (カメラ空間原点) に向ける。
     _v3.copyFrom(_v2).scaleInPlace(-1 / Math.max(1e-6, _v2.length()));
     Quaternion.FromUnitVectorsToRef(_POS_Z, _v3, this.reticle.rotationQuaternion);
+    // reticle も anchor の子なので FOV 補正の (c,c,1) は自動で掛かる —
+    // ここでは補正前の仮想空間の値をそのまま書けばよい。
+    this.reticle.position.copyFrom(_v2);
     /**
      * SIZE: 幾何学的に正直な 2 MOA は 0.6 px (死んだサブピクセル) なので、
      * 市販のダットサイトと同じ方向にチートする — 判読できるサイズで描き、
-     * 目がガラスに近づくほど育てる。hip 4 px / ADS 7.9 px 半径。
+     * 目がガラスに近づくほど育てる。hip 4 px / ADS 7.9 px 半径 (60° 設計)。
      */
     const coreR = s * lerp(0.00385, 0.00655, ads);
     this.dotCore.scaling.setAll(coreR);
