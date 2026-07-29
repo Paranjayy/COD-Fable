@@ -67,10 +67,11 @@ for (const [key, flag] of [
  * `?gtao=1` / `?mblur=1` を明示したときだけその上書きを尊重する。
  */
 /**
- * `?fxparticles=1` でパーティクル層を有効化する。既定は無効 —
- * 粒子を出すとフレーム全体が黒くなる未解決バグがあるため (src/fx/index.js 参照)。
+ * `?fxparticles=0` でパーティクル層を無効化できる (切り分け用)。既定は有効。
+ * かつて既定無効だった理由 (WebGPU の頂点バッファ数上限で真っ黒になるバグ) は
+ * 解決済み — 経緯は src/fx/particles.js のコメント参照。
  */
-config.fxParticles = params.get('fxparticles') === '1';
+config.fxParticles = params.get('fxparticles') !== '0';
 
 config.forcePost = {
   gtao: params.get('gtao') === '1' ? true : undefined,

@@ -13,12 +13,15 @@ import { WGSL_PARTICLE_VERT, WGSL_PARTICLE_FRAG } from './wgsl/particle.js';
 export const STRIDE = 32;
 
 /**
- * インスタンス属性の名前。**WGSL の `attribute` 宣言と 1 対 1 で対応する。**
+ * 粒子属性の名前。**WGSL の `attribute` 宣言と 1 対 1 で対応する。**
  * 片方だけ変えると、その属性だけゼロで届いて静かに壊れる。
+ *
+ * **配列の順序 = インターリーブバッファ内のオフセット順序** (index * 4 float)。
+ * 下の O_* 定数と並びを揃えてあるので、追加・入れ替えは両方を同時に直すこと。
  */
 const ATTR_KINDS = ['aPS', 'aVS', 'aLife', 'aRot', 'aCol0', 'aCol1', 'aMisc', 'aExtra'];
 
-// インターリーブされたスロットのオフセット
+// インターリーブされたスロットのオフセット (float 単位。ATTR_KINDS と同順)
 const O_PS = 0; // pos.xyz, size0
 const O_VS = 4; // vel.xyz, size1
 const O_LF = 8; // birth, 1/life, drag, gravity
@@ -110,27 +113,18 @@ export class ParticleLayer {
     /**
      * --- ジオメトリ: 1 粒子 = 4 頂点 --------------------------------------
      *
-     * **インスタンシングは使わない。** Babylon + WebGPU で 2 通り試してどちらも
-     * 失敗したため:
-     *
-     *   (a) geometry に instanced VertexBuffer を足す
-     *       (`mesh.setVerticesBuffer(buffer.createVertexBuffer(..., instanced=true))`)
-     *       → 描画は発行されるが **インスタンス属性が全てゼロで届く**。
-     *          size = mix(0,0,...) = 0 で面積ゼロの板になり、エラーもなく完全に不可視。
-     *          (シェーダにサイズを固定で埋めると板が出ることで確認)
-     *
-     *   (b) `thinInstanceSetBuffer` でカスタム属性を登録
-     *       → **シーン全体が描画されなくなる**。エラーもワーニングも出ず、
-     *          scene.getActiveIndices() は 20 万を返すのにキャンバスは真っ黒。
-     *          単位行列の "matrix" バッファを添えても変わらず。
-     *
-     * どちらも「エラーが出ないまま絵だけが消える」ため、原因の特定に時間がかかる。
-     * ここでは **粒子ごとに 4 頂点を持ち、同じ属性値を 4 回書く**古典的な方式にした。
-     * インスタンシング機構に一切依存しないので、Babylon のバージョンや
+     * 粒子ごとに 4 頂点を持ち、同じ属性値を 4 回書く古典的な方式。
+     * インスタンシング機構に依存しないので、Babylon のバージョンや
      * バックエンドの都合で静かに壊れることがない。
      *
      * 代償: 頂点バッファが 4 倍になり (24k 粒子 = 96k 頂点)、emit の書き込みも
      * 4 倍 (1 粒子 128 float)。着弾 1 発で数十粒子なので実測上は問題にならない。
+     *
+     * なお過去に試したインスタンシング 2 方式 (instanced VertexBuffer /
+     * thinInstanceSetBuffer) が「属性ゼロ」「画面真っ黒」で失敗した根本原因は、
+     * 下の「頂点バッファは 1 本」のコメントにある **WebGPU の頂点バッファ数上限**
+     * だった。方式の問題ではないが、この 4 頂点方式で正しく動いているので戻す
+     * 理由はない。
      */
     const mesh = new Mesh(`fx-particles-${o.mode}`, o.scene);
     const N = this.capacity;
@@ -168,14 +162,44 @@ export class ParticleLayer {
     vd.applyToMesh(mesh, true);
 
     /**
-     * 粒子ごとの属性。**頂点ごとに同じ値を 4 回持つ。**
-     * kind 名は WGSL の `attribute` 宣言と 1 対 1 で対応する。
+     * 粒子ごとの属性。**頂点ごとに同じ値を 4 回持ち、8 属性を 1 本のバッファに
+     * インターリーブする** (1 頂点 = STRIDE=32 float、オフセットは O_* 定数)。
+     *
+     * ## 頂点バッファは必ず 1 本にまとめること (このファイル最大の罠)
+     *
+     * WebGPU の頂点バッファスロット上限は **8 本** (maxVertexBuffers の既定値)。
+     * 以前は属性ごとに `mesh.setVerticesData()` で別バッファを作っており、
+     * position + uv + 8 属性 = **10 本**で上限を超えていた。このとき何が起きるか:
+     *
+     *   - CreateRenderPipeline が「Vertex buffer count (10) exceeds the maximum
+     *     number of vertex buffers (8)」で失敗する
+     *   - 不正なパイプラインを 1 度でも SetPipeline すると、そのフレームの
+     *     **コマンドバッファ全体が invalid になり Queue.Submit ごと捨てられる**
+     *   - 結果、粒子を 1 つ出しただけで **フレーム全体が真っ黒**になる
+     *   - しかもこの検証エラーは console に **error ではなく warning** として
+     *     届く (Babylon が uncaptured error を Logger.Warn で流す)。
+     *     「console にエラーが無い = GPU は正常」と判断してはならない
+     *
+     * 過去に「インスタンス属性が全てゼロで届く」「thin instance でシーン全体が
+     * 消える」と見えていた症状もすべてこれが原因だった (未使用属性が effect から
+     * 削られてバッファ数が 8 以下に収まったときだけ描けていた)。
+     *
+     * Babylon の WebGPU 実装は「同一の GPU バッファを参照し、effect の属性順で
+     * **連続している**属性」を 1 つの GPUVertexBufferLayout にまとめる
+     * (webgpuCacheRenderPipeline._getVertexInputDescriptor)。ただし各属性が
+     * `offset + サイズ <= stride` を満たすことが条件。ここでは 8 x vec4 を
+     * stride 128 byte に詰めるので条件を満たし、position + uv + 本バッファ =
+     * **3 スロット**に収まる。属性の宣言順 (ShaderMaterial の attributes と WGSL)
+     * を ATTR_KINDS と揃えておくこと — 順序が飛び飛びになるとまとめが効かず
+     * スロット数が増える。
+     *
+     * 副次効果として、flush のアップロードも 8 回 → 1 回になる。
      */
-    this.attrs = {};
-    for (const kind of ATTR_KINDS) {
-      const arr = new Float32Array(N * 4 * 4);
-      this.attrs[kind] = arr;
-      mesh.setVerticesData(kind, arr, true, 4);
+    this.data = new Float32Array(N * 4 * STRIDE);
+    this._buffer = new Buffer(o.scene.getEngine(), this.data, true, STRIDE);
+    for (let a = 0; a < ATTR_KINDS.length; a++) {
+      // offset / stride は float 単位 (useBytes=false)。サイズは vec4f なので 4。
+      mesh.setVerticesBuffer(this._buffer.createVertexBuffer(ATTR_KINDS[a], a * 4, 4, STRIDE), false);
     }
 
     /**
@@ -269,21 +293,21 @@ export class ParticleLayer {
 
     const life = Math.max(0.016, s.life);
     const birth = now + s.delay;
-    const A = this.attrs;
+    const D = this.data;
     const invLife = 1 / life;
 
     // 4 頂点すべてに同じ値を書く。頂点シェーダは corner (position.xy) だけを
     // 頂点ごとに変え、それ以外はこの値を共有する。
     for (let v = 0; v < 4; v++) {
-      const b = (i * 4 + v) * 4;
-      A.aPS[b] = s.x;      A.aPS[b + 1] = s.y;       A.aPS[b + 2] = s.z;        A.aPS[b + 3] = s.size0;
-      A.aVS[b] = s.vx;     A.aVS[b + 1] = s.vy;      A.aVS[b + 2] = s.vz;       A.aVS[b + 3] = s.size1;
-      A.aLife[b] = birth;  A.aLife[b + 1] = invLife; A.aLife[b + 2] = s.drag;   A.aLife[b + 3] = s.gravity;
-      A.aRot[b] = s.rot;   A.aRot[b + 1] = s.spin;   A.aRot[b + 2] = s.stretch; A.aRot[b + 3] = s.sizeCurve;
-      A.aCol0[b] = s.r0;   A.aCol0[b + 1] = s.g0;    A.aCol0[b + 2] = s.b0;     A.aCol0[b + 3] = s.i0;
-      A.aCol1[b] = s.r1;   A.aCol1[b + 1] = s.g1;    A.aCol1[b + 2] = s.b1;     A.aCol1[b + 3] = s.i1;
-      A.aMisc[b] = s.tile; A.aMisc[b + 1] = s.soft;  A.aMisc[b + 2] = s.alpha;  A.aMisc[b + 3] = s.alphaCurve;
-      A.aExtra[b] = s.turb; A.aExtra[b + 1] = s.turbFreq; A.aExtra[b + 2] = s.seed; A.aExtra[b + 3] = s.flags;
+      const b = (i * 4 + v) * STRIDE;
+      D[b + O_PS] = s.x;      D[b + O_PS + 1] = s.y;        D[b + O_PS + 2] = s.z;       D[b + O_PS + 3] = s.size0;
+      D[b + O_VS] = s.vx;     D[b + O_VS + 1] = s.vy;       D[b + O_VS + 2] = s.vz;      D[b + O_VS + 3] = s.size1;
+      D[b + O_LF] = birth;    D[b + O_LF + 1] = invLife;    D[b + O_LF + 2] = s.drag;    D[b + O_LF + 3] = s.gravity;
+      D[b + O_RT] = s.rot;    D[b + O_RT + 1] = s.spin;     D[b + O_RT + 2] = s.stretch; D[b + O_RT + 3] = s.sizeCurve;
+      D[b + O_C0] = s.r0;     D[b + O_C0 + 1] = s.g0;       D[b + O_C0 + 2] = s.b0;      D[b + O_C0 + 3] = s.i0;
+      D[b + O_C1] = s.r1;     D[b + O_C1 + 1] = s.g1;       D[b + O_C1 + 2] = s.b1;      D[b + O_C1 + 3] = s.i1;
+      D[b + O_MS] = s.tile;   D[b + O_MS + 1] = s.soft;     D[b + O_MS + 2] = s.alpha;   D[b + O_MS + 3] = s.alphaCurve;
+      D[b + O_EX] = s.turb;   D[b + O_EX + 1] = s.turbFreq; D[b + O_EX + 2] = s.seed;    D[b + O_EX + 3] = s.flags;
     }
 
     if (i < this._dirtyLo) this._dirtyLo = i;
@@ -303,9 +327,9 @@ export class ParticleLayer {
    */
   flush(now) {
     if (this._dirtyHi >= this._dirtyLo) {
-      // 変更のあった属性を再アップロードする。updateVerticesData は範囲指定を
-      // 持たないので全体を送る。emit があったフレームだけなので許容範囲。
-      for (const kind of ATTR_KINDS) this.mesh.updateVerticesData(kind, this.attrs[kind], false, false);
+      // インターリーブバッファを丸ごと再アップロードする (1 本なので 1 回)。
+      // emit があったフレームだけなので許容範囲。
+      this._buffer.update(this.data);
       this._dirtyLo = Infinity;
       this._dirtyHi = -Infinity;
     }
@@ -328,5 +352,8 @@ export class ParticleLayer {
   dispose() {
     this.mesh.dispose();
     this.material.dispose();
+    // createVertexBuffer で切り出した VertexBuffer は共有バッファを所有しない
+    // (takeBufferOwnership=false) ので、大本の Buffer はここで自分で捨てる。
+    this._buffer.dispose();
   }
 }
