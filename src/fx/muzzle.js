@@ -41,10 +41,23 @@ const LOBE = { x: 0, y: 0, z: 0 };
  * the crown in its own direction and the composite silhouette is irregular.
  */
 export function screenAngle(fx, view, dx, dy, dz) {
-  const cam = view ? fx.ctx.viewCamera : fx.ctx.camera;
+  /**
+   * **このファイルで唯一 Babylon 移植が必要だった箇所。**
+   *
+   * 元は Three のカメラ API (`cam.updateMatrixWorld()` /
+   * `cam.matrixWorldInverse.elements`) を直接読んでいた。muzzle.js は `import` の
+   * 上では Three 非依存だったが、`fx.ctx.camera` に Three の *API 形状* を仮定して
+   * いたため、そこだけは移植が要った。
+   *
+   * 「import を見ただけで移植不要と判断しない」教訓としてここに残す。
+   *
+   * Babylon の view 行列は列優先の Float32Array (16 要素)。ワールド方向ベクトルを
+   * ビュー空間へ回すには 3x3 部分の転置を掛ける = m[0],m[4],m[8] / m[1],m[5],m[9] を
+   * 使う。添字の並びは Three と同じで済む (どちらも列優先のため)。
+   */
+  const cam = view ? (fx.ctx.viewCamera ?? fx.ctx.camera) : fx.ctx.camera;
   if (!cam) return 0;
-  cam.updateMatrixWorld();
-  const m = cam.matrixWorldInverse.elements;
+  const m = cam.getScene().getViewMatrix().m;
   const vx = m[0] * dx + m[4] * dy + m[8] * dz;
   const vy = m[1] * dx + m[5] * dy + m[9] * dz;
   return Math.atan2(vy, vx);

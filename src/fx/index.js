@@ -78,6 +78,12 @@ export class FxSystem {
     const atlases = await bakeAtlases(ctx.scene, ctx.backend);
     if (!atlases) {
       this.disabled = true;
+      // FX を無効化しても **レシピは呼ばれる** (イベントは流れる)。emit 系が
+      // 存在しないと undefined 呼び出しで落ちるので、無効時でもバインドしておく。
+      this._bindEmitters();
+      this.pScale = 1;
+      this.lights = { flash: () => {} };
+      this._wireEvents(ctx);
       return;
     }
     this.atlases = atlases;
@@ -111,6 +117,21 @@ export class FxSystem {
       scene: ctx.scene,
     });
 
+    /**
+     * レシピが参照する契約項目。**名前と形を変えないこと** (レシピ側が直接読む)。
+     *
+     *   fx.pScale  粒子数のスケール。品質プリセットで粒子の量を落とすための係数。
+     *              レシピは `Math.round(n * fx.pScale)` の形で使う。
+     *   fx.lights  動的光源。`flash(x,y,z, r,g,b, intensity, duration, decay, range, ?)`
+     *   fx.ctx     レシピが camera を引くために使う (muzzle.js の screenAngle)
+     */
+    this.pScale = Math.max(0.25, q.particleBudget / 24000);
+    this.lights = {
+      flash: (x, y, z, r, g, b, intensity, duration, decay = 8, range = 8) =>
+        this.flashLight(x, y, z, r, g, b, intensity, duration, decay, range),
+    };
+
+    this._bindEmitters();
     this._initLightPool(ctx);
     this._wireEvents(ctx);
   }
@@ -133,7 +154,7 @@ export class FxSystem {
       l.range = 8;
       l.diffuse = new Color3(1, 0.8, 0.5);
       this.render.addLight(l);
-      this._lights.push({ light: l, until: -1, peak: 0, start: 0 });
+      this._lights.push({ light: l, until: -1, peak: 0, start: 0, decay: 6 });
     }
   }
 
@@ -151,14 +172,37 @@ export class FxSystem {
   /* レシピが呼ぶ API (契約 — シグネチャを変えないこと)                  */
   /* ================================================================== */
 
-  emitAdd(s) {
-    if (this.disabled) return;
-    this.add.emit(s, this._now);
-  }
-
-  emitLit(s) {
-    if (this.disabled) return;
-    this.lit.emit(s, this._now);
+  /**
+   * emit 系は **バインド済みのインスタンスプロパティ**として持つ。
+   *
+   * ## なぜプロトタイプメソッドではいけないか (実際に踏んだ)
+   *
+   * muzzle.js のレシピはこう書かれている:
+   *
+   *     const emitAdd = view ? fx.emitViewAdd : fx.emitAdd;
+   *     ...
+   *     emitAdd(s);
+   *
+   * **メソッド参照を変数に取り出して裸で呼ぶ**ので、プロトタイプメソッドだと
+   * `this` が undefined になり「Cannot read properties of undefined (reading
+   * 'disabled')」で落ちる。レシピ側を直すのではなく、こちらがバインドして渡すのが
+   * 正しい (レシピは契約の消費者であって、契約に合わせるのは提供側の責務)。
+   *
+   * `emitView*` は Three 版の viewScene 相当。この移植は 1 カメラ構成でビュー空間が
+   * 存在しないので world 層に流すエイリアス。**存在しないとレシピが undefined を
+   * 呼んで落ちる**ので必ず残すこと。
+   */
+  _bindEmitters() {
+    this.emitAdd = (s) => {
+      if (this.disabled) return;
+      this.add.emit(s, this._now);
+    };
+    this.emitLit = (s) => {
+      if (this.disabled) return;
+      this.lit.emit(s, this._now);
+    };
+    this.emitViewAdd = this.emitAdd;
+    this.emitViewLit = this.emitLit;
   }
 
   /**
@@ -344,12 +388,14 @@ export class FxSystem {
   /* ================================================================== */
 
   /** プールから 1 灯借りて、短時間光らせる。 */
-  flashLight(x, y, z, r, g, b, intensity, duration) {
+  flashLight(x, y, z, r, g, b, intensity, duration, decay = 6, range = 8) {
     const e = this._lights[this._lightCursor];
     this._lightCursor = (this._lightCursor + 1) % this._lights.length;
     e.light.position.set(x, y, z);
     e.light.diffuse.set(r, g, b);
+    e.light.range = range;
     e.peak = intensity;
+    e.decay = decay;
     e.start = this._now;
     e.until = this._now + duration;
     return e;
@@ -363,7 +409,8 @@ export class FxSystem {
       }
       const t = (now - e.start) / Math.max(1e-4, e.until - e.start);
       // 立ち上がりは瞬時、減衰は指数。火薬の燃焼はこの形。
-      e.light.intensity = e.peak * Math.exp(-t * 6);
+      // decay はレシピが指定する。火薬の燃焼は指数減衰。
+      e.light.intensity = e.peak * Math.exp(-t * (e.decay ?? 6));
     }
   }
 
@@ -385,15 +432,17 @@ export class FxSystem {
 
   onWeaponFire(e) {
     if (this.disabled) return;
+    /**
+     * レシピは `o.position` / `o.direction` を **オブジェクトとして**受け取る。
+     * 分解した x/dx の形で渡すと `p.x` が undefined になって落ちる (実際に踏んだ)。
+     */
     this.muzzleFlash({
-      x: e.origin.x,
-      y: e.origin.y,
-      z: e.origin.z,
-      dx: e.dir.x,
-      dy: e.dir.y,
-      dz: e.dir.z,
+      position: e.origin,
+      direction: e.dir,
       weapon: e.weapon,
       seed: e.seed,
+      // 1 カメラ構成なので view 空間は無い。レシピ側は view=false として扱う。
+      view: false,
     });
   }
 
