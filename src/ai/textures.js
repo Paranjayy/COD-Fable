@@ -21,7 +21,23 @@
  * and the macro pattern is not averaged into flat tan by the mip chain.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: CPU ベイク (bake/bakeDetail と全パターン定義) は Three 版から
+// 無改変。GPU 面だけ差し替えた — DataTexture → RawTexture、
+// MeshStandardMaterial → PBRMaterial。
+//
+// 【積み残し・意図的な差分】Three 版が onBeforeCompile で注入していた 2 つの
+// シェーダフックはこの版では未移植:
+//   1. 高周波ディテールタイル (this.details) — 2 スケール系の高周波側。ベイク
+//      自体は残してあるので、移植する場合は Babylon の MaterialPluginBase で
+//      WGSL を注入する (customProgramCacheKey 相当は plugin 名が担う)。
+//   2. シルエットのエッジ減光 (RIM) — 逆光の輪郭コントラスト用。
+// どちらも「絵の質」の項目で、動作には影響しない。resolveMaterials から渡る
+// detail/rim オプションは受け取るが現状は無視する。
+import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
+import { Texture } from '@babylonjs/core/Materials/Textures/texture.js';
+import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
+import { Color3 } from '@babylonjs/core/Maths/math.color.js';
+import { Constants } from '@babylonjs/core/Engines/constants.js';
 
 /* ------------------------------------------------------------------ */
 /* Tileable value noise                                                */
@@ -95,15 +111,26 @@ const smooth = (e0, e1, x) => {
 const mix = (a, b, t) => a + (b - a) * t;
 const mix3 = (a, b, t) => [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
 
-function dataTexture(buf, size, srgbSpace, aniso) {
-  const t = new THREE.DataTexture(buf, size, size, THREE.RGBAFormat);
-  t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.colorSpace = srgbSpace ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-  t.generateMipmaps = true;
-  t.minFilter = THREE.LinearMipmapLinearFilter;
-  t.magFilter = THREE.LinearFilter;
-  t.anisotropy = aniso;
-  t.needsUpdate = true;
+/**
+ * ベイク済みバッファを Babylon の RawTexture に上げる。
+ *
+ * `srgbSpace` は albedo のみ true: bake() は albedo を srgb() でエンコード
+ * しているので、gammaSpace=true のまま渡すと PBR シェーダが GAMMAALBEDO で
+ * 線形化する (materials/index.js の GPU ベイクは線形書き出しなので逆に
+ * gammaSpace=false — ここを混同すると全身がガンマ 2.2 ぶん明るく/暗くなる)。
+ */
+function uploadTexture(scene, buf, size, srgbSpace, aniso) {
+  const t = RawTexture.CreateRGBATexture(
+    buf, size, size, scene,
+    true, // generateMipMaps — タイル素材なので必須 (無いと遠距離でモアレ)
+    false, // invertY
+    Texture.TRILINEAR_SAMPLINGMODE,
+    Constants.TEXTURETYPE_UNSIGNED_BYTE
+  );
+  t.wrapU = Texture.WRAP_ADDRESSMODE;
+  t.wrapV = Texture.WRAP_ADDRESSMODE;
+  t.anisotropicFilteringLevel = aniso;
+  t.gammaSpace = !!srgbSpace;
   return t;
 }
 
@@ -161,11 +188,9 @@ function bake(size, fn, aniso, normalScale = 1) {
       nrm[i * 4 + 3] = 255;
     }
   }
-  return {
-    albedo: dataTexture(alb, size, true, aniso),
-    orm: dataTexture(orm, size, false, aniso),
-    normal: dataTexture(nrm, size, false, aniso),
-  };
+  // GPU 化はコンストラクタ側 (_upload) で行う。ここで返すのは CPU バッファ —
+  // selftest.mjs が Node (GPU なし) で同じベイクを検査できるようにするため。
+  return { albedo: alb, orm, normal: nrm, size };
 }
 
 /**
@@ -208,7 +233,7 @@ function bakeDetail(size, fn, aniso, normalScale = 1) {
       buf[i * 4 + 3] = Math.max(0, Math.min(255, (rough[i] * 0.5 + 0.5) * 255));
     }
   }
-  return dataTexture(buf, size, false, aniso);
+  return { data: buf, size };
 }
 
 /* ------------------------------------------------------------------ */
@@ -528,7 +553,11 @@ export const RIM = { strength: 0.62, edge: 0.42, power: 1.9 };
 export class SoldierMaterials {
   /**
    * @param rng   deterministic Rng
-   * @param opts  { size, anisotropy, camo: string[] }
+   * @param opts  { size, anisotropy, camo: string[], scene }
+   *
+   * `scene` (Babylon Scene) を渡すとベイク結果を GPU テクスチャ化して
+   * PBRMaterial を配れる。渡さない場合 (Node での selftest) は CPU ベイク
+   * だけ行い、get()/glass() は使えない。
    */
   constructor(rng, opts = {}) {
     const size = opts.size ?? 512;
@@ -536,7 +565,11 @@ export class SoldierMaterials {
     const nz = new TileNoise(rng.fork());
     const t0 = (typeof performance !== 'undefined' ? performance.now() : 0);
 
+    this.scene = opts.scene ?? null;
+    this._aniso = aniso;
     this.sets = {};
+    /** set 名 -> { albedo, orm, normal } (RawTexture)。scene がある場合のみ。 */
+    this.textures = {};
     this.materials = new Map();
     this._disposables = [];
 
@@ -805,24 +838,40 @@ export class SoldierMaterials {
     );
 
     this.bakeMs = (typeof performance !== 'undefined' ? performance.now() : 0) - t0;
-    for (const k in this.sets) {
-      const s = this.sets[k];
-      this._disposables.push(s.albedo, s.normal, s.orm);
+
+    // ---- GPU へ (scene がある場合のみ) --------------------------------
+    if (this.scene) {
+      for (const k in this.sets) {
+        const s = this.sets[k];
+        const set = {
+          albedo: uploadTexture(this.scene, s.albedo, s.size, true, aniso),
+          orm: uploadTexture(this.scene, s.orm, s.size, false, aniso),
+          normal: uploadTexture(this.scene, s.normal, s.size, false, aniso),
+        };
+        set.albedo.name = `ai_${k}_albedo`;
+        set.orm.name = `ai_${k}_orm`;
+        set.normal.name = `ai_${k}_normal`;
+        this.textures[k] = set;
+        this._disposables.push(set.albedo, set.normal, set.orm);
+      }
     }
-    for (const k in this.details) this._disposables.push(this.details[k]);
   }
 
   /**
-   * Build (and cache) a MeshStandardMaterial for a set.
-   * opts: { tint:[r,g,b], rough, metal, normalScale, key, side, transparent,
-   *         detail: { set, scale, normal, rough } }
+   * Build (and cache) a PBRMaterial for a set.
+   * opts: { tint:[r,g,b], rough, metal, normalScale, key, ao,
+   *         detail: { set, scale, normal, rough }, rim }
    *
-   * Everything here stays a plain MeshStandardMaterial, which is what lets
-   * render's MaterialPatcher inject the CSM shadow, the contact shadow, GTAO and
-   * SSR into it. The detail layer is added through `onBeforeCompile`, and the
-   * patcher chains our hook (it calls the previous one first), so the two
-   * coexist. `customProgramCacheKey` is mandatory: without it three would hand
-   * the detail-blended program to the skin material, which shares every define.
+   * ORM の R/G/B 割り当ては materials/index.js の GPU ベイクと同じ約束
+   * (R=AO, G=roughness, B=metallic)。ここがズレると「全部つるつる/全部金属」に
+   * なり、絵から原因を辿りにくい。
+   *
+   * `detail` と `rim` は Three 版のシェーダフックのオプション。ファイル冒頭の
+   * 積み残しコメントの通り現状は受けるだけで無視する (キャッシュキーには含めて
+   * おく — 将来 plugin 移植した時にキーを変えずに済むように)。
+   *
+   * `roughness`/`metallic` は Babylon PBR ではテクスチャ値に掛かる係数なので、
+   * Three 版の roughness/metalness 乗数と同じ意味になる。
    */
   get(setName, opts = {}) {
     const d = opts.detail;
@@ -831,120 +880,60 @@ export class SoldierMaterials {
     }|${d ? `${d.set},${d.scale},${d.normal},${d.rough}` : ''}`;
     let m = this.materials.get(key);
     if (m) return m;
-    const set = this.sets[setName];
-    if (!set) throw new Error(`[ai] unknown material set "${setName}"`);
-    m = new THREE.MeshStandardMaterial({
-      map: set.albedo,
-      normalMap: set.normal,
-      roughnessMap: set.orm,
-      metalnessMap: set.orm,
-      aoMap: set.orm,
-      vertexColors: true,
-      roughness: opts.rough ?? 1,
-      metalness: opts.metal ?? 1,
-      color: opts.tint ? new THREE.Color(opts.tint[0], opts.tint[1], opts.tint[2]) : 0xffffff,
-      side: opts.side ?? THREE.FrontSide,
-      dithering: true,
-    });
-    m.normalScale.set(opts.normalScale ?? 1, opts.normalScale ?? 1);
-    m.aoMapIntensity = opts.ao ?? 0.85;
-    m.name = `ai_${setName}`;
-    this._attachShader(m, d && this.details[d.set] ? d : null, opts.rim);
+    const set = this.textures[setName];
+    if (!set) throw new Error(`[ai] unknown material set "${setName}" (scene 無しで get() した場合もここに来る)`);
+    m = new PBRMaterial(`ai_${setName}_${opts.key ?? ''}`, this.scene);
+    m.albedoTexture = set.albedo;
+    m.bumpTexture = set.normal;
+    m.metallicTexture = set.orm;
+    m.useAmbientOcclusionFromMetallicTextureRed = true;
+    m.useRoughnessFromMetallicTextureGreen = true;
+    m.useMetallnessFromMetallicTextureBlue = true;
+    m.useRoughnessFromMetallicTextureAlpha = false;
+    m.ambientTextureStrength = opts.ao ?? 0.85;
+    m.metallic = opts.metal ?? 1;
+    m.roughness = opts.rough ?? 1;
+    if (opts.tint) m.albedoColor = new Color3(opts.tint[0], opts.tint[1], opts.tint[2]);
+    // 法線は bake() が OpenGL 規約 (+Y 上) で書いている。materials/index.js と同じく反転しない。
+    m.invertNormalMapX = false;
+    m.invertNormalMapY = false;
+    /**
+     * **WebGPU の inter-stage 変数上限 (16) 対策。消すと画面全体が黒くなる。**
+     *
+     * この材質構成 (CSM 4 カスケード + 頂点カラー + UV + world pos/normal + IBL)
+     * は fragment 入力が 17 変数になり、WebGPU の上限 16 を 1 だけ超える。
+     * パイプライン生成が GPUValidationError で落ち、そのフレームの
+     * コマンドバッファごと無効化されて**シーン全体が真っ黒**になる (実測。
+     * エラーは uncaptured warning にしか出ないため、初見では原因に辿り着き
+     * にくい)。ワールドの材質は頂点カラーが無いのでちょうど 16 に収まっている。
+     *
+     * irradiance (SH) を頂点→fragment 渡しせず fragment 側で評価することで
+     * varying を 1 本削り、16 に収める。絵は同等 (むしろ法線あたりの精度は上がる)。
+     */
+    m.forceIrradianceInFragment = true;
+    m.metadata = { owSurface: 'fabric' };
     this.materials.set(key, m);
     return m;
-  }
-
-  /**
-   * Install the character shader hooks: the high-frequency detail tile (when the
-   * set has one) and the silhouette edge-darkening term (always).
-   *
-   * Both live in ONE onBeforeCompile because render's MaterialPatcher chains
-   * whatever hook it finds — it calls ours first, then injects the CSM shadow,
-   * contact shadow, GTAO and bounce fill. `customProgramCacheKey` must describe
-   * every branch below or three hands the detail-blended program to the skin
-   * material, which shares every define.
-   */
-  _attachShader(m, d, rimScale = 1) {
-    const rim = new THREE.Vector4(
-      RIM.strength * rimScale,
-      RIM.edge,
-      RIM.power,
-      0
-    );
-    const uni = {
-      owDetailTex: { value: d ? this.details[d.set] : null },
-      owDetailParams: {
-        value: new THREE.Vector3(d?.scale ?? 8, d?.normal ?? 0.7, d?.rough ?? 0.2),
-      },
-      owCharRim: { value: rim },
-    };
-    m.userData.owDetailUniforms = uni;
-    m.userData.owCharRim = uni.owCharRim;
-    const tag = `ai-${d ? `detail-${d.set}-${d.scale}` : 'plain'}-rim${rim.x.toFixed(2)}`;
-    m.customProgramCacheKey = () => tag;
-    m.onBeforeCompile = (shader) => {
-      shader.uniforms.owCharRim = uni.owCharRim;
-      shader.fragmentShader = 'uniform vec4 owCharRim;\n' + shader.fragmentShader;
-      if (d) {
-        shader.uniforms.owDetailTex = uni.owDetailTex;
-        shader.uniforms.owDetailParams = uni.owDetailParams;
-        shader.fragmentShader =
-          'uniform sampler2D owDetailTex;\nuniform vec3 owDetailParams;\n' + shader.fragmentShader;
-        // roughness: the detail alpha is a signed delta around 0.5
-        shader.fragmentShader = shader.fragmentShader.replace(
-          '#include <roughnessmap_fragment>',
-          `#include <roughnessmap_fragment>
-          roughnessFactor = clamp( roughnessFactor +
-            ( texture2D( owDetailTex, vNormalMapUv * owDetailParams.x ).w - 0.5 ) * owDetailParams.z,
-            0.04, 1.0 );`
-        );
-        // normal: add the detail tangent slope to the base one before the TBN
-        shader.fragmentShader = shader.fragmentShader.replace(
-          '#include <normal_fragment_maps>',
-          `vec3 owMapN = texture2D( normalMap, vNormalMapUv ).xyz * 2.0 - 1.0;
-          owMapN.xy *= normalScale;
-          owMapN.xy += ( texture2D( owDetailTex, vNormalMapUv * owDetailParams.x ).xy * 2.0 - 1.0 )
-            * owDetailParams.y;
-          normal = normalize( tbn * normalize( owMapN ) );`
-        );
-      }
-      // silhouette: darken the grazing sliver of every closed surface, using the
-      // geometric normal so the band cannot crawl with the detail tile.
-      shader.fragmentShader = shader.fragmentShader.replace(
-        '#include <opaque_fragment>',
-        `{
-          float owF = 1.0 - abs( dot( normalize( vViewPosition ), nonPerturbedNormal ) );
-          float owEdge = pow( smoothstep( owCharRim.y, 1.0, owF ), owCharRim.z );
-          outgoingLight *= 1.0 - owCharRim.x * owEdge;
-        }
-        #include <opaque_fragment>`
-      );
-    };
   }
 
   /** Flat material for goggle lenses / optic glass. */
   glass(tint = [0.06, 0.07, 0.08]) {
     let m = this.materials.get('glass');
     if (m) return m;
-    m = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(tint[0], tint[1], tint[2]),
-      roughness: 0.11,
-      metalness: 0.0,
-      vertexColors: true,
-      envMapIntensity: 1.4,
-    });
-    m.name = 'ai_glass';
-    // A goggle lens is the one place a *bright* grazing highlight is correct, so
-    // the edge term runs at half strength: enough that the lens rim does not
-    // bloom into the sky, not enough to kill the sheen that makes it read glass.
-    this._attachShader(m, null, 0.5);
+    m = new PBRMaterial('ai_glass', this.scene);
+    m.albedoColor = new Color3(tint[0], tint[1], tint[2]);
+    m.roughness = 0.11;
+    m.metallic = 0.0;
+    m.environmentIntensity = 1.4;
+    // 頂点カラー付きメッシュに載るので、上の get() と同じ varying 上限対策が要る
+    m.forceIrradianceInFragment = true;
     this.materials.set('glass', m);
     return m;
   }
 
   dispose() {
     for (const t of this._disposables) t.dispose();
-    for (const m of this.materials.values()) m.dispose();
+    for (const m of this.materials.values()) m.dispose?.();
     this.materials.clear();
     this._disposables.length = 0;
   }

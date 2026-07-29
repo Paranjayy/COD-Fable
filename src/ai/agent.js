@@ -2,7 +2,7 @@
  * AI — one enemy: body, senses, brain, gun.
  *
  * PERCEPTION is deliberately imperfect. A target has to be inside a 100 degree
- * cone, in line of sight through the physics BVH, and then *stay* there for a
+ * cone, in line of sight through the physics world, and then *stay* there for a
  * reaction delay that scales with angle off-centre and distance before the
  * agent acknowledges it. Gunshots and footsteps arrive as events and only give
  * a direction, which becomes a "last known position" that decays — so enemies
@@ -15,14 +15,37 @@
  * suppressing fire, grenades and repositioning when the player stops moving.
  *
  * DAMAGE is per-bone: capsule colliders for head, chest, pelvis, arms and legs
- * are pushed into `physics` every frame, so a headshot is a headshot because of
- * where the round landed, not because of a random roll. Death hands the live
- * skeleton to the ragdoll solver with the bullet's impulse.
+ * follow the animated skeleton every frame (hitbox.js の ANIMATED ボディ), so a
+ * headshot is a headshot because of where the round landed, not because of a
+ * random roll. Death plays a deterministic procedural collapse (deathfall.js —
+ * ラグドールを持たない理由はそちらのコメント参照).
+ *
+ * ## Babylon 移植で変わった構図 (Three 版との差分)
+ *
+ *  - ビジュアル: THREE.SkinnedMesh + Group → Babylon Mesh(clone) + TransformNode。
+ *    アニメーションは CPU 側 math3.Bone 階層で解き、毎フレーム
+ *    `syncSkeleton()` で Babylon の Skeleton に写す (mesh.js 参照)。
+ *  - 移動: Babylon 版 Character.move は「速度」を fixedUpdate から渡す方式
+ *    (Three 版は「変位」を update から)。update() は毎フレーム希望速度を作り、
+ *    AiSystem.fixedUpdate → agent.fixedUpdate(h) が積分する。
+ *  - CC の position は**カプセル中心** (characterController.js の footOffset
+ *    参照)。this.position は Three 版と同じ「足元」を維持し、境界で変換する。
+ *    ここを混ぜると全員が 0.9 m 浮く/沈む。
+ *  - CC の shape フィルタを membership=CLIP / collideWith=MASK.CHARACTER に
+ *    設定する。**自分のヒットボックス (ACTOR) を CC の掃引から外すため**で、
+ *    hitbox.js のフィルタ設計とセット。外すと一歩も歩けなくなる。
  */
 
-import * as THREE from 'three';
+import * as THREE from './math3.js';
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+import { Quaternion as BQuaternion } from '@babylonjs/core/Maths/math.vector.js';
+
 import { RIG } from './rig.js';
 import { Animator } from './animator.js';
+import { createBabylonSkeleton, syncSkeleton, applyInflatedBounds } from './mesh.js';
+import { HitboxSet } from './hitbox.js';
+import { DeathFall } from './deathfall.js';
+import { ray, rayAny } from './physray.js';
 
 const STATE = {
   IDLE: 'idle',
@@ -37,6 +60,7 @@ const STATE = {
 
 export { STATE };
 
+/** [part, boneA, boneB, radius, damageScale] */
 const HITBOXES = [
   ['head', 'Head', 'HeadTop', 0.098, 4.0],
   ['torso', 'Spine1', 'Neck', 0.185, 1.0],
@@ -47,45 +71,7 @@ const HITBOXES = [
   ['leg', 'UpLegL', 'FootL', 0.105, 0.7],
 ];
 
-/**
- * Ragdoll bone spec, in the order the solver wants it.
- *   [ headBone, tailBone, radius, massFraction, parentIndex, cone°, twist°, map ]
- * `map` false marks a stub whose only job is to weld a limb chain to the torso:
- * the solver shares a particle between two bones only when their endpoints are
- * coincident, so the shoulder and hip need a bone that starts exactly on the
- * spine joint. Deriving our own spec (instead of letting physics infer one from
- * all 25 bones) also gets the capsule radii right, which is the difference
- * between a body and a pancake.
- */
-const DOLL = [
-  ['Hips', 'Spine', 0.135, 0.14, -1, 0, 0, true],
-  ['Spine', 'Spine1', 0.125, 0.10, 0, 22, 16, true],
-  ['Spine1', 'Spine2', 0.135, 0.14, 1, 18, 12, true],
-  ['Spine2', 'Neck', 0.130, 0.10, 2, 16, 10, true],
-  ['Neck', 'Head', 0.052, 0.03, 3, 30, 25, true],
-  ['Head', 'HeadTop', 0.098, 0.07, 4, 42, 30, true],
-  // stubs get a free cone: their direction is lateral while the parent points
-  // up the spine, so any limit here is violated in the bind pose and the solver
-  // would inject energy trying to fix it
-  ['Spine2', 'UpperArmR', 0.055, 0.02, 3, 179, 179, false],
-  ['UpperArmR', 'ForearmR', 0.058, 0.027, 6, 100, 60, true],
-  ['ForearmR', 'HandR', 0.048, 0.018, 7, 80, 45, true],
-  ['HandR', 'FingersR', 0.038, 0.006, 8, 55, 40, true],
-  ['Spine2', 'UpperArmL', 0.055, 0.02, 3, 179, 179, false],
-  ['UpperArmL', 'ForearmL', 0.058, 0.027, 10, 100, 60, true],
-  ['ForearmL', 'HandL', 0.048, 0.018, 11, 80, 45, true],
-  ['HandL', 'FingersL', 0.038, 0.006, 12, 55, 40, true],
-  ['Hips', 'UpLegR', 0.065, 0.02, 0, 179, 179, false],
-  ['UpLegR', 'LegR', 0.088, 0.10, 14, 95, 35, true],
-  ['LegR', 'FootR', 0.068, 0.045, 15, 70, 20, true],
-  ['FootR', 'ToeR', 0.050, 0.012, 16, 40, 20, true],
-  ['Hips', 'UpLegL', 0.065, 0.02, 0, 179, 179, false],
-  ['UpLegL', 'LegL', 0.088, 0.10, 18, 95, 35, true],
-  ['LegL', 'FootL', 0.068, 0.045, 19, 70, 20, true],
-  ['FootL', 'ToeL', 0.050, 0.012, 20, 40, 20, true],
-];
-
-const DEG = Math.PI / 180;
+const UP = new THREE.Vector3(0, 1, 0);
 
 let _nextId = 1;
 
@@ -101,35 +87,46 @@ export class Agent {
     this.scale = def.variant.scale ?? 1;
 
     /* ---------------- body ---------------- */
-    const { bones, skeleton, root } = RIG.createSkeleton();
+    // CPU 側: アニメーション/IK が解く姿勢木。actor がワールド変換 (位置+yaw+scale)。
+    const { bones, root } = RIG.createSkeleton();
     this.bones = bones;
-    this.skeleton = skeleton;
-    this.mesh = new THREE.SkinnedMesh(def.geometry, def.materials);
-    this.mesh.castShadow = true;
-    this.mesh.receiveShadow = true;
-    this.mesh.frustumCulled = true;
-    this.mesh.userData.agent = this;
-    this.group = new THREE.Group();
-    this.group.name = `enemy${this.id}`;
-    this.group.add(root);
-    this.group.add(this.mesh);
-    this.mesh.bind(skeleton);
-    this.group.scale.setScalar(this.scale);
-    ai.root.add(this.group);
+    this.actor = new THREE.Object3D();
+    this.actor.name = `enemy${this.id}`;
+    this.actor.add(root);
+    this.actor.scale.setScalar(this.scale);
 
-    /** Physics looks for these when it adopts the skeleton on death. */
-    this.skinnedMesh = this.mesh;
+    // Babylon 側: テンプレートの clone (ジオメトリ共有) + アクター専用スケルトン。
+    const scene = this.ctx.scene;
+    this.node = new TransformNode(`enemy${this.id}`, scene);
+    this.node.parent = ai.root;
+    this.node.rotationQuaternion = BQuaternion.Identity();
+    this.node.scaling.setAll(this.scale);
+    this.mesh = def.template.clone(`enemy${this.id}_mesh`, this.node);
+    this.mesh.setEnabled(true);
+    this.mesh.metadata = { agent: this, owNoShadow: false };
+    applyInflatedBounds(this.mesh, def.geometry.boundingBox);
+    const sk = createBabylonSkeleton(scene, RIG, `sk_enemy${this.id}`);
+    this.skeleton = sk.skeleton;
+    this.bBones = sk.bBones;
+    this.mesh.skeleton = this.skeleton;
+    // 影キャスタ登録。画面外 LOD (AiSystem._updateRelevance) が add/remove を
+    // 切り替えるので、現在の登録状態をここで追跡する。
+    this._render = this.ctx.peek('render');
+    this._render?.addShadowCaster(this.mesh, false);
+    this._castingShadow = true;
+
     this.mass = 82 * this.scale;
 
     this.position = new THREE.Vector3().copy(opts.position ?? new THREE.Vector3());
     this.yaw = opts.yaw ?? 0;
     this.targetYaw = this.yaw;
-    this.group.position.copy(this.position);
-    this.group.rotation.y = this.yaw;
-    // The bones' world matrices are derived from the group's, so the group has
-    // to be current before anything reads them — including the very first
-    // animator pass and a same-frame ragdoll hand-off.
-    this.group.updateMatrixWorld(true);
+    this.actor.position.copy(this.position);
+    this.actor.quaternion.setFromAxisAngle(UP, this.yaw);
+    // ボーンのワールド行列はアクターの行列から導かれるので、何かがそれを読む前
+    // (最初の animator パスや同フレームの死亡処理) に最新化しておく。
+    this.actor.updateMatrix();
+    this.actor.updateMatrixWorld();
+    this._syncNode();
 
     this.animator = new Animator(RIG, bones, {
       weapon: def.weapon,
@@ -147,30 +144,26 @@ export class Agent {
       ? phys.createCharacter({
         radius: this.radius,
         height: this.height,
-        position: this.position,
+        // CC はカプセル中心基準 (冒頭コメント)。this.position は足元。
+        position: { x: this.position.x, y: this.position.y + this.height * 0.5, z: this.position.z },
         stepHeight: 0.42,
         slopeLimit: 48,
       })
       : null;
+    if (this.controller) {
+      // 自分のヒットボックス (ACTOR) と衝突しないための CC 側フィルタ。
+      // hitbox.js 冒頭の設計コメントとセットで読むこと。
+      const shape = this.controller.ctrl.shape;
+      shape.filterMembershipMask = phys.LAYER.CLIP;
+      shape.filterCollideMask = phys.MASK.CHARACTER;
+    }
     this.velocity = new THREE.Vector3();
     this.grounded = true;
+    /** update() が作り fixedUpdate() が消費する希望水平速度。 */
+    this._wishVx = 0;
+    this._wishVz = 0;
 
-    this.colliders = [];
-    if (phys) {
-      for (const [part, a, b, r, dmg] of HITBOXES) {
-        const c = phys.addCollider({
-          shape: 'capsule',
-          layer: phys.LAYER.ACTOR,
-          surface: 'flesh',
-          owner: this,
-          part,
-          radius: r * this.scale,
-          damageScale: dmg,
-        });
-        c.userData = { a, b };
-        this.colliders.push(c);
-      }
-    }
+    this.hitboxes = phys ? new HitboxSet(phys, scene, this, HITBOXES, RIG, this.scale) : null;
 
     /* ---------------- stats ---------------- */
     this.health = 100;
@@ -236,6 +229,12 @@ export class Agent {
     this.pathPending = false;
     this._pendingDest = new THREE.Vector3();
 
+    /* ---------------- death ---------------- */
+    this.deathFall = new DeathFall(RIG, bones);
+    this._deathOut = { rootAngle: 0, rootAxis: null, rootTwist: 0, rootY: 0 };
+    this._deathQ = new THREE.Quaternion();
+    this._deathQ2 = new THREE.Quaternion();
+
     /* ---------------- LOD ---------------- */
     /** set by AiSystem._updateRelevance: nothing this actor does reaches a pixel */
     this.lodIrrelevant = false;
@@ -284,6 +283,26 @@ export class Agent {
     this._move(dt);
     this._shoot(dt);
     this._drive(dt);
+  }
+
+  /**
+   * 物理積分 (120 Hz 固定)。AiSystem.fixedUpdate から呼ばれる。
+   * Babylon 版 Character.move は「速度」を渡す約束 (physics/index.js)。
+   */
+  fixedUpdate(h) {
+    const c = this.controller;
+    if (!c || !this.alive) return;
+    this.velocity.y += this.phys.gravity.y * h;
+    c.setHeight?.(this.crouch ? 1.16 * this.scale : this.height);
+    c.move(this._wishVx, this.velocity.y, this._wishVz);
+    // CC のカプセル中心 → 足元へ変換して保持 (冒頭コメント)
+    this.position.set(
+      c.position.x,
+      c.position.y - c.height * 0.5,
+      c.position.z
+    );
+    this.grounded = c.grounded;
+    if (c.grounded && this.velocity.y < 0) this.velocity.y = 0;
   }
 
   /* ================================================================== */
@@ -671,18 +690,12 @@ export class Agent {
     const turnRate = this.speed > 0.3 ? 6.5 : 3.4;
     this.yaw += Math.max(-turnRate * dt, Math.min(turnRate * dt, dy));
 
-    /* integrate through the character controller */
+    /* 希望速度を書く。実際の積分は fixedUpdate (120 Hz) — Babylon 版 Character
+     * が「速度渡し + 固定ステップ」の約束のため (physics/index.js 参照)。 */
     const c = this.controller;
     if (c) {
-      const g = this.phys.gravity;
-      this.velocity.y += g * dt;
-      const vx = this._steer.x * this.speed;
-      const vz = this._steer.z * this.speed;
-      c.setHeight?.(this.crouch ? 1.16 * this.scale : this.height);
-      c.move(vx * dt, this.velocity.y * dt, vz * dt);
-      this.position.copy(c.position);
-      this.grounded = c.grounded;
-      if (c.grounded && this.velocity.y < 0) this.velocity.y = 0;
+      this._wishVx = this._steer.x * this.speed;
+      this._wishVz = this._steer.z * this.speed;
 
       // blocked by something low: vault it
       if (c.lastMoveBlocked && this.speed > 1.5 && this.vaultCooldown <= 0 && this.grounded) {
@@ -705,12 +718,14 @@ export class Agent {
   _tryVault() {
     const phys = this.phys;
     const fwd = this._v.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
-    const low = phys.raycast(
+    const low = ray(
+      phys,
       this.position.x, this.position.y + 0.35, this.position.z,
       fwd.x, 0, fwd.z, 0.85, phys.MASK.WORLD
     );
     if (!low.hit) return;
-    const high = phys.raycastAny(
+    const high = rayAny(
+      phys,
       this.position.x, this.position.y + 1.25, this.position.z,
       fwd.x, 0, fwd.z, 1.1, phys.MASK.WORLD
     );
@@ -852,27 +867,21 @@ export class Agent {
     this.ai.cover?.release(this.id);
     if (this.controller) this.phys.removeCharacter(this.controller);
     this.controller = null;
-    for (const c of this.colliders) this.phys?.removeCollider(c);
-    this.colliders.length = 0;
+    this.hitboxes?.dispose();
+    this.hitboxes = null;
 
-    // Impulse is N·s, and the ragdoll turns it into a velocity change on the
-    // particles it lands near: a 5.56 round carries ~4 N·s, so anything in the
-    // hundreds launches the body across the street instead of dropping it.
-    this.group.updateMatrixWorld(true);
+    // actor:death のペイロード互換のため、impulse は Three 版と同じスケールで作る
+    // (fx の土煙などが読む可能性があるため向きと大きさの意味を保つ)。
     const impulse = this._v2
       .copy(dir ?? this._v.set(0, 0, 1))
       .normalize()
       .multiplyScalar(Math.min(5.5, 1.5 + amount * 0.02));
     const hitPoint = point ?? this._v.copy(this.position).setY(this.position.y + 1.2);
 
-    // Own the hand-off: build the capsule spec from the *live* animated pose,
-    // hand it to the solver and let it drive the skeleton from here. Setting
-    // __ragdoll stops physics creating a second one off our death event.
-    const rd = this._makeRagdoll(impulse, hitPoint);
-    if (rd) {
-      this.__ragdoll = rd;
-      this.ragdoll = rd;
-    }
+    // ラグドールの代わりに手続きの倒れ込み (deathfall.js に選定理由)。
+    // 被弾方向に倒れる。支点は現在の足元。
+    this.deathFall.begin(this, dir, this.position.y);
+
     this.ctx.events.emit('actor:death', {
       actor: this,
       point: hitPoint,
@@ -883,50 +892,44 @@ export class Agent {
   }
 
   /**
-   * Hand the live pose to the ragdoll solver. `physics` derives the capsule
-   * chain from the skeleton itself, so the doll starts exactly in the pose the
-   * animator left — the death has no pop. `radiusRatio` fattens the capsules
-   * (its default is thin enough that a settled body reads as a pancake).
+   * 死後のフレーム更新: 倒れ込みモーションを進め、静止したら以後は何もしない
+   * (スケルトンへの sync も止まるので死体はゼロコスト)。
    */
-  _makeRagdoll(impulse, point) {
-    const phys = this.phys;
-    if (!phys) return null;
-    // Fat capsules that start half-buried in the floor tunnel straight through
-    // it: the contact normal flips once a bone's axis is on the far side. Lift
-    // the pose clear of the ground for the one frame it takes to build the doll,
-    // then put the group back — the body drops the 15 cm invisibly.
-    const lift = 0.15 * this.scale;
-    this.group.position.y += lift;
-    this.group.updateMatrixWorld(true);
-    const rd = phys.createRagdollFromSkeleton(this.mesh, {
-      actor: this,
-      mass: this.mass,
-      radiusRatio: 0.42,
-      cone: 74,
-      twist: 38,
-      iterations: 8,
-      velocity: { x: this.velocity.x * 0.6, y: 0, z: this.velocity.z * 0.6 },
-    });
-    this.group.position.y -= lift;
-    this.group.updateMatrixWorld(true);
-    if (!rd) return null;
-    if (impulse && point) {
-      // wide radius: a tight one dumps all of it into whichever light bone is
-      // nearest and whips the limb across the street
-      rd.applyImpulse(point.x, point.y, point.z, impulse.x, impulse.y, impulse.z, 0.85);
+  updateDead(dt) {
+    this.deadTime += dt;
+    if (this.deathFall.t < 0) return;
+    const moving = this.deathFall.update(dt, this._deathOut);
+    this._applyDeathPose();
+    if (!moving) this.deathFall.t = -1; // 完了 — 以後この分岐に入らない
+  }
+
+  /** 倒れ込み中のルート姿勢 (倒れ回転 + ひねり) を CPU/Babylon 両方に書く。 */
+  _applyDeathPose() {
+    const o = this._deathOut;
+    // yaw (+ひねり) → 倒れ回転 の順で合成 (ワールド軸回転は premultiply)
+    this._deathQ.setFromAxisAngle(UP, this.yaw + o.rootTwist);
+    if (o.rootAxis && o.rootAngle > 1e-5) {
+      this._deathQ2.setFromAxisAngle(o.rootAxis, o.rootAngle);
+      this._deathQ.premultiply(this._deathQ2);
     }
-    if (this.ai.debugLog) {
-      console.info(
-        `[ai] ragdoll ${rd.boneCount} bones / ${rd.particleCount} particles, ` +
-          `mask=${rd.mask} tris=${rd.world?.triCount}`
-      );
-    }
-    return rd;
+    this.actor.position.set(this.position.x, o.rootY, this.position.z);
+    this.actor.quaternion.copy(this._deathQ);
+    this.actor.updateMatrix();
+    this.actor.updateMatrixWorld();
+    this._syncNode();
+    syncSkeleton(this.bones, this.bBones, this.skeleton);
   }
 
   /* ================================================================== */
   /* drive the visual                                                   */
   /* ================================================================== */
+
+  /** CPU 側 actor の変換を Babylon ノードへ写す。 */
+  _syncNode() {
+    const a = this.actor;
+    this.node.position.set(a.position.x, a.position.y, a.position.z);
+    this.node.rotationQuaternion.set(a.quaternion.x, a.quaternion.y, a.quaternion.z, a.quaternion.w);
+  }
 
   _drive(dt) {
     // root motion for a vault
@@ -935,12 +938,19 @@ export class Agent {
       const t = Math.min(1, this.vaultT);
       this.position.lerpVectors(this.vaultFrom, this.vaultTo, t);
       this.position.y += Math.sin(t * Math.PI) * 0.42;
-      this.controller?.teleport(this.position.x, this.position.y, this.position.z);
+      // teleport はカプセル中心基準
+      this.controller?.teleport(
+        this.position.x,
+        this.position.y + this.controller.height * 0.5,
+        this.position.z
+      );
     }
 
-    this.group.position.copy(this.position);
-    this.group.rotation.y = this.yaw;
-    this.group.updateMatrixWorld(true);
+    this.actor.position.copy(this.position);
+    this.actor.quaternion.setFromAxisAngle(UP, this.yaw);
+    this.actor.updateMatrix();
+    this.actor.updateMatrixWorld();
+    this._syncNode();
 
     const moving = this.speed > 0.25;
     let clip;
@@ -981,29 +991,26 @@ export class Agent {
     }
     an.update(this._animAccum, this.ctx.time.elapsed);
     this._animAccum = 0;
+    // CPU で解いた姿勢を Babylon の Skeleton へ (スキップしたフレームは前の
+    // 姿勢のまま描かれる — Three 版の挙動と同じ)
+    syncSkeleton(this.bones, this.bBones, this.skeleton);
   }
 
   /** Push the hit capsules onto the animated skeleton. */
   syncHitboxes() {
-    if (!this.alive) return;
-    const an = this.animator;
-    for (let i = 0; i < this.colliders.length; i++) {
-      const c = this.colliders[i];
-      const { a, b } = c.userData;
-      an.bonePos(a, this._boneA);
-      an.bonePos(b, this._boneB);
-      c.setSegment(
-        this._boneA.x, this._boneA.y, this._boneA.z,
-        this._boneB.x, this._boneB.y, this._boneB.z
-      );
-    }
+    if (!this.alive || !this.hitboxes) return;
+    this.hitboxes.sync(this.animator);
   }
 
   dispose() {
     if (this.controller) this.phys?.removeCharacter(this.controller);
-    for (const c of this.colliders) this.phys?.removeCollider(c);
-    this.colliders.length = 0;
-    if (this.ragdoll) this.phys?.removeRagdoll(this.ragdoll);
-    this.group.parent?.remove(this.group);
+    this.controller = null;
+    this.hitboxes?.dispose();
+    this.hitboxes = null;
+    if (this._castingShadow) this._render?.removeShadowCaster(this.mesh);
+    // マテリアル/テクスチャは共有なので dispose しない (第 2 引数 false)
+    this.mesh.dispose(false, false);
+    this.skeleton.dispose();
+    this.node.dispose();
   }
 }

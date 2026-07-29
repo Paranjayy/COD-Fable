@@ -11,17 +11,21 @@
  *   soldier.js    variant assembly -> one skinned geometry + material list
  *   clips.js      hand-authored pose layers (idle/walk/run/crouch/hit/recoil…)
  *   animator.js   layered blending + aim, look-at, arm and foot IK
- *   nav.js        walkability grid from the physics BVH, A*, string pulling,
+ *   nav.js        walkability grid from the physics world, A*, string pulling,
  *                 cover point extraction and scoring
  *   agent.js      one enemy: senses, state machine, gun, hit zones, death
  *   squad.js      peek rotation, contact sharing, flank and grenade rationing
+ *   --- Babylon 移植で増えた層 ---
+ *   math3.js      Three 互換 math shim (上記の大半を無改変で通すための要)
+ *   mesh.js       Babylon Mesh/Skeleton 化と CPU 姿勢の書き写し
+ *   hitbox.js     部位ヒットボックス (Havok キネマティックカプセル + フィルタ設計)
+ *   deathfall.js  手続き死亡モーション (ラグドール不採用の理由もここ)
  *
  * PUBLIC API — `const ai = ctx.get('ai')`
  *   ai.spawn(variant, position, yaw, opts) -> Agent
  *   ai.agents                              live Agent list
  *   ai.debugStage('firefight')             staged combat tableau for captures
- *   ai.prewarmMaterials()                  await: build + compile every character
- *                                          shader without spawning anything
+ *   ai.prewarmMaterials()                  build every character material
  *   ai.grid / ai.cover                     navigation + cover queries
  *   ai.stats                               { agents, alive, navMs, coverPts,
  *                                            pathsDeferred, lodIrrelevant }
@@ -37,7 +41,14 @@
  *   damage:dealt (enemy hitting the player), actor:death
  */
 
-import * as THREE from 'three';
+import * as THREE from './math3.js';
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
+import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
+import { Color3 } from '@babylonjs/core/Maths/math.color.js';
+import { Frustum } from '@babylonjs/core/Maths/math.frustum.js';
+import { Plane } from '@babylonjs/core/Maths/math.plane.js';
+
 import { SoldierMaterials } from './textures.js';
 import { buildSoldier, resolveMaterials, MATERIAL_SLOTS, VARIANTS } from './soldier.js';
 import { RIG } from './rig.js';
@@ -45,6 +56,8 @@ import { NavGrid, CoverMap } from './nav.js';
 import { Agent, STATE } from './agent.js';
 import { Squad } from './squad.js';
 import { GroundShadows } from './grounding.js';
+import { buildVariantTemplate } from './mesh.js';
+import { ray } from './physray.js';
 
 export class AiSystem {
   static id = 'ai';
@@ -53,19 +66,18 @@ export class AiSystem {
   async init(ctx) {
     this.ctx = ctx;
     this.rng = ctx.rng.fork();
-    this.root = new THREE.Group();
-    this.root.name = 'ai';
-    ctx.scene.add(this.root);
+    this.root = new TransformNode('ai', ctx.scene);
 
     const t0 = performance.now();
     this.materials = new SoldierMaterials(this.rng.fork(), {
       size: 512,
       anisotropy: ctx.config.q.anisotropy ?? 8,
       camo: ['arid', 'woodland', 'urban'],
+      scene: ctx.scene,
     });
     // Contact occlusion under every actor. Without it the cast shadow alone
     // leaves them hovering: see grounding.js.
-    this.ground = new GroundShadows(this.root, 16);
+    this.ground = new GroundShadows(ctx.scene, this.root, 16);
     this._variants = new Map();
     this.agents = [];
     this.squads = [];
@@ -73,8 +85,11 @@ export class AiSystem {
     this.cover = null;
     this.inspect = false;
     this.debugLog = false;
-    /** dev: force the garrison to spawn even in deterministic capture runs */
-    this.forcePopulate = false;
+    /** dev: force the garrison to spawn even in deterministic capture runs.
+     *  URL の ?aipop=1 でも立つ (パトロール/経路の動作確認用)。 */
+    this.forcePopulate =
+      typeof location !== 'undefined' &&
+      new URLSearchParams(location.search).get('aipop') === '1';
     this._navPending = true;
     this.stats = { agents: 0, alive: 0, navMs: 0, coverPts: 0, walkable: 0 };
 
@@ -102,22 +117,24 @@ export class AiSystem {
     this._shellEvent = { position: new THREE.Vector3(), velocity: new THREE.Vector3() };
     this._tracerEvent = { from: this._tracerFrom, to: this._tracerTo, speed: 800 };
     this._grenades = [];
-    this._grenadeGeo = null;
+    this._grenadeMesh = null;
     this._grenadeMat = null;
 
     /* ---- frame budgets and LOD state (see _updateRelevance / requestPath) ---- */
     this._pathBudget = 0;
-    /** A* solves allowed per frame. Measured: one solve is 0.5-1.1 ms on the
-     *  221x221 grid, and a squad that all enters combat on the same frame used to
-     *  ask for six of them at once. */
+    /** A* solves allowed per frame. Measured (Three 版): one solve is 0.5-1.1 ms
+     *  on the 221x221 grid, and a squad that all enters combat on the same frame
+     *  used to ask for six of them at once. */
     this.pathsPerFrame = 2;
     this.stats.pathsDeferred = 0;
-    this._frustum = new THREE.Frustum();
-    this._mvp = new THREE.Matrix4();
-    this._sphere = new THREE.Sphere();
-    this._sweep = new THREE.Sphere();
+    /** フラスタム平面 (Babylon)。GetPlanesToRef が毎フレーム書き直す。 */
+    this._planes = [];
+    for (let i = 0; i < 6; i++) this._planes.push(new Plane(0, 0, 0, 0));
+    this._sphereC = { x: 0, y: 0, z: 0 };
     this._sun = new THREE.Vector3(0, 1, 0);
     this._lodStats = { irrelevant: 0 };
+    this._stagedAgents = [];
+    this._stagedSquad = null;
 
     this._wireEvents(ctx);
     console.info(
@@ -125,7 +142,7 @@ export class AiSystem {
         `(${this.materials.bakeMs.toFixed(0)}ms texture bake)`
     );
     // The albedo budget is only real if it is measured. Print what every camo
-    // bake actually landed on, so a drift out of 0.09-0.32 is visible in the
+    // bake actually landed on, so a drift out of budget is visible in the
     // capture log instead of only in the critic's histogram.
     for (const k in this.materials.camoStats ?? {}) {
       const s = this.materials.camoStats[k];
@@ -135,21 +152,9 @@ export class AiSystem {
       );
     }
 
-    // Navigation, the garrison and every character shader, DURING BOOT.
-    //
-    // MEASURED, not guessed: all of this used to land on the first `update()`
-    // after the player took control — 224 ms for the 221x221 walkability grid,
-    // 19 ms for the cover map and 93/58/57 ms to build the three soldier
-    // geometries the first three spawns ask for. One 450 ms freeze, on the frame
-    // the player starts playing, plus five character programs compiling over the
-    // frames after it (116-328 ms each).
-    //
-    // Doing it here is behaviour-identical rather than merely similar: no frame
-    // has run yet, so `physics`, `world` and `player` are in exactly the state
-    // the first update would have found them in, and the order of RNG draws —
-    // which is what decides how every soldier is stitched together — is
-    // unchanged. `update()` keeps the same code as a fallback for the case where
-    // the collision world is not registered yet.
+    // Navigation and the garrison DURING BOOT (Three 版の実測に基づく判断を
+    // 踏襲: 最初の update() に 450ms のフリーズを載せない)。物理がまだ空なら
+    // _navPending が立ったままになり update() が再試行する。
     this._bootNav(ctx);
     await this.prewarmMaterials();
   }
@@ -169,92 +174,32 @@ export class AiSystem {
   }
 
   /**
-   * Build every character material and force its shader program to compile,
-   * WITHOUT spawning a gameplay object and WITHOUT drawing a frame.
+   * 全キャラクタマテリアルを起動時に作っておく。
    *
-   * This is the hook `src/core/prewarm.js` documents as missing: its `transients`
-   * pass reached the character programs by staging a firefight, which left actors
-   * and decals behind and blew the pixel gate. Nothing here is a gameplay object.
+   * Three 版はここでシェーダ 26 本を CSM 深度バリアント込みで compileAsync して
+   * いた。Babylon 版は各パイプラインが自前でエフェクトを管理しており、深度/影の
+   * バリアント強制コンパイルに相当する安全な公開 API が (この構成では) 無いため、
+   * **マテリアル生成のみ**行う。初回描画時のコンパイルは capture の settle
+   * フレームに吸収される。実測で問題になったら forceCompilationAsync の導入を
+   * 検討すること (メッシュとペアで呼ぶ必要がある)。
    *
-   *  - `resolveMaterials()` is a pure function of the variant name, so every
-   *    material every variant will ever ask for can be created now. It draws no
-   *    random numbers, so the RNG stream — and therefore the picture — is
-   *    untouched. It MUST be handed `MATERIAL_SLOTS` in the builder's own order:
-   *    three sorts opaque draws (including the nine groups inside one soldier) by
-   *    the global `Material.id` counter, so creating them in any other order
-   *    reorders those draws and flips the depth tie on coplanar surfaces. That is
-   *    a measured 2-pixel gate failure, not a theory — see MATERIAL_SLOTS.
-   *  - the programs are compiled against a throwaway scene holding ONE dummy
-   *    SkinnedMesh. The permutation three compiles is decided by the material
-   *    plus the object's features (skinning, vertex colours, uv) and the target
-   *    scene's lights, so a 6-triangle stand-in with the real 25-bone skeleton
-   *    and the real vertex attributes yields the same programs a soldier does.
-   *  - the cascade depth variant is compiled too, by borrowing render's own
-   *    override material: `compileAsync` only ever looks at `object.material`, so
-   *    the skinned depth program is otherwise not reachable without rendering a
-   *    shadow map.
-   *
-   * Idempotent and never throws — a failed prewarm just means the old stutter.
+   * Idempotent and never throws — a failed prewarm just means a stutter.
    */
   async prewarmMaterials() {
     if (this._prewarmed) return this._prewarmed;
     const t0 = performance.now();
-    const out = { ok: false, materials: 0, programs: 0, ms: 0 };
+    const out = { ok: false, materials: 0, ms: 0 };
     this._prewarmed = out;
     try {
-      const mats = [];
       const seen = new Set();
       for (const name in VARIANTS) {
         for (const m of resolveMaterials(name, MATERIAL_SLOTS, this.materials)) {
-          if (m && !seen.has(m)) { seen.add(m); mats.push(m); }
+          if (m && !seen.has(m)) seen.add(m);
         }
       }
       // the thrown grenade's mesh is built on the first throw, mid-firefight
       this._ensureGrenade();
-      out.materials = mats.length + 1;
-
-      const r = this.ctx.peek('render');
-      if (r?.patcher) {
-        for (const m of mats) r.patcher.patch(m);
-        r.patcher.patch(this._grenadeMat);
-      }
-      const renderer = r?.renderer;
-      if (!renderer) return out;
-      const before = renderer.info.programs?.length ?? 0;
-
-      const scene = new THREE.Scene();
-      const { skeleton, root } = RIG.createSkeleton();
-      const geo = this._dummySkinGeometry();
-      const mesh = new THREE.SkinnedMesh(geo, mats);
-      mesh.frustumCulled = false;
-      scene.add(root);
-      scene.add(mesh);
-      mesh.bind(skeleton);
-
-      const compile = async (target) => {
-        try {
-          await renderer.compileAsync(scene, this.ctx.camera, target);
-        } catch {
-          try { renderer.compile(scene, this.ctx.camera, target); } catch { /* driver */ }
-        }
-      };
-      await compile(this.ctx.scene);
-      // cascade depth: same object, render's own override material
-      const depth = r.csm?.depthMaterial;
-      if (depth) {
-        mesh.material = depth;
-        await compile(this.ctx.scene);
-      }
-      // the grenade is a plain (unskinned) mesh, so it needs its own object
-      scene.remove(mesh);
-      const g = new THREE.Mesh(this._grenadeGeo, this._grenadeMat);
-      scene.add(g);
-      await compile(this.ctx.scene);
-      scene.remove(g);
-
-      geo.dispose();
-      skeleton.dispose?.();
-      out.programs = (renderer.info.programs?.length ?? 0) - before;
+      out.materials = seen.size + 1;
       out.ok = true;
     } catch (err) {
       out.error = String(err?.message ?? err);
@@ -262,27 +207,6 @@ export class AiSystem {
     out.ms = Math.round(performance.now() - t0);
     console.info(`[ai] prewarmMaterials ${JSON.stringify(out)}`);
     return out;
-  }
-
-  /**
-   * A 2-triangle skinned stand-in carrying exactly the attributes a soldier's
-   * geometry does — position, normal, uv, colour, skinIndex, skinWeight. Three
-   * derives half of the shader permutation from the geometry's attributes, so
-   * anything missing here would compile the wrong program.
-   */
-  _dummySkinGeometry() {
-    const g = new THREE.BufferGeometry();
-    const n = 3;
-    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]), 3));
-    g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(n * 2), 2));
-    g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3).fill(1), 3));
-    g.setAttribute('skinIndex', new THREE.BufferAttribute(new Uint16Array(n * 4), 4));
-    const w = new Float32Array(n * 4);
-    for (let i = 0; i < n; i++) w[i * 4] = 1;
-    g.setAttribute('skinWeight', new THREE.BufferAttribute(w, 4));
-    g.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
-    return g;
   }
 
   /* ================================================================== */
@@ -321,7 +245,11 @@ export class AiSystem {
       if (!e || !e.target || !(e.target instanceof Agent)) return;
       const a = e.target;
       if (!a.alive) return;
-      const amount = e.amount * this._falloff(e.point);
+      // 部位倍率: Babylon 版 physics は Hit の damageScale を掛けないので、
+      // ここでヘッドショット倍率 (HITBOXES の head=4.0) を適用する。ダメージの
+      // 適用は対象 (この購読) だけが行う — 発行側で適用すると二重に減る。
+      const partScale = e.headshot ? 4.0 : 1;
+      const amount = e.amount * partScale * this._falloff(e.point);
       a.applyDamage(amount, e.headshot ? 'head' : e.part ?? 'torso', e.point ?? a.position, e.incident);
       if (!a.alive) e.killed = true;
     });
@@ -374,15 +302,12 @@ export class AiSystem {
     let v = this._variants.get(name);
     if (!v) {
       const t0 = performance.now();
-      v = buildSoldier(name, { rng: this.rng.fork(), materials: this.materials });
+      const built = buildSoldier(name, { rng: this.rng.fork(), materials: this.materials });
+      // Babylon テンプレート Mesh (setEnabled(false))。各 Agent は clone する。
+      built.template = buildVariantTemplate(this.ctx.scene, name, built);
+      built.template.parent = this.root;
+      v = built;
       this._variants.set(name, v);
-      // Hand the new materials to render immediately rather than waiting for its
-      // scene walk: they are all MeshStandardMaterial, so the patcher injects the
-      // CSM sun shadow, the screen-space contact shadow, GTAO and the bounce fill
-      // into them. Without the shadow term a character is lit by ambient alone
-      // and looks pasted onto the ground.
-      const r = this.ctx.peek('render');
-      if (r?.patcher) for (const m of v.materials) r.patcher.patch(m);
       console.info(
         `[ai] variant "${name}" ${v.stats.triangles | 0} tris / ${v.stats.vertices} verts / ` +
           `${v.materials.length} materials in ${(performance.now() - t0).toFixed(0)}ms`
@@ -391,7 +316,7 @@ export class AiSystem {
     return v;
   }
 
-  /** Bone index lookup for the shared rig (used by the ragdoll spec). */
+  /** Bone index lookup for the shared rig. */
   rigIndex(name) {
     return RIG.index(name);
   }
@@ -408,12 +333,15 @@ export class AiSystem {
     const phys = this.phys;
     const world = this.ctx.peek('world');
     if (!phys) return;
-    if (phys.staticWorld.dirty) phys.rebuildStatic();
-    if (phys.triangleCount <= 0) return; // level not registered yet — retry next frame
-    const bounds =
-      world?.bounds?.clone?.() ??
-      new THREE.Box3(new THREE.Vector3(-70, -4, -70), new THREE.Vector3(70, 24, 70));
-    bounds.expandByScalar(2);
+    // レベルが Havok に載っているかの実測プローブ: 原点付近の床に下向きレイ。
+    // Three 版は triangleCount を見たが Babylon 版 physics は公開していない。
+    const probe = ray(phys, 0, 60, 0, 0, -1, 0, 200, phys.MASK.WORLD);
+    if (!probe.hit) return; // level not registered yet — retry next frame
+    // world.bounds は Babylon 版 world に無いので、レベルレイアウトを覆う既定値。
+    const wb = world?.bounds ?? null;
+    const bounds = wb
+      ? { min: { x: wb.min.x - 2, y: wb.min.y - 2, z: wb.min.z - 2 }, max: { x: wb.max.x + 2, y: wb.max.y + 2, z: wb.max.z + 2 } }
+      : { min: { x: -72, y: -6, z: -72 }, max: { x: 72, y: 26, z: 72 } };
     const t0 = performance.now();
     this.grid = new NavGrid(phys, { bounds, cell: 0.8, radius: 0.36, height: 1.78 });
     this.grid.build();
@@ -433,7 +361,7 @@ export class AiSystem {
   probeGround(x, z, fromY, out) {
     const phys = this.phys;
     if (!phys) return false;
-    const h = phys.raycast(x, fromY, z, 0, -1, 0, 3.2, phys.MASK.WORLD);
+    const h = ray(phys, x, fromY, z, 0, -1, 0, 3.2, phys.MASK.WORLD);
     if (!h.hit) return false;
     out.y = h.point.y;
     out.nx = h.normal.x;
@@ -446,21 +374,26 @@ export class AiSystem {
   groundAt(x, z, fromY = 40) {
     const phys = this.phys;
     if (!phys) return 0;
-    const h = phys.raycast(x, fromY, z, 0, -1, 0, 80, phys.MASK.WORLD);
+    const h = ray(phys, x, fromY, z, 0, -1, 0, 80, phys.MASK.WORLD);
     if (h.hit) return h.point.y;
     return this.ctx.peek('world')?.groundHeight?.(x, z) ?? 0;
   }
 
-  /** The player's chest position, however the player system exposes itself. */
+  /**
+   * The player's chest position, however the player system exposes itself.
+   *
+   * Babylon 版 player は `position()` メソッドで**カプセル中心**を返す
+   * (足元 + 0.9 m)。胸 ≈ 足元 + 1.35 m = 中心 + 0.45 m。
+   */
   playerPosition(out) {
     const p = this.ctx.peek('player');
-    const src = p?.position ?? p?.capsulePosition ?? null;
+    const src = typeof p?.position === 'function' ? p.position() : (p?.position ?? null);
     if (src && Number.isFinite(src.x)) {
-      out.set(src.x, src.y + 1.35, src.z);
+      out.set(src.x, src.y + 0.45, src.z);
       return out;
     }
-    out.setFromMatrixPosition(this.ctx.camera.matrixWorld);
-    out.y -= 0.1;
+    const c = this.ctx.camera.globalPosition;
+    out.set(c.x, c.y - 0.1, c.z);
     return out;
   }
 
@@ -482,7 +415,9 @@ export class AiSystem {
    */
   populate(opts = {}) {
     const world = this.ctx.peek('world');
-    const spawns = world?.spawnPoints ?? [];
+    // Babylon 版 world は spawnPoints を公開していないので、無ければ nav グリッド
+    // から決定的にアンカーを合成する (_spawnAnchors)。
+    const spawns = world?.spawnPoints ?? this._spawnAnchors();
     if (!spawns.length || !this.grid) return 0;
     const player = this.playerPosition(this._v3).clone();
     // rank the spawn points by distance from the player, take the far half
@@ -537,6 +472,32 @@ export class AiSystem {
     return made;
   }
 
+  /**
+   * nav グリッドから決定的にスポーンアンカーを作る: 原点まわり 8 方位 × 2 半径で
+   * 歩行可能セルへスナップ。rng を引かないので決定性に影響しない。
+   */
+  _spawnAnchors() {
+    const g = this.grid;
+    if (!g) return [];
+    const anchors = [];
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2 + 0.35;
+      for (const r of [30, 42, 20]) {
+        const ci = g.nearest(Math.cos(a) * r, Math.sin(a) * r, null, 8);
+        if (ci < 0) continue;
+        const px = g.worldX(ci % g.nx);
+        const pz = g.worldZ((ci / g.nx) | 0);
+        anchors.push({
+          position: new THREE.Vector3(px, g.floor[ci], pz),
+          // 市街中心 (原点) を向く
+          yaw: Math.atan2(-px, -pz),
+        });
+        break;
+      }
+    }
+    return anchors;
+  }
+
   createSquad() {
     const s = new Squad(this.rng.fork());
     this.squads.push(s);
@@ -550,8 +511,10 @@ export class AiSystem {
   /** 0 at night, 1 in full daylight. Drives both flash gains below. */
   _daylight() {
     const sky = this._sky ?? (this._sky = this.ctx.peek('sky'));
-    const alt = sky?.sunAltitude ?? 0.6; // radians above the horizon
-    return Math.min(1, Math.max(0, Math.sin(Math.max(0, alt)) * 4));
+    // Babylon 版 sky は高度角を直接公開しないので sunDirection().y (=sin 高度) から。
+    const d = sky?.sunDirection?.();
+    const sinAlt = d && Number.isFinite(d.y) ? d.y : Math.sin(0.6);
+    return Math.min(1, Math.max(0, sinAlt * 4));
   }
 
   /**
@@ -565,16 +528,8 @@ export class AiSystem {
 
   /**
    * LIGHT gain, deliberately separate and two orders of magnitude smaller.
-   *
-   * The crown sits 0.6 m from the shooter's own chest, so a player-strength
-   * 90 cd flash puts 90/0.36 = 250 W/m^2 on him against 4 W/m^2 of sun. That is
-   * the whole reason the soldiers used to render BRIGHTER than the sunlit stucco
-   * behind them: they were being lit, on the frame the shutter fell, by their own
-   * muzzle flash. A real flash is ~1 ms inside a 16 ms frame, so the honest
-   * time-averaged contribution in daylight is a highlight on the receiver and
-   * nothing more; after dark it is the only light there is and gets to earn its
-   * keep. Measured: torso 0.44 -> 0.13 linear, i.e. from 1.9x the sunlit wall to
-   * 0.55x, which is what an 0.19-albedo uniform in shade should be.
+   * 経緯は Three 版の実測コメント (git 履歴) 参照: プレイヤー級の 90cd を
+   * 撃った本人の胸に当てると、射手が画面で一番明るい物体になる。
    */
   _flashLight() {
     const day = this._daylight();
@@ -611,10 +566,12 @@ export class AiSystem {
         penetration: 0.9,
         maxDist: 200,
         mask: phys.MASK.BULLET,
+        rng: this.rng,
       });
       if (impacts.length) end = impacts[0].point;
     }
-    // physics has no player collider, so test the player capsule ourselves.
+    // Babylon 版でも player の部位カプセルは Havok に無い (CC ボディは CLIP 層で
+    // 弾には当たるが meta を持たない) ので、プレイヤーへの命中はここで判定する。
     // Staged agents shoot for the camera, not for blood: a capture must not be
     // graded through the player's low-health filter.
     if (!agent.staged?.noDamage) this._testPlayerHit(agent, origin, dir, end);
@@ -631,7 +588,7 @@ export class AiSystem {
     const maxT = end ? origin.distanceTo(end) : 200;
     const px = p.x - origin.x, py = p.y - origin.y, pz = p.z - origin.z;
     const t = px * dir.x + py * dir.y + pz * dir.z;
-    if (t < 0.5 || t > maxT) return;
+    if (t < 0.5 || t > maxT + 0.6) return;
     const miss = Math.hypot(px - dir.x * t, py - dir.y * t, pz - dir.z * t);
     const player = this.ctx.peek('player');
     if (miss > 0.42) {
@@ -642,7 +599,7 @@ export class AiSystem {
     this._v2.copy(origin);
     // Damage is applied *only* through the event below. `player` listens for
     // `damage:dealt` with itself as the target, so calling applyDamage() here as
-    // well wounded the player twice for every round that connected.
+    // well would wound the player twice for every round that connected.
     this.ctx.events.emit('damage:dealt', {
       target: player ?? 'player',
       amount,
@@ -658,27 +615,32 @@ export class AiSystem {
     this.ctx.events.emit('weapon:reload', { weapon: 'ai_rifle', phase: 'start', actor: agent });
   }
 
-  /** Grenade geometry + material. Built at prewarm, not on the first throw. */
+  /** Grenade mesh + material. Built at prewarm, not on the first throw. */
   _ensureGrenade() {
-    if (this._grenadeGeo) return;
-    this._grenadeGeo = new THREE.IcosahedronGeometry(0.045, 1);
-    this._grenadeMat = new THREE.MeshStandardMaterial({
-      color: 0x2c3226,
-      roughness: 0.62,
-      metalness: 0.85,
-    });
+    if (this._grenadeMesh) return;
+    this._grenadeMat = new PBRMaterial('ai_grenade', this.ctx.scene);
+    this._grenadeMat.albedoColor = new Color3(0.028, 0.036, 0.021);
+    this._grenadeMat.roughness = 0.62;
+    this._grenadeMat.metallic = 0.85;
+    // テンプレート (非表示)。投擲ごとに clone する。
+    this._grenadeMesh = MeshBuilder.CreateIcoSphere('ai_grenade_tmpl', { radius: 0.045, subdivisions: 1 }, this.ctx.scene);
+    this._grenadeMesh.material = this._grenadeMat;
+    this._grenadeMesh.parent = this.root;
+    this._grenadeMesh.isPickable = false;
+    this._grenadeMesh.setEnabled(false);
   }
 
   throwGrenade(agent, from, target) {
     const phys = this.phys;
     if (!phys) return;
     this._ensureGrenade();
-    const mesh = new THREE.Mesh(this._grenadeGeo, this._grenadeMat);
-    this.root.add(mesh);
+    const mesh = this._grenadeMesh.clone(`ai_grenade_${agent.id}_${this.ctx.time.frame}`);
+    mesh.setEnabled(true);
+    mesh.position.set(from.x, from.y, from.z);
     // lobbed ballistic solve
     const dx = target.x - from.x, dz = target.z - from.z;
     const dist = Math.max(0.5, Math.hypot(dx, dz));
-    const g = Math.abs(phys.gravity);
+    const g = Math.abs(phys.gravity.y);
     const speed = Math.min(18, Math.sqrt(Math.max(4, (dist * g) / 0.95)));
     const vy = speed * 0.62;
     const vh = Math.min(speed, dist / Math.max(0.35, (2 * vy) / g));
@@ -686,13 +648,11 @@ export class AiSystem {
       shape: 'sphere',
       radius: 0.05,
       mass: 0.42,
-      position: from,
+      position: mesh.position,
       velocity: { x: (dx / dist) * vh, y: vy, z: (dz / dist) * vh },
-      restitution: 0.28,
-      friction: 0.7,
       lifetime: 9,
-      object3D: mesh,
-      surfaceType: 'metal',
+      mesh,
+      surface: 'metal',
     });
     this._grenades.push({ body, mesh, fuse: 2.35, agent });
     agent.animator.fire(0.35);
@@ -710,8 +670,8 @@ export class AiSystem {
         damage: 120,
         source: g.agent,
       });
+      // removeRigidBody はメッシュ (node) も dispose する (owKeep なし)
       this.phys?.removeRigidBody(g.body);
-      this.root.remove(g.mesh);
       this._grenades.splice(i, 1);
     }
   }
@@ -719,6 +679,14 @@ export class AiSystem {
   /* ================================================================== */
   /* frame                                                              */
   /* ================================================================== */
+
+  /** 物理積分 (120 Hz)。Babylon 版 Character.move は速度渡し + 固定ステップ。 */
+  fixedUpdate(h) {
+    for (let i = 0; i < this.agents.length; i++) {
+      const a = this.agents[i];
+      if (a.alive) a.fixedUpdate(h);
+    }
+  }
 
   update(dt, ctx) {
     if (this._navPending) {
@@ -743,16 +711,8 @@ export class AiSystem {
         else a.update(dt, ctx);
         alive++;
       } else if (a.deadTime !== undefined) {
-        a.deadTime += dt;
-        if (this.debugLog && a.ragdoll && !a._loggedDoll && a.deadTime > 1.2) {
-          a._loggedDoll = true;
-          const b = a.ragdoll.aabb;
-          console.info(
-            `[ai] ragdoll ${a.id} settled: ${(b.maxx - b.minx).toFixed(2)} x ` +
-              `${(b.maxy - b.miny).toFixed(2)} x ${(b.maxz - b.minz).toFixed(2)} m ` +
-              `at y=${b.miny.toFixed(2)} sleeping=${a.ragdoll.sleeping}`
-          );
-        }
+        // 倒れ込みモーションを進める。静止後は実質 no-op。
+        a.updateDead(dt);
       }
     }
     this._updateGrenades(dt);
@@ -766,7 +726,7 @@ export class AiSystem {
     for (let i = 0; i < this.agents.length; i++) {
       const a = this.agents[i];
       a.syncHitboxes();
-      // Dead men keep their contact: a ragdoll on the floor needs it most.
+      // Dead men keep their contact: a body on the floor needs it most.
       g.addActor(a);
     }
     g.end();
@@ -795,11 +755,21 @@ export class AiSystem {
   /** Unit vector pointing AT the sun, however the sky exposes itself. */
   _sunDirection() {
     const sky = this._sky ?? (this._sky = this.ctx.peek('sky'));
-    const d = sky?.sunDirection;
-    if (d && Number.isFinite(d.x)) this._sun.copy(d);
+    const d = sky?.sunDirection?.();
+    if (d && Number.isFinite(d.x)) this._sun.set(d.x, d.y, d.z);
     else this._sun.set(0.3, 0.8, 0.4);
     if (this._sun.lengthSq() < 1e-8) this._sun.set(0, 1, 0);
     return this._sun.normalize();
+  }
+
+  /** 球 (中心 c, 半径 r) がフラスタムに掛かるか。Babylon の平面規約 (内側 > 0)。 */
+  _sphereInFrustum(cx, cy, cz, r) {
+    const c = this._sphereC;
+    c.x = cx; c.y = cy; c.z = cz;
+    for (let i = 0; i < 6; i++) {
+      if (this._planes[i].dotCoordinate(c) <= -r) return false;
+    }
+    return true;
   }
 
   /**
@@ -815,17 +785,18 @@ export class AiSystem {
    *      the ray from that surface toward the sun passes through it. Sweeping to
    *      where the ray leaves the level below the floor covers every receiver,
    *      ground or wall, and the 4 m of slack absorbs both the soft-shadow filter
-   *      radius (up to ~1 m of cascade texels) and a frame of camera motion.
+   *      radius and a frame of camera motion.
    *
    * Irrelevant actors animate at a third of the rate and are dropped from the
-   * shadow cascades (`userData.owNoShadow`, which render honours per frame). They
-   * are still simulated, still shootable, still make noise — only the parts that
-   * can exclusively affect pixels are skipped.
+   * shadow cascades. Babylon 版では「CSM の render list から add/remove する」
+   * ことがそのスイッチで、`mesh.metadata.owNoShadow` は現在状態の記録
+   * (render.addShadowCaster が入口で見るフラグ) として同期しておく。
+   * They are still simulated, still shootable, still make noise — only the parts
+   * that can exclusively affect pixels are skipped.
    */
   _updateRelevance(ctx) {
-    const cam = ctx.camera;
-    this._mvp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
-    this._frustum.setFromProjectionMatrix(this._mvp);
+    // view-projection からフラスタム平面を取り直す (毎フレーム)
+    Frustum.GetPlanesToRef(ctx.scene.getTransformMatrix(), this._planes);
     const sun = this._sunDirection();
     // how far a shadow ray can travel before it is under the level
     const floorY = (this.grid ? -6 : -20);
@@ -834,25 +805,37 @@ export class AiSystem {
 
     for (let i = 0; i < this.agents.length; i++) {
       const a = this.agents[i];
-      const geo = a.mesh.geometry;
-      const bs = geo.boundingSphere;
-      if (!bs) { a.lodIrrelevant = false; continue; }
-      const s = this._sphere.copy(bs).applyMatrix4(a.mesh.matrixWorld);
-      s.radius += 4;
-      let visible = this._frustum.intersectsSphere(s);
+      const bs = a.def.geometry.boundingSphere;
+      const r = bs.radius * a.scale + 4;
+      const cx = a.position.x;
+      const cy = a.position.y + bs.center[1] * a.scale;
+      const cz = a.position.z;
+      let visible = this._sphereInFrustum(cx, cy, cz, r);
       if (!visible) {
-        const sweep = this._sweep;
-        const tMax = Math.min(320, (s.center.y - floorY) / sunY);
-        const step = Math.max(2, s.radius * 0.9);
-        sweep.radius = s.radius;
+        const tMax = Math.min(320, (cy - floorY) / sunY);
+        const step = Math.max(2, r * 0.9);
         for (let t = step; t <= tMax; t += step) {
-          sweep.center.copy(s.center).addScaledVector(sun, -t);
-          if (this._frustum.intersectsSphere(sweep)) { visible = true; break; }
+          if (this._sphereInFrustum(cx - sun.x * t, cy - sun.y * t, cz - sun.z * t, r)) {
+            visible = true;
+            break;
+          }
         }
       }
       a.lodIrrelevant = !visible;
       if (!visible) irrelevant++;
-      a.mesh.userData.owNoShadow = !visible;
+      // 影キャスタの add/remove (状態が変わった時だけ)
+      if (a.mesh.metadata.owNoShadow !== !visible) {
+        a.mesh.metadata.owNoShadow = !visible;
+        if (!visible) {
+          if (a._castingShadow) {
+            a._render?.removeShadowCaster(a.mesh);
+            a._castingShadow = false;
+          }
+        } else if (!a._castingShadow) {
+          a._render?.addShadowCaster(a.mesh, false);
+          a._castingShadow = true;
+        }
+      }
     }
     this._lodStats.irrelevant = irrelevant;
     this.stats.lodIrrelevant = irrelevant;
@@ -902,6 +885,18 @@ export class AiSystem {
   }
 
   /**
+   * カメラの前方/右/垂直半画角。Babylon の fov はラジアン (垂直)。
+   * 前方は世界行列の -Z 列 (右手系でカメラは -Z を向く)。
+   */
+  _cameraBasis(cam, outF, outR) {
+    const m = cam.getWorldMatrix().m;
+    outF.set(-m[8], -m[9], -m[10]).normalize();
+    outR.set(m[0], m[1], m[2]).normalize();
+    const aspect = this.ctx.engine.babylon.getAspectRatio(cam);
+    return Math.tan(cam.fov / 2) * aspect; // tan(半水平画角)
+  }
+
+  /**
    * Compose a staged enemy into the frame: find the walkable spot whose
    * projected screen position and depth best match the requested composition,
    * that the camera can actually see, that is not on top of another actor, and
@@ -910,19 +905,22 @@ export class AiSystem {
    */
   _stageSlot(cam, ndcX, wantDepth, placed) {
     const g = this.grid;
-    const F = this._v.set(0, 0, -1).applyQuaternion(cam.quaternion);
+    const F = this._v;
+    const R = this._v2;
+    const tanH = this._cameraBasis(cam, F, R);
     F.y = 0;
     F.normalize();
     const rx = F.z, rz = -F.x; // camera right, flattened
-    const tanH = Math.tan((cam.fov * Math.PI) / 360) * cam.aspect;
-    const ideal = new THREE.Vector3()
-      .copy(cam.position)
-      .addScaledVector(F, wantDepth)
-      .add(this._v2.set(rx, 0, rz).multiplyScalar(ndcX * tanH * wantDepth));
-    const yRef = cam.position.y - 1.7;
+    const camPos = cam.globalPosition;
+    const ideal = new THREE.Vector3(
+      camPos.x + F.x * wantDepth + rx * ndcX * tanH * wantDepth,
+      0,
+      camPos.z + F.z * wantDepth + rz * ndcX * tanH * wantDepth
+    );
+    const yRef = camPos.y - 1.7;
     const out = new THREE.Vector3(ideal.x, yRef, ideal.z);
     if (!g) {
-      out.y = this.groundAt(out.x, out.z, cam.position.y + 3);
+      out.y = this.groundAt(out.x, out.z, camPos.y + 3);
       return out;
     }
     const chest = this._v3;
@@ -944,7 +942,7 @@ export class AiSystem {
         }
         if (tooClose) continue;
         // project
-        const ex = x - cam.position.x, ez = z - cam.position.z;
+        const ex = x - camPos.x, ez = z - camPos.z;
         const depth = ex * F.x + ez * F.z;
         if (depth < 3) continue;
         const lateral = ex * rx + ez * rz;
@@ -952,9 +950,9 @@ export class AiSystem {
         // must be visible: chest and head
         if (this.phys) {
           chest.set(x, fy + 1.25, z);
-          if (!this.phys.lineOfSight(cam.position, chest, this.phys.MASK.SIGHT)) continue;
+          if (!this.phys.lineOfSight(camPos, chest, this.phys.MASK.SIGHT)) continue;
           chest.set(x, fy + 1.62, z);
-          if (!this.phys.lineOfSight(cam.position, chest, this.phys.MASK.SIGHT)) continue;
+          if (!this.phys.lineOfSight(camPos, chest, this.phys.MASK.SIGHT)) continue;
         }
         let score = Math.abs(ndc - ndcX) * 9 + Math.abs(depth - wantDepth) * 0.5;
         // prefer standing next to something solid
@@ -968,18 +966,41 @@ export class AiSystem {
       }
     }
     if (best >= 0) out.set(bestX, g.floor[best], bestZ);
-    else out.y = this.groundAt(out.x, out.z, cam.position.y + 3);
+    else out.y = this.groundAt(out.x, out.z, camPos.y + 3);
     return out;
+  }
+
+  /** 前回の staged 配置を撤収する — debugStage は連続適用され得るため。 */
+  _clearStage() {
+    if (!this._stagedAgents.length) return;
+    for (const a of this._stagedAgents) {
+      const i = this.agents.indexOf(a);
+      if (i >= 0) this.agents.splice(i, 1);
+      this.cover?.release(a.id);
+      a.dispose();
+    }
+    this._stagedAgents.length = 0;
+    if (this._stagedSquad) {
+      const i = this.squads.indexOf(this._stagedSquad);
+      if (i >= 0) this.squads.splice(i, 1);
+      this._stagedSquad = null;
+    }
   }
 
   /**
    * `debugStage('firefight')` — a staged firefight in front of the shot camera:
    * one man up and firing from behind hard cover, one crouched and peeking, one
    * moving between positions, one reloading further back.
+   * `debugStage('none')` — 撤収 (prewarm の後始末が呼ぶ)。
    */
   debugStage(name) {
+    if (name === 'none') {
+      this._clearStage();
+      return this.stats;
+    }
     if (name !== 'firefight') return this.stats;
     if (this.inspect) return this._stageInspect();
+    this._clearStage();
     if (this._navPending) this._buildNav();
 
     const cam = this.ctx.camera;
@@ -987,11 +1008,14 @@ export class AiSystem {
     // down the street so the characters are lit, not silhouetted. This shot is
     // ours to compose; every other shot keeps its own time of day.
     this.ctx.peek('sky')?.setTimeOfDay?.(17.9);
-    const F = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+    const F = new THREE.Vector3();
+    const R = new THREE.Vector3();
+    this._cameraBasis(cam, F, R);
     F.y = 0;
     F.normalize();
     const right = new THREE.Vector3(F.z, 0, -F.x);
     const squad = this.createSquad();
+    this._stagedSquad = squad;
 
     /** [variant, ndcX, depth, crouch, speed, fire, reloadEvery] */
     const LAYOUT = [
@@ -1007,10 +1031,11 @@ export class AiSystem {
       ['irregular', -0.26, 22.0, false, 0, true, 0],
     ];
 
+    const camPos = cam.globalPosition;
     const placedPositions = [];
     for (const [variant, ndcX, d, crouch, speed, fire, reload] of LAYOUT) {
       const pos = this._stageSlot(cam, ndcX, d, placedPositions);
-      const yaw = Math.atan2(cam.position.x - pos.x, cam.position.z - pos.z);
+      const yaw = Math.atan2(camPos.x - pos.x, camPos.z - pos.z);
       const a = this.spawn(variant, pos, yaw);
       squad.add(a);
       a.staged = {
@@ -1028,27 +1053,31 @@ export class AiSystem {
       a.burstLeft = this.rng.int(2, 6);
       a.peeking = true;
       a.aimTarget.copy(this.playerPosition(this._v3));
-      a.animator.update(0.016, 0);
+      a._drive(0.016);
       placedPositions.push(pos.clone());
-      this._stagedAgents = (this._stagedAgents ?? []);
       this._stagedAgents.push(a);
       if (this.debugLog) {
         console.info(
           `[ai] staged ${variant} at ${pos.x.toFixed(1)},${pos.y.toFixed(2)},${pos.z.toFixed(1)} ` +
-            `d=${cam.position.distanceTo(pos).toFixed(1)}m`
+            `d=${Math.hypot(camPos.x - pos.x, camPos.z - pos.z).toFixed(1)}m`
         );
       }
     }
 
-    // One man already down, handed to the ragdoll solver with the round's
-    // impulse — it dresses the tableau and it exercises the death path.
+    // One man already down — 手続き倒れ込みを完了状態まで進めて死体として置く
+    // (ラグドール不採用の経緯は deathfall.js)。death path の実行も兼ねる。
     const dPos = this._stageSlot(cam, -0.58, 9.4, placedPositions);
-    const casualty = this.spawn('breacher', dPos, Math.atan2(cam.position.x - dPos.x, cam.position.z - dPos.z));
+    const casualty = this.spawn('breacher', dPos, Math.atan2(camPos.x - dPos.x, camPos.z - dPos.z));
     squad.add(casualty);
-    casualty.animator.update(0.016, 0);
+    casualty._drive(0.016);
     const hit = new THREE.Vector3(dPos.x, dPos.y + 1.35, dPos.z);
-    const inc = new THREE.Vector3().subVectors(hit, cam.position).normalize();
+    const inc = new THREE.Vector3(dPos.x - camPos.x, dPos.y + 1.35 - camPos.y, dPos.z - camPos.z).normalize();
     casualty.applyDamage(260, 'torso', hit, inc);
+    // 撮影フレームまでに倒れ切るよう、静止状態まで送る
+    casualty.deathFall.finish(casualty._deathOut);
+    casualty._applyDeathPose();
+    casualty.deathFall.t = -1;
+    this._stagedAgents.push(casualty);
 
     return this.stats;
   }
@@ -1056,20 +1085,25 @@ export class AiSystem {
   /** Model inspection line-up (dev only). */
   _stageInspect() {
     const cam = this.ctx.camera;
-    const F = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+    const F = new THREE.Vector3();
+    const R = new THREE.Vector3();
+    this._cameraBasis(cam, F, R);
     F.y = 0;
     F.normalize();
     const right = new THREE.Vector3(F.z, 0, -F.x);
     this.ctx.peek('sky')?.setTimeOfDay?.(11.5);
+    const camPos = cam.globalPosition;
     const layout = [
       ['vanguard', 1.9, 0.35, 0.25],
       ['irregular', 2.7, -0.95, 3.0],
       ['breacher', 3.6, 1.15, -0.7],
     ];
     for (const [nm, d, s2, extraYaw] of layout) {
-      const p = new THREE.Vector3().copy(cam.position).addScaledVector(F, d).addScaledVector(right, s2);
-      p.y = this.groundAt(p.x, p.z, cam.position.y + 1.0);
-      const toCam = Math.atan2(cam.position.x - p.x, cam.position.z - p.z);
+      const p = new THREE.Vector3(camPos.x, camPos.y, camPos.z)
+        .addScaledVector(F, d)
+        .addScaledVector(right, s2);
+      p.y = this.groundAt(p.x, p.z, camPos.y + 1.0);
+      const toCam = Math.atan2(camPos.x - p.x, camPos.z - p.z);
       const a = this.spawn(nm, p, toCam + extraYaw);
       a.staged = {
         crouch: false,
@@ -1078,6 +1112,7 @@ export class AiSystem {
         aimWeight: 1,
         heading: new THREE.Vector3(0, 0, 1),
       };
+      this._stagedAgents.push(a);
     }
     return this.stats;
   }
@@ -1089,18 +1124,17 @@ export class AiSystem {
     for (const a of this.agents) a.dispose();
     this.agents.length = 0;
     this.squads.length = 0;
-    for (const g of this._grenades) {
-      this.phys?.removeRigidBody(g.body);
-      this.root.remove(g.mesh);
-    }
+    this._stagedAgents.length = 0;
+    for (const g of this._grenades) this.phys?.removeRigidBody(g.body);
     this._grenades.length = 0;
-    this._grenadeGeo?.dispose();
+    this._grenadeMesh?.dispose(false, false);
     this._grenadeMat?.dispose();
     this.ground?.dispose();
-    for (const v of this._variants.values()) v.geometry.dispose();
+    // テンプレート mesh の dispose は共有ジオメトリも解放する (clone は先に消えている)
+    for (const v of this._variants.values()) v.template?.dispose(false, false);
     this._variants.clear();
     this.materials?.dispose();
-    this.root.parent?.remove(this.root);
+    this.root.dispose();
   }
 }
 

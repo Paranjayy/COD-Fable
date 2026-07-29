@@ -4,7 +4,11 @@
  * instance of that variant; only the skeleton is per-instance.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: Three 互換の自前 math shim (経緯は math3.js 冒頭コメント参照)。
+// buildSoldier の戻り値 geometry は THREE.BufferGeometry ではなく生配列の
+// レコードになった (geo.js の CharacterBuilder.build 参照)。Babylon の Mesh 化は
+// agent.js / index.js 側で行う。
+import * as THREE from './math3.js';
 import { RIG, GRIP_R, GRIP_L, BORE_DIR } from './rig.js';
 import { CharacterBuilder, Noise, appendMesh, computeNormals, emptyMesh } from './geo.js';
 import * as P from './parts.js';
@@ -734,6 +738,8 @@ export function buildSoldier(name, { rng, materials }) {
   return {
     geometry: built.geometry,
     materials: mats,
+    // SubMesh 分割 (mesh.js) が group.mat 名 → materials 配列位置を引くのに使う
+    materialNames: built.materialNames,
     parts: built.parts,
     weapon: W,
     stats: { vertices: built.vertices, triangles: built.triangles },

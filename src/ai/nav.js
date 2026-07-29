@@ -19,7 +19,9 @@
  * rest of the squad has already claimed.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: Three 互換の自前 math shim (経緯は math3.js 冒頭コメント参照)
+import * as THREE from './math3.js';
+import { ray, rayAny } from './physray.js';
 
 const SQRT2 = Math.SQRT2;
 
@@ -155,13 +157,13 @@ export class NavGrid {
       for (let ix = 0; ix < this.nx; ix++) {
         const i = this.index(ix, iz);
         const x = this.worldX(ix), z = this.worldZ(iz);
-        const down = phys.raycast(x, this.topY, z, 0, -1, 0, this.topY + 30, MASK);
+        const down = ray(phys, x, this.topY, z, 0, -1, 0, this.topY + 30, MASK);
         if (!down.hit) continue;
         this.floor[i] = down.point.y;
         if (down.normal.y < this.maxSlope) continue;
         const fy = down.point.y;
         // standing clearance straight up
-        const up = phys.raycast(x, fy + 0.25, z, 0, 1, 0, this.height - 0.2, MASK);
+        const up = ray(phys, x, fy + 0.25, z, 0, 1, 0, this.height - 0.2, MASK);
         if (!up.hit) this.flags[i] = 1;
         else if (up.distance > this.crouchHeight - 0.25) this.flags[i] = 2;
         else continue;
@@ -170,7 +172,7 @@ export class NavGrid {
         for (let d = 0; d < 4; d++) {
           const dx = d === 0 ? 1 : d === 1 ? -1 : 0;
           const dz = d === 2 ? 1 : d === 3 ? -1 : 0;
-          if (phys.raycastAny(x, fy + 0.95, z, dx, 0, dz, r + 0.06, MASK)) blocked++;
+          if (rayAny(phys, x, fy + 0.95, z, dx, 0, dz, r + 0.06, MASK)) blocked++;
         }
         if (blocked >= 3) {
           this.flags[i] = 0;
@@ -407,9 +409,9 @@ export class CoverMap {
         for (let d = 0; d < 8; d++) {
           const dx = DX[d] / (d < 4 ? 1 : SQRT2);
           const dz = DZ[d] / (d < 4 ? 1 : SQRT2);
-          const low = phys.raycast(x, y + 0.55, z, dx, 0, dz, reach, MASK);
+          const low = ray(phys, x, y + 0.55, z, dx, 0, dz, reach, MASK);
           if (!low.hit) continue;
-          const high = phys.raycastAny(x, y + 1.32, z, dx, 0, dz, reach, MASK);
+          const high = rayAny(phys, x, y + 1.32, z, dx, 0, dz, reach, MASK);
           // must be able to shoot over/around: check a peek to both sides
           this.points.push({
             x, y, z,

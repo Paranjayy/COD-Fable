@@ -16,7 +16,10 @@
  * Nothing here runs per frame; it is all boot-time work.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: math だけ Three 互換 shim を使う (math3.js 冒頭コメント参照)。
+// GPU リソース (BufferGeometry) はもう作らない — build() は素の型付き配列を返し、
+// Babylon の VertexData への流し込みは soldier.js / agent.js 側で行う。
+import * as THREE from './math3.js';
 
 /* ------------------------------------------------------------------ */
 /* Deterministic gradient noise                                        */
@@ -559,22 +562,48 @@ export class CharacterBuilder {
     // ---- vertex colour: AO + grime + wear ------------------------------
     this._shade(order, pos, nrm, col);
 
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
-    geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
-    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-    geo.setAttribute('skinIndex', new THREE.BufferAttribute(skinIndex, 4));
-    geo.setAttribute('skinWeight', new THREE.BufferAttribute(skinWeight, 4));
-    geo.setIndex(new THREE.BufferAttribute(idx, 1));
-    for (const g of groups) geo.addGroup(g.start, g.count, matNames.indexOf(g.mat));
-    geo.computeBoundingSphere();
-    // animated poses reach outside the bind-pose bounds
-    geo.boundingSphere.radius *= 1.45;
-    geo.computeBoundingBox();
+    // ---- バウンディング (バインドポーズ基準) ---------------------------
+    // Babylon 版では GPU ジオメトリをここで作らず、生配列を返す。バウンディングは
+    // アニメーション中の姿勢がバインドポーズ境界の外に出るため 1.45 倍に膨らませて
+    // おく (Three 版と同じ係数。フラスタムカリングと LOD 判定の両方が依存する)。
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < vTotal; i++) {
+      const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      if (z > maxZ) maxZ = z;
+    }
+    const cx = (minX + maxX) * 0.5, cy = (minY + maxY) * 0.5, cz = (minZ + maxZ) * 0.5;
+    let r2 = 0;
+    for (let i = 0; i < vTotal; i++) {
+      const dx = pos[i * 3] - cx, dy = pos[i * 3 + 1] - cy, dz = pos[i * 3 + 2] - cz;
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d > r2) r2 = d;
+    }
 
     return {
-      geometry: geo,
+      /**
+       * 生のジオメトリデータ。Babylon の VertexData 語彙に合わせたキー名:
+       * matricesIndices / matricesWeights は Three の skinIndex / skinWeight。
+       * 1 頂点あたり最大 4 影響 (Babylon の既定と一致。_bind が 4 本に絞っている)。
+       */
+      geometry: {
+        positions: pos,
+        normals: nrm,
+        uvs: uv,
+        colors: col,
+        matricesIndices: skinIndex,
+        matricesWeights: skinWeight,
+        indices: idx,
+        /** { start, count, mat } — Babylon の SubMesh 分割に使う (index 単位)。 */
+        groups: groups.map((g) => ({ start: g.start, count: g.count, mat: g.mat })),
+        boundingSphere: { center: [cx, cy, cz], radius: Math.sqrt(r2) * 1.45 },
+        boundingBox: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
+      },
       materialNames: matNames,
       vertices: vTotal,
       triangles: iTotal / 3,

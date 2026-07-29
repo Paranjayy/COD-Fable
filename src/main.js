@@ -104,6 +104,7 @@ engine
   .add(PlayerSystem)
   .add(WeaponSystem)
   .add(FxSystem)
+  .add(AiSystem)
   .add(UiSystem)
   .add(AudioSystem);
 
@@ -123,6 +124,23 @@ BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
 }
 
 /**
+ * **キャプチャ用の細工を prewarm より先に入れる。順序が意味を持つ。**
+ *
+ * installShotApi は capture モードで `engine.step` を差し替え、フレーム時間を実時計
+ * ではなく固定 1/60 s にする。prewarm は内部で `engine.step()` を 2 回呼ぶ (影と
+ * G バッファのバリアントを作るため) ので、**先に prewarm を走らせるとその 2 フレームが
+ * 実時計で進み、`time.elapsed` が run ごとにブレる**。
+ *
+ * 実測: この順序が逆だったとき、CPU 側の状態 (frame / rng / 乱数消費回数 / 三角形数)
+ * はすべて run 間で完全に一致しているのに、絵は 4〜12% のピクセルが最大 123 ずれて
+ * いた。原因の切り分けに時間を要したのは「CPU が決定的なら絵も決定的なはず」と
+ * 思い込んだため。**time.elapsed も CPU 状態の一部**である。
+ *
+ * README に記録された「boot 時間との結合が視覚的変化に見えた」事故と同じ構図。
+ */
+const shotApi = installShotApi(engine, { capture, lockstep });
+
+/**
  * ゲームループを回す前に全マテリアルのパイプラインを事前生成する。
  *
  * これが無いと、カメラが旋回して新しいメッシュが視界に入るたびに WebGPU の
@@ -138,7 +156,7 @@ const warmup =
 console.info('[boot] prewarm', warmup);
 window.__PREWARM__ = warmup;
 
-const shotApi = installShotApi(engine, { capture, lockstep });
+
 
 engine.start();
 
