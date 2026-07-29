@@ -61,6 +61,16 @@ for (const [key, flag] of [
   else if (v === '1') config.q[flag] = true;
 }
 
+/**
+ * 決定的キャプチャでは render が SSAO とモーションブラーを強制的に切る
+ * (GPU 由来の非決定性のため。理由は src/render/index.js のコメント)。
+ * `?gtao=1` / `?mblur=1` を明示したときだけその上書きを尊重する。
+ */
+config.forcePost = {
+  gtao: params.get('gtao') === '1' ? true : undefined,
+  mblur: params.get('mblur') === '1' ? true : undefined,
+};
+
 // 切り分け用: ?post=0 でポストプロセスを丸ごと外す。
 if (params.get('post') === '0') config.post = false;
 

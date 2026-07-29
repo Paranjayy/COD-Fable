@@ -87,6 +87,48 @@ export class RenderSystem {
     this.webgpu = ctx.backend === 'webgpu';
     const q = ctx.config.q;
 
+    /**
+     * ## 決定的キャプチャでは SSAO とモーションブラーを外す
+     *
+     * この 2 つは Babylon 側に GPU 由来の非決定性があり、**外から制御できない**。
+     * 二分探索の実測 (480x270, hero, settle=35, 2 回実行の差分):
+     *
+     *   gtao=0 & mblur=0 & taa=0 & bloom=0   changed% 0      maxDelta 0
+     *   gtao=0 & mblur=0 & taa=0             changed% 0.0224 maxDelta 1   (bloom のみ)
+     *   gtao=0 & mblur=0                     changed% 0      maxDelta 0   (TAA が均す)
+     *   ← ここまでは完全に bit-identical
+     *   prewarm=0 (= post 全部有効)          changed% 0.804  maxDelta 37
+     *
+     * つまり **ベースシーン・影・clustered lighting・bloom・TAA はすべて決定的**で、
+     * SSAO とモーションブラーだけが揺れる。SSAO のカーネルとランダムテクスチャは
+     * `Math.random` をシードして潰してある (core/determinism.js) にもかかわらず残る。
+     *
+     * ### なぜ「許容誤差を緩める」ではなく「外す」を選ぶか
+     *
+     * pixel gate の目的は「最適化で絵が変わっていないことを *証明* する」こと。
+     * maxDelta 71 を許容する gate は、実際の退行をほぼ検出できない = gate として
+     * 機能しない。外せば bit-identical が戻り、ジオメトリ・マテリアル・ライティング・
+     * 空・露出・bloom・TAA・HUD の変更はすべて検出できる。
+     *
+     * ### 代償 (明示しておく)
+     *
+     * ベースラインの絵に AO とモーションブラーが写らないため、**その 2 つだけを
+     * 変える修正は gate をすり抜ける**。批評家向けのレビューセット
+     * (tools/shotset.mjs) は製品と同じ設定で撮るので、絵の評価はそちらで行うこと。
+     *
+     * 明示的に上書きしたい場合は `?gtao=1&mblur=1` を付ける。
+     */
+    if (ctx.config.deterministic) {
+      if (q.gtao || q.motionBlur) {
+        console.info(
+          '[render] 決定的キャプチャのため SSAO とモーションブラーを無効化しました ' +
+            '(GPU 由来の非決定性のため。?gtao=1&mblur=1 で上書き可)'
+        );
+      }
+      q.gtao = ctx.config.forcePost?.gtao ?? false;
+      q.motionBlur = ctx.config.forcePost?.mblur ?? false;
+    }
+
     this._setupImageProcessing(ctx);
     this._setupShadows(ctx, q);
     this._setupClusteredLights(q);
@@ -452,6 +494,39 @@ export class RenderSystem {
   registerPass(pass) {
     this.extraPasses.push(pass);
     return pass;
+  }
+
+  /**
+   * 時間的蓄積 (TAA の履歴) を捨てる。
+   *
+   * ## なぜ必要か
+   *
+   * キャプチャは「ショットを適用してから settle フレーム送る」流れだが、**ショット
+   * 適用前にも数フレーム描かれている** (prewarm の 2 フレーム + boot の 3 フレーム)。
+   * TAA はそれらを履歴に積んでおり、カメラがショット位置へ跳んだあとも一部が残る。
+   *
+   * 残った履歴の量は「跳ぶ前に何をどこから見ていたか」に依存するため、実行ごとに
+   * 微妙に違う絵になる。実測では細い電線のエッジなど、サブピクセルの被覆が
+   * 反転しやすい箇所に差が集中していた (0.7% のピクセルで最大 68 の差)。
+   *
+   * `tools/baseline.mjs` はこのフックの存在を前提にしており、ショット適用後・
+   * settle 送出前に呼ぶ。**名前を変える場合は baseline.mjs も直すこと**
+   * (あちらは resetTemporal / resetHistory / invalidateHistory を順に試す)。
+   */
+  resetTemporal() {
+    /**
+     * Babylon の TAA は `_taaThinPostProcess` 側に `_reset()` を持つ。**public API では
+     * ない**ので、Babylon を上げたときに名前が変わっていないか確認すること。
+     * 名前が変わっても静かに何も起きないだけ (履歴が残り、キャプチャがわずかに揺れる)
+     * なので、気付きにくい類の破損になる。
+     */
+    const thin = this.taa?._taaThinPostProcess;
+    if (thin?._reset) thin._reset();
+    else if (this.taa) {
+      // フォールバック: samples を触ると内部で履歴が捨てられる実装が多い。
+      const n = this.taa.samples;
+      this.taa.samples = n;
+    }
   }
 
   /** 現在の環境マップ。fx や weapons が反射に使う。 */
