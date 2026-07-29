@@ -270,6 +270,44 @@ Babylon の `ShadowGenerator` は **カメラの layerMask も renderingGroupId 
 discard 後の微分・bounding info・GPU 検証エラー)。**デカール・動的光源・弾痕は
 影響を受けないので動作する。**
 
+## Havok / Babylon の罠 (実測で踏んだもの)
+
+### PhysicsCharacterController の内部 body はフィルタ全ビット
+
+`PhysicsCharacterController` は内部で `PhysicsBody` を作り、**フィルタが全ビット立った
+状態**になっている。つまり弾のレイに当たる。しかもその body は physics のメタデータ表に
+載っていないので:
+
+- `hit.surface` が既定の 'concrete' になる (肉なのにコンクリ音・コンクリ片)
+- `hit.actor` が null なので **damage:dealt が発行されず、ダメージが入らない**
+
+実測 (修正前): 8m 手前からプレイヤーへ撃つと 7.75m で
+`{surface:'concrete', hasActor:false}` に当たり、**体力が一切減らなかった**。
+
+`physics.createCharacter({ actor, surface, part })` を渡せばメタデータ表に登録される。
+別途ヒットボックスを持つキャラクタ (ai) は `bulletProof: true` でフィルタを CLIP に
+落とし、弾と視線から外すこと。
+
+**CC の内部 body は private (`ctrl._body`)**。public な取得手段が無いので直接触っている。
+Babylon を上げたときに名前が変わっていないか確認すること — 変われば静かに登録されなくなり、
+「弾が当たるのにダメージが入らない」状態に戻る (エラーは出ない)。
+
+### kinematic ボディはワールド追加後に動かすと raycast に当たらなくなる
+
+実座標だけが動き、query broadphase が追従しない (最小再現で確認済み)。ai の部位
+ヒットボックスは毎フレーム `RemoveBody` → `AddBody` で回避している
+(`src/ai/hitbox.js`)。**kinematic を動かす実装を足すときは同じ罠を踏む。**
+
+### WebGPU の fragment 入力は 16 変数まで
+
+頂点カラー + CSM 4 カスケードで 17 になり、**画面全体が黒くなる**。ai は
+`forceIrradianceInFragment = true` で回避した。**頂点カラー付きマテリアルを追加する
+ときは要注意。**
+
+### matricesIndices は Float32 で渡す
+
+`Uint16Array` を渡すと頂点フォーマットが食い違い、メッシュが爆発する。
+
 ## WGSL の罠
 
 `node tools/wgsl-lint.mjs` が (1) と (2) を検出する。**コミット前に必ず通すこと。**

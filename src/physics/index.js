@@ -648,6 +648,28 @@ export class PhysicsSystem {
   /* Characters                                                         */
   /* ================================================================== */
 
+  /**
+   * キャラクタコントローラを作る。
+   *
+   * ## `actor` / `surface` を必ず渡すこと (弾が当たる主体の場合)
+   *
+   * `PhysicsCharacterController` は **内部で PhysicsBody を作り、フィルタは全ビット
+   * 立った状態**になっている。つまり弾のレイに当たる。しかしその body は physics の
+   * メタデータ表に載っていないため:
+   *
+   *   - `hit.surface` が既定の 'concrete' になる (足元が肉でもコンクリ音・コンクリ片)
+   *   - `hit.actor` が null なので **damage:dealt が発行されず、ダメージが入らない**
+   *
+   * 実測 (修正前): 8m 手前からプレイヤーへ撃つと 7.75m で
+   * `{surface:'concrete', hasActor:false}` に当たっていた。**敵の弾が当たっても
+   * プレイヤーは一切ダメージを受けない**状態だった。
+   *
+   * ここで body をメタデータ表に登録することで、弾が当たれば正しく actor 付きの
+   * Hit になり damage:dealt が流れる。
+   *
+   * 逆に「弾に当たってほしくない」CC (別途ヒットボックスを持つ ai など) は
+   * `opts.bulletProof = true` を渡す。フィルタを CLIP に落として弾と視線から外す。
+   */
   createCharacter(opts = {}) {
     const c = new Character(this, {
       radius: UNITS.playerRadius,
@@ -655,12 +677,42 @@ export class PhysicsSystem {
       ...opts,
     });
     this.characters.push(c);
+
+    /**
+     * CC の内部 body は private (`ctrl._body`)。**public な取得手段が無い**ので
+     * 直接触っている。Babylon を上げたときに名前が変わっていないか確認すること。
+     * 名前が変われば静かに登録されなくなり、「弾が当たるのにダメージが入らない」
+     * 状態に戻る (エラーは出ない)。
+     */
+    const body = c.ctrl?._body;
+    if (body) {
+      c.body = body;
+      if (opts.bulletProof) {
+        // 弾と視線から外す。別途ヒットボックスを持つキャラクタ向け。
+        const shape = c.ctrl._shape;
+        if (shape) {
+          shape.filterMembershipMask = LAYER.CLIP;
+          shape.filterCollideMask = MASK.CHARACTER;
+        }
+      } else {
+        const si = surfaceIndex(opts.surface ?? 'flesh');
+        this._meta.set(body, {
+          surfaceIndex: si,
+          surface: surfaceName(si),
+          layer: LAYER.ACTOR,
+          mesh: null,
+          actor: opts.actor ?? null,
+          part: opts.part ?? 'torso',
+        });
+      }
+    }
     return c;
   }
 
   removeCharacter(c) {
     const i = this.characters.indexOf(c);
     if (i >= 0) this.characters.splice(i, 1);
+    if (c.body) this._meta.delete(c.body);
     c.dispose?.();
   }
 

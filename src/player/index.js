@@ -59,6 +59,16 @@ export class PlayerSystem {
       radius: 0.32,
       stepHeight: STANCE.stand.stepHeight,
       slopeLimit: 52,
+      /**
+       * **弾が当たる主体として登録する。**
+       *
+       * これを渡さないと、CC の内部 body が physics のメタデータ表に載らず、
+       * 敵の弾が `surface:'concrete' / actor:null` で当たる。damage:dealt が
+       * 発行されないため **プレイヤーは一切ダメージを受けない** (実測済み)。
+       */
+      actor: this,
+      surface: 'flesh',
+      part: 'torso',
     });
     this._snapToGround(spawn.position);
 
