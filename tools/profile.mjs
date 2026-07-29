@@ -16,6 +16,7 @@
  *   node tools/profile.mjs --port=8080 --dpr=2 --w=1512 --h=982
  */
 import { chromium } from 'playwright';
+import { WEBGPU_FLAGS, CHROMIUM_CHANNEL } from './chromium-flags.mjs';
 import { resolve } from 'node:path';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -30,8 +31,9 @@ const FRAMES = Number(args.frames ?? 900);
 
 const browser = await chromium.launch({
   headless: true,
-  args: ['--use-angle=metal', '--ignore-gpu-blocklist', '--mute-audio',
-         '--disable-frame-rate-limit', '--disable-gpu-vsync'],
+  // WebGPU を掴むには軽量な headless-shell ではなく full Chrome binary が要る。
+  channel: CHROMIUM_CHANNEL,
+  args: WEBGPU_FLAGS,
 });
 const page = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: DPR });
 const errs = [];
