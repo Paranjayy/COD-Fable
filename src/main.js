@@ -1,5 +1,6 @@
 import { Engine } from './core/engine.js';
 import { createConfig } from './core/config.js';
+import { installDeterministicRandom, randomCallCount } from './core/determinism.js';
 
 import { MaterialSystem } from './materials/index.js';
 import { SkySystem } from './sky/index.js';
@@ -60,6 +61,16 @@ for (const [key, flag] of [
 
 // 切り分け用: ?post=0 でポストプロセスを丸ごと外す。
 if (params.get('post') === '0') config.post = false;
+
+/**
+ * **Babylon のオブジェクトを 1 つでも作る前に**乱数を決定化する。
+ *
+ * Babylon 内部 (SSAO のサンプルカーネル等) が Math.random() を使っており、
+ * ページを読むたびに別の絵になる。詳細と実測値は src/core/determinism.js を参照。
+ * SSAO のカーネルはパイプラインのコンストラクタで作られるので、engine 生成後に
+ * 差し替えても手遅れになる。
+ */
+if (config.deterministic) installDeterministicRandom();
 
 const canvas = document.getElementById('game');
 
@@ -139,6 +150,12 @@ if (lockstep) {
 
 window.__ENGINE__ = engine;
 window.__BACKEND__ = engine.backend;
+/**
+ * 診断用。**キャプチャの実行ごとにこの数が変わるなら、まだどこかに実時計依存や
+ * 環境依存の分岐が残っている** (乱数の消費回数が経路に依存しているということ)。
+ * bit-identical が崩れたときに最初に見る値。
+ */
+window.__RANDOM_CALLS__ = randomCallCount();
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => engine.dispose());
