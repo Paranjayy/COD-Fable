@@ -1,405 +1,242 @@
-import * as THREE from 'three';
-import { CONCRETE, BRICK, PLASTER, TILE } from './glsl/surfaces-arch.js';
-import { ASPHALT, SAND, DIRT, GRAVEL } from './glsl/surfaces-ground.js';
-import { METAL_RUST, METAL_PAINTED, METAL_BRUSHED, CORRUGATED } from './glsl/surfaces-metal.js';
-import { WOOD, FABRIC, BURLAP, FOLIAGE, RUBBER, GLASS } from './glsl/surfaces-organic.js';
-
 /**
- * The surface library.
+ * SURFACE LIBRARY — 19 種の手続きサーフェスの定義。
  *
- * `bake`  — how the texture set is generated (resolution, the metres the tile
- *           spans, and the peak-to-trough relief that sets the normal slope).
- * `mat`   — parameters for the material shader extension (see shader.js).
- * `three` — properties applied straight to the THREE material.
- * `surface` — the shared physics/FX surface vocabulary from ARCHITECTURE.md.
+ * ここには **数値しか置かない**。生成ロジックは wgsl/surface.js に一本化されて
+ * いるので、新しいサーフェスを足す作業は多くの場合このファイルに 1 エントリ
+ * 足すだけで済む (SSOT)。
+ *
+ * 各エントリ:
+ *   kind      wgsl/surface.js の分岐 ID。KIND を使うこと (生の数字を書かない)
+ *   surface   ARCHITECTURE.md の 12 種 physics/FX 語彙。decal・足音・弾痕が参照する
+ *   bake      size    生成解像度 (px)
+ *             world   タイル 1 枚が実世界で覆う長さ (m)。テクセル密度を決める
+ *             relief  凹凸の山谷差 (m)。法線の勾配はこれと world から決まる
+ *             tile    タイル内の格子分割数。**周期性の基準**なので整数であること
+ *             seed    ハッシュ種
+ *             pa/pb   kind 固有パラメータ (意味は surface.js の該当分岐を参照)
+ *   colors    tint / tint2 / grime。**sRGB の 0xRRGGBB で書く** (人間が読めるように)。
+ *             線形化は materials/index.js が行うので、ここに線形値を書かないこと
+ *   weather   [全体強度, エッジ摩耗, 凹部の汚れ, 色ムラ]
+ *   orm       [roughness 基準, height→roughness 傾き, AO 強度, metallic]
+ *
+ * ## albedo の値域について
+ *
+ * README の品質バーに「Albedo in 0.02-0.9, metals are 0 or 1」とある。ここの色は
+ * すべてその範囲に収まるよう選んである。**物理的にありえない暗さ/明るさに逃がして
+ * 露出を誤魔化さないこと** — Three 版で武器の albedo を 1/3 に潰して破綻した経緯が
+ * README に記録されている。
  */
+
+/** wgsl/surface.js の分岐 ID。生の数字をライブラリに書かないための SSOT。 */
+export const KIND = {
+  CONCRETE: 0,
+  BRICK: 1,
+  PLASTER: 2,
+  TILE: 3,
+  ASPHALT: 4,
+  SAND: 5,
+  DIRT: 6,
+  GRAVEL: 7,
+  METAL_RUST: 8,
+  METAL_PAINTED: 9,
+  METAL_BRUSHED: 10,
+  CORRUGATED: 11,
+  WOOD: 12,
+  FABRIC: 13,
+  BURLAP: 14,
+  FOLIAGE: 15,
+  RUBBER: 16,
+  GLASS: 17,
+};
+
+/** sRGB 0xRRGGBB → 線形 [r,g,b]。PBR の albedo は線形でなければならない。 */
+export function hexToLinear(hex) {
+  const f = (v) => {
+    const c = v / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  return [f((hex >> 16) & 255), f((hex >> 8) & 255), f(hex & 255)];
+}
+
 export const LIBRARY = {
-  // ------------------------------------------------------------ masonry ----
+  // ---------------------------------------------------------------- 石材 --
   concrete: {
-    glsl: CONCRETE,
+    kind: KIND.CONCRETE,
     surface: 'concrete',
-    bake: { size: 1024, worldSize: 2.5, relief: 0.09, seed: 11, param: [1, 0, 0, 0] },
-    mat: {
-      scale: 2.5,
-      parallax: 0.016,
-      detile: 0.4,
-      detail: [9, 0.95, 0.58, 26],
-      macro: [0.085, 0.62, 0.24, 0.45],
-      // 3-4 m pour/wash variation at real contrast plus a 12 m band, so a long
-      // retaining wall or a barrier run is not one value end to end.
-      macroBig: [2.05, 0.130, 0.028, 0],
-      patch: [0.28, 2.0, 0.145, -0.08],
-      weather: [0.42, 0.4, 0.55, 0.5],
-      wearColor: 0x9a978f,
-      dustColor: 0x8b7f6a,
-      grimeColor: 0x2b2823,
-      roughness: [0.98, -0.01, 0.24],
-    },
+    bake: { size: 1024, world: 2.5, relief: 0.09, tile: 4, seed: 11, pa: [0, 0, 0, 0] },
+    colors: { tint: 0x8e8b84, tint2: 0x757169, grime: 0x2b2823 },
+    weather: [0.42, 0.4, 0.55, 0.5],
+    orm: [0.92, 0.16, 0.85, 0],
   },
   concrete_floor: {
-    glsl: CONCRETE,
+    kind: KIND.CONCRETE,
     surface: 'concrete',
-    bake: { size: 1024, worldSize: 2.5, relief: 0.075, seed: 47, param: [0, 1, 0, 0] },
-    mat: {
-      scale: 3.2,
-      parallax: 0.01,
-      detile: 0,
-      detail: [9, 0.90, 0.52, 26],
-      macro: [0.075, 0.48, 0.18, 0.3],
-      macroRelief: 0.3,
-      weather: [0.55, 0.1, 0.15, 0.5],
-      roughness: [1.0, 0.0, 0.22],
-    },
+    // pa.x=1 で打ち継ぎの帯を消す (床には出ないため)。
+    bake: { size: 1024, world: 3.2, relief: 0.06, tile: 4, seed: 47, pa: [1, 0, 0, 0] },
+    colors: { tint: 0x8a877f, tint2: 0x6f6b63, grime: 0x272420 },
+    weather: [0.55, 0.1, 0.62, 0.42],
+    orm: [0.95, 0.12, 0.9, 0],
   },
   brick: {
-    glsl: BRICK,
+    kind: KIND.BRICK,
     surface: 'concrete',
-    bake: { size: 1024, worldSize: 1.35, relief: 0.055, seed: 23 },
-    mat: {
-      scale: 1.35,
-      // 0.12 of height range x 0.024 m = ~2.5 mm of mortar parallax
-      parallax: 0.024,
-      parallaxLayers: 24,
-      detile: 0,
-      detail: [7, 0.88, 0.48, 22],
-      macro: [0.09, 0.58, 0.22, 0.55],
-      macroBig: [1.95, 0.115, 0.03, 0],
-      weather: [0.4, 0.5, 0.6, 0.55],
-      wearColor: 0xa08678,
-      grimeColor: 0x241f19,
-      roughness: [0.98, -0.01, 0.26],
-    },
+    // pa = [列数, 段数, 目地幅, 段ごとのずらし]
+    bake: { size: 1024, world: 1.35, relief: 0.055, tile: 4, seed: 23, pa: [6, 16, 0.035, 0.5] },
+    colors: { tint: 0x9c5f45, tint2: 0x7a4632, grime: 0x8b8578 },
+    weather: [0.5, 0.35, 0.6, 0.55],
+    orm: [0.88, 0.2, 0.95, 0],
   },
   plaster: {
-    glsl: PLASTER,
+    kind: KIND.PLASTER,
     surface: 'plaster',
-    bake: { size: 1024, worldSize: 2.2, relief: 0.06, seed: 5 },
-    mat: {
-      scale: 2.2,
-      parallax: 0.014,
-      detile: 0.8,
-      detail: [10, 0.95, 0.54, 24],
-      // 0.085 puts the coarsest band of the macro map at ~4 m; the contrast
-      // expansion is what turns it from a 5% wash into a real 20% swing, and the
-      // second band at 0.026 zones the facade at ~13 m. Between them a 12 m
-      // elevation reads as damp/dry/bleached areas instead of one flat colour.
-      macro: [0.085, 0.72, 0.26, 0.5],
-      macroBig: [2.15, 0.150, 0.026, 0],
-      // ~18% of every facade is a replastered rectangle at +/-17% value.
-      // A 12 m elevation seen at 3 m is mostly ONE surface, so the only thing
-      // that can stop it reading as flat colour is structure at 1-4 m.
-      patch: [0.34, 2.2, 0.175, -0.10],
-      // streaks are gated by the runoff model now, so the amplitude can be real
-      weather: [0.34, 0.5, 0.6, 0.5],
-      wearColor: 0xb0a692,
-      dustColor: 0x9c8a6c,
-      grimeColor: 0x2a251d,
-      roughness: [0.97, -0.02, 0.26],
-    },
+    // pa = [剥離しきい値, 剥離の深さ, -, -]
+    bake: { size: 1024, world: 2.8, relief: 0.05, tile: 4, seed: 71, pa: [0.62, 0.55, 0, 0] },
+    colors: { tint: 0xc4bba6, tint2: 0x9a5f45, grime: 0x6e6455 },
+    weather: [0.6, 0.5, 0.5, 0.5],
+    orm: [0.9, 0.14, 0.8, 0],
   },
   tile: {
-    glsl: TILE,
+    kind: KIND.TILE,
     surface: 'concrete',
-    bake: { size: 1024, worldSize: 1.5, relief: 0.03, seed: 31 },
-    mat: {
-      scale: 1.5,
-      // 0.06 of height range x 0.03 m = ~1.8 mm of grout recess
-      parallax: 0.03,
-      parallaxLayers: 20,
-      detail: [8, 0.6, 0.36, 18],
-      macro: [0.09, 0.40, 0.16, 0.3],
-      // tiled walls are laid in batches: whole areas came from a different kiln
-      macroBig: [1.7, 0.075, 0.032, 0],
-      patch: [0.14, 1.7, 0.10, -0.05],
-      weather: [0.3, 0.2, 0.3, 0.5],
-      roughness: [0.9, -0.04, 0.16],
-    },
+    // pa = [1 辺のタイル数, 目地幅, -, -]
+    bake: { size: 1024, world: 1.2, relief: 0.02, tile: 4, seed: 89, pa: [8, 0.03, 0, 0] },
+    colors: { tint: 0xa8a294, tint2: 0x8d8578, grime: 0x4a453c },
+    weather: [0.35, 0.2, 0.7, 0.3],
+    orm: [0.42, -0.22, 0.75, 0],
   },
 
-  // ------------------------------------------------------------- ground ----
+  // ---------------------------------------------------------------- 地面 --
   asphalt: {
-    glsl: ASPHALT,
+    kind: KIND.ASPHALT,
     surface: 'concrete',
-    bake: { size: 1024, worldSize: 3.0, relief: 0.075, seed: 71 },
-    mat: {
-      scale: 3.0,
-      parallax: 0.014,
-      detile: 1.0,
-      // micro detail is gone by 16 m, so the near ground gains detail instead
-      // of shimmering at range
-      detail: [8, 0.8, 0.42, 18],
-      macro: [0.062, 0.52, 0.22, 0.25],
-      macroRelief: 0.55,
-      weather: [0.45, 0.05, 0.1, 0.26],
-      dustColor: 0x8b8071,
-      grimeColor: 0x232120,
-      roughness: [0.98, -0.02, 0.3],
-    },
+    // pa = [ひび幅, ひびしきい値, -, -]
+    bake: { size: 1024, world: 3.0, relief: 0.045, tile: 4, seed: 5, pa: [0.05, 0.62, 0, 0] },
+    colors: { tint: 0x3d3b38, tint2: 0x56534d, grime: 0x232120 },
+    weather: [0.5, 0.25, 0.5, 0.4],
+    orm: [0.94, 0.1, 0.85, 0],
   },
   sand: {
-    glsl: SAND,
+    kind: KIND.SAND,
     surface: 'sand',
-    bake: { size: 1024, worldSize: 2.5, relief: 0.10, seed: 91 },
-    mat: {
-      uvMode: 'triplanar',
-      scale: 2.5,
-      detile: 0,
-      detail: [8, 0.7, 0.30, 18],
-      macro: [0.050, 0.44, 0.14, 0.35],
-      macroRelief: 0.45,
-      weather: [0.15, 0.0, 0.0, 0.18],
-      dustColor: 0xa89066,
-      grimeColor: 0x4c4132,
-      roughness: [1.0, 0.0, 0.3],
-    },
+    // pa = [風紋の周波数, 風紋の振幅, 風紋の向き(rad), -]
+    bake: { size: 1024, world: 4.0, relief: 0.05, tile: 4, seed: 13, pa: [3, 0.055, 0.7, 0] },
+    colors: { tint: 0xc2a878, tint2: 0xa78d5f, grime: 0x6d5c3f },
+    weather: [0.3, 0.05, 0.25, 0.45],
+    orm: [0.97, 0.06, 0.6, 0],
   },
   dirt: {
-    glsl: DIRT,
+    kind: KIND.DIRT,
     surface: 'dirt',
-    bake: { size: 1024, worldSize: 2.5, relief: 0.12, seed: 13 },
-    mat: {
-      uvMode: 'triplanar',
-      scale: 2.5,
-      detail: [7, 0.85, 0.36, 18],
-      macro: [0.055, 0.48, 0.18, 0.4],
-      macroRelief: 0.6,
-      weather: [0.2, 0.0, 0.0, 0.22],
-      dustColor: 0x94805c,
-      grimeColor: 0x37301f,
-      roughness: [0.98, -0.02, 0.3],
-    },
+    // pa = [乾裂の深さ, -, -, -]
+    bake: { size: 1024, world: 3.2, relief: 0.07, tile: 4, seed: 29, pa: [0.16, 0, 0, 0] },
+    colors: { tint: 0x6b5a44, tint2: 0x53442f, grime: 0x342b1e },
+    weather: [0.5, 0.15, 0.6, 0.5],
+    orm: [0.96, 0.08, 0.9, 0],
   },
   gravel: {
-    glsl: GRAVEL,
-    // 1K, not 512: at 512 the 9 mm grade was 2.5 texels wide and baked as
-    // noise. Aggregate has to be resolved in the tile or it cannot be resolved
-    // at all — the mip chain only ever removes information.
-    bake: { size: 1024, worldSize: 1.6, relief: 0.055, seed: 57 },
+    kind: KIND.GRAVEL,
     surface: 'dirt',
-    mat: {
-      uvMode: 'triplanar',
-      scale: 1.6,
-      detail: [6, 0.8, 0.34, 20],
-      macro: [0.070, 0.44, 0.2, 0.3],
-      macroRelief: 0.7,
-      // Cavity grime on a surface whose height field IS its aggregate turns
-      // every gap between stones into a black pit; 0.5 was most of the
-      // bimodal histogram the critics measured on the road.
-      weather: [0.2, 0.0, 0.0, 0.16],
-      dustColor: 0xa2947a,
-      grimeColor: 0x4a4238,
-      roughness: [0.96, -0.03, 0.28],
-    },
+    // pa = [石の密度 (voronoi 格子数), -, -, -]
+    bake: { size: 1024, world: 2.0, relief: 0.1, tile: 4, seed: 37, pa: [16, 0, 0, 0] },
+    colors: { tint: 0x8a8074, tint2: 0x6b6157, grime: 0x3a342c },
+    weather: [0.4, 0.1, 0.55, 0.5],
+    orm: [0.93, 0.12, 0.95, 0],
   },
 
-  // -------------------------------------------------------------- metal ----
+  // ---------------------------------------------------------------- 金属 --
   metal_rust: {
-    glsl: METAL_RUST,
+    kind: KIND.METAL_RUST,
     surface: 'metal',
-    bake: { size: 1024, worldSize: 1.2, relief: 0.035, seed: 37 },
-    mat: {
-      scale: 1.2,
-      parallax: 0.004,
-      detail: [9, 0.7, 0.36, 16],
-      macro: [0.10, 0.30, 0.14, 0.4],
-      weather: [0.25, 0.4, 0.5, 0.35],
-      wearColor: 0x8c8f93,
-      wearMaterial: [0.28, 1.0, 0, 0.85],
-    },
+    // pa = [錆のしきい値, 錆の量, -, -]
+    bake: { size: 1024, world: 1.6, relief: 0.02, tile: 4, seed: 53, pa: [0.48, 0.9, 0, 0] },
+    colors: { tint: 0x6e6a66, tint2: 0x8a4a26, grime: 0x2a2320 },
+    weather: [0.6, 0.5, 0.5, 0.4],
+    // 錆は非金属なので metallic を落とす。健全部との差はシェーダ側の色で出す。
+    orm: [0.72, 0.3, 0.85, 0.35],
   },
   metal_painted: {
-    glsl: METAL_PAINTED,
+    kind: KIND.METAL_PAINTED,
     surface: 'metal',
-    bake: {
-      size: 1024,
-      worldSize: 1.5,
-      relief: 0.018,
-      seed: 61,
-      tintA: 0x4a5340,
-      tintB: 0x2a2f26,
-    },
-    mat: {
-      scale: 1.5,
-      parallax: 0.003,
-      detail: [10, 0.6, 0.32, 16],
-      macro: [0.10, 0.28, 0.14, 0.35],
-      weather: [0.3, 0.45, 0.35, 0.35],
-      wearColor: 0x8f9296,
-      wearMaterial: [0.3, 1.0, 0, 0.9],
-      // painted metal has to stay glossy enough to glint, but never mirror
-      roughness: [0.92, -0.03, 0.22],
-    },
+    // pa = [塗装剥げの量, -, -, -]
+    bake: { size: 1024, world: 1.8, relief: 0.012, tile: 4, seed: 61, pa: [0.55, 0, 0, 0] },
+    colors: { tint: 0x3f5a6b, tint2: 0x7a7570, grime: 0x22201e },
+    weather: [0.45, 0.6, 0.4, 0.3],
+    orm: [0.48, -0.16, 0.7, 0.15],
   },
   metal_brushed: {
-    glsl: METAL_BRUSHED,
+    kind: KIND.METAL_BRUSHED,
     surface: 'metal',
-    bake: { size: 512, worldSize: 0.8, relief: 0.004, seed: 83 },
-    mat: {
-      scale: 0.8,
-      detail: [8, 0.25, 0.15, 8],
-      macro: [0.09, 0.14, 0.1, 0.2],
-      weather: [0.15, 0.15, 0.2, 0.2],
-      wearColor: 0xb9bcc0,
-      wearMaterial: [0.16, 1.0, 0, 0.9],
-    },
-    three: { anisotropy: 0.65, anisotropyRotation: 0, physical: true },
+    // pa = [刷毛目の伸長率, -, 向き(rad), -]
+    bake: { size: 1024, world: 1.0, relief: 0.004, tile: 4, seed: 67, pa: [140, 0, 0.15, 0] },
+    colors: { tint: 0x9a9a9e, tint2: 0x76767a, grime: 0x2a2a2c },
+    weather: [0.2, 0.15, 0.3, 0.2],
+    // 金属は metallic=1。README の「metals are 0 or 1」に従う。
+    orm: [0.34, -0.14, 0.5, 1.0],
   },
   corrugated: {
-    glsl: CORRUGATED,
+    kind: KIND.CORRUGATED,
     surface: 'metal',
-    bake: { size: 1024, worldSize: 2.4, relief: 0.075, seed: 29 },
-    mat: {
-      scale: 2.4,
-      parallax: 0.03,
-      parallaxLayers: 24,
-      detail: [10, 0.6, 0.32, 18],
-      macro: [0.09, 0.26, 0.12, 0.3],
-      weather: [0.3, 0.5, 0.5, 0.4],
-      wearColor: 0x9aa0a4,
-      wearMaterial: [0.32, 1.0, 0, 0.85],
-    },
+    // pa = [波の本数 (整数), 錆の量, -, -]
+    bake: { size: 1024, world: 2.2, relief: 0.05, tile: 4, seed: 73, pa: [10, 0.55, 0, 0] },
+    colors: { tint: 0x8d8b85, tint2: 0x8a4f2c, grime: 0x2b2622 },
+    weather: [0.55, 0.4, 0.5, 0.4],
+    orm: [0.62, 0.24, 0.75, 0.55],
   },
 
-  // ------------------------------------------------------------ organic ----
+  // ---------------------------------------------------------- 木・有機物 --
   wood: {
-    glsl: WOOD,
+    kind: KIND.WOOD,
     surface: 'wood',
-    bake: { size: 1024, worldSize: 2.0, relief: 0.038, seed: 19 },
-    mat: {
-      scale: 2.0,
-      parallax: 0.008,
-      detail: [10, 0.8, 0.42, 18],
-      macro: [0.085, 0.34, 0.14, 0.5],
-      weather: [0.3, 0.35, 0.5, 0.45],
-      wearColor: 0xa88b62,
-      wearMaterial: [0.5, 0.0, 0, 0.7],
-    },
+    // pa = [年輪の詰まり, 節の密度, 木目の向き(rad), -]
+    bake: { size: 1024, world: 1.6, relief: 0.03, tile: 4, seed: 83, pa: [7, 3, 0.12, 0] },
+    colors: { tint: 0x8a6540, tint2: 0x5c412a, grime: 0x2e251b },
+    weather: [0.5, 0.35, 0.55, 0.45],
+    orm: [0.82, 0.2, 0.85, 0],
   },
   fabric: {
-    glsl: FABRIC,
+    kind: KIND.FABRIC,
     surface: 'fabric',
-    // The weave carries ~0.3 of the height range, so 0.011 m of relief over a
-    // 0.7 m tile is a ~1.5-2 mm thread bump at the 0.26 m mapping the awnings
-    // use — a real weave, not a painted grid.
-    bake: { size: 512, worldSize: 0.7, relief: 0.008, seed: 43, tintA: 0x5a5445, tintB: 0x3a3830 },
-    mat: {
-      scale: 0.7,
-      detail: [6, 0.42, 0.28, 10],
-      // 1.4 m macro at real contrast: sun-bleached panels and damp panels
-      macro: [0.12, 0.34, 0.12, 0.3],
-      macroBig: [1.8, 0.07, 0.09, 0],
-      weather: [0.25, 0.2, 0.3, 0.35],
-      normalStrength: 1.15,
-      /**
-       * Canvas passes 18% of the beam, its underside sits ~0.75 stops under its
-       * top, and the drape structure is a 10 cm fold field. This is the whole
-       * difference between fabric and painted cardboard.
-       */
-      cloth: [0.20, 0.72, 0.26, 0],
-    },
-    three: { physical: true, sheen: 0.55, sheenRoughness: 0.85, sheenColor: 0x8a8272 },
+    // pa = [織り目の数, -, -, -]
+    bake: { size: 512, world: 0.8, relief: 0.006, tile: 4, seed: 97, pa: [42, 0, 0, 0] },
+    colors: { tint: 0x7a6f5e, tint2: 0x5f5647, grime: 0x332d24 },
+    weather: [0.35, 0.2, 0.45, 0.35],
+    orm: [0.94, 0.06, 0.8, 0],
   },
   burlap: {
-    glsl: BURLAP,
+    kind: KIND.BURLAP,
     surface: 'fabric',
-    // hessian is coarse: a fat, visible thread bump
-    bake: { size: 512, worldSize: 0.5, relief: 0.018, seed: 67 },
-    mat: {
-      scale: 0.5,
-      parallax: 0.003,
-      detail: [6, 0.4, 0.28, 9],
-      macro: [0.14, 0.32, 0.12, 0.35],
-      macroBig: [1.7, 0.06, 0.11, 0],
-      weather: [0.4, 0.15, 0.35, 0.4],
-      dustColor: 0x9c8760,
-      normalStrength: 1.15,
-      // a filled bag transmits far less than a stretched canvas
-      cloth: [0.06, 0.86, 0.10, 0],
-    },
-    three: { physical: true, sheen: 0.4, sheenRoughness: 0.95, sheenColor: 0x9c8b68 },
+    bake: { size: 512, world: 0.7, relief: 0.012, tile: 4, seed: 101, pa: [24, 0, 0, 0] },
+    colors: { tint: 0x9c8560, tint2: 0x7b6746, grime: 0x413523 },
+    weather: [0.45, 0.25, 0.6, 0.4],
+    orm: [0.97, 0.05, 0.9, 0],
   },
   foliage: {
-    glsl: FOLIAGE,
+    kind: KIND.FOLIAGE,
     surface: 'foliage',
-    bake: { size: 512, worldSize: 0.6, relief: 0.02, seed: 79 },
-    mat: {
-      uvMode: 'mesh',
-      scale: 1,
-      alphaMask: true,
-      detail: [4, 0.25, 0.15, 8],
-      macro: [0.16, 0.3, 0.08, 0.6],
-      weather: [0.15, 0.0, 0.0, 0.2],
-    },
-    three: {
-      side: THREE.DoubleSide,
-      alphaTest: 0.45,
-      physical: true,
-      sheen: 0.3,
-      sheenRoughness: 0.8,
-      sheenColor: 0x9fbd6a,
-    },
+    // pa = [葉の密度, -, -, -]
+    bake: { size: 512, world: 1.4, relief: 0.03, tile: 4, seed: 103, pa: [10, 0, 0, 0] },
+    colors: { tint: 0x4a6b32, tint2: 0x6d8a3c, grime: 0x22301a },
+    weather: [0.4, 0.1, 0.4, 0.6],
+    orm: [0.72, 0.16, 0.9, 0],
   },
   rubber: {
-    glsl: RUBBER,
+    kind: KIND.RUBBER,
     surface: 'rubber',
-    bake: { size: 512, worldSize: 0.5, relief: 0.013, seed: 97 },
-    mat: {
-      scale: 0.45,
-      detail: [7, 0.62, 0.42, 13],
-      // A tyre stack is a dark mass low in the frame, so it has nothing but its
-      // own variation to read by: bleached crowns, damp black sidewalls and the
-      // road dust that fills the tread. Without these it is a grey lozenge.
-      macro: [0.16, 0.36, 0.20, 0.18],
-      macroBig: [1.8, 0.10, 0.11, 0],
-      weather: [0.40, 0.18, 0.22, 0.45],
-      dustColor: 0x8d8478,
-      grimeColor: 0x181715,
-      tint: 0xfffaf2,
-      normalStrength: 1.25,
-      roughness: [0.94, -0.03, 0.34],
-    },
+    // pa = [ブロック数, ブロックの面取り幅, -, -]
+    bake: { size: 512, world: 0.9, relief: 0.02, tile: 4, seed: 107, pa: [7, 0.09, 0, 0] },
+    colors: { tint: 0x2a2a2c, tint2: 0x1e1e20, grime: 0x141414 },
+    weather: [0.3, 0.15, 0.4, 0.2],
+    orm: [0.88, 0.1, 0.8, 0],
   },
   glass: {
-    glsl: GLASS,
+    kind: KIND.GLASS,
     surface: 'glass',
-    bake: { size: 512, worldSize: 2.0, relief: 0.0008, seed: 3 },
-    mat: {
-      scale: 2.0,
-      detail: [3, 0.06, 0.05, 6],
-      macro: [0.05, 0.1, 0.06, 0.1],
-      weather: [0.1, 0.3, 0.4, 0.15],
-      normalStrength: 0.35,
-      roughness: [0.9, -0.01, 0.03],
-    },
-    three: {
-      physical: true,
-      transparent: true,
-      opacity: 0.22,
-      side: THREE.DoubleSide,
-      envMapIntensity: 1.6,
-      ior: 1.52,
-      specularIntensity: 1,
-      depthWrite: false,
-    },
+    // pa = [拭き跡の濃さ, 埃の濃さ, -, -]
+    bake: { size: 512, world: 2.0, relief: 0.002, tile: 4, seed: 109, pa: [0.22, 0.18, 0, 0] },
+    colors: { tint: 0xbfc9cc, tint2: 0xa9b4b8, grime: 0x6e7472 },
+    weather: [0.25, 0.05, 0.2, 0.15],
+    orm: [0.08, -0.04, 0.3, 0],
   },
 };
 
-/** Alias -> library key, so callers can ask for the physics surface name. */
-export const ALIASES = {
-  metal: 'metal_painted',
-  steel: 'metal_brushed',
-  rust: 'metal_rust',
-  sandbag: 'burlap',
-  ground: 'dirt',
-  road: 'asphalt',
-  stucco: 'plaster',
-  wall: 'concrete',
-  floor: 'concrete_floor',
-  plank: 'wood',
-  leaf: 'foliage',
-  window: 'glass',
-};
-
-export function resolveName(name) {
-  return LIBRARY[name] ? name : (ALIASES[name] ?? name);
-}
+export const SURFACE_KEYS = Object.keys(LIBRARY);
