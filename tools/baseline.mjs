@@ -80,6 +80,9 @@ for (const name of wanted) {
 
     const applied = await page.evaluate(
       ({ s, settle }) => window.__APPLY_SHOT__(s, { grabFrame: settle }), { s: name, settle: SETTLE });
+    if (!applied || typeof applied !== 'object' || applied.error) {
+      throw new Error(applied?.error ?? 'shot API unavailable');
+    }
 
     // Drop temporal history so accumulation starts from a known phase.
     await page.evaluate(() => {
@@ -98,7 +101,7 @@ for (const name of wanted) {
 
     await page.screenshot({ path: `${OUTDIR}/${name}.png`, type: 'png' });
     const info = await page.evaluate('window.__RENDER_INFO__ ?? null');
-    report.shots.push({ shot: name, ok: !applied?.error, info, logs: logs.filter((l) => /pageerror|\[error\]/.test(l)) });
+    report.shots.push({ shot: name, ok: true, info, logs: logs.filter((l) => /pageerror|\[error\]/.test(l)) });
   } catch (e) {
     report.ok = false;
     report.shots.push({ shot: name, ok: false, error: e.message });

@@ -27,7 +27,7 @@ const args = Object.fromEntries(
 const PORT = Number(args.port ?? 5173);
 const W = Number(args.w ?? 1920);
 const H = Number(args.h ?? 1080);
-const SHOT = args.shot ?? 'default';
+const SHOT = args.shot ?? 'hero';
 const OUT = resolve(args.out ?? `shots/${SHOT}.png`);
 const TIMEOUT = Number(args.timeout ?? 90000);
 // Frames to render before capture: lets TAA converge, streaming settle, LOD pick.
@@ -87,7 +87,7 @@ page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}\n${e.stack ?? ''
 
 let failed = null;
 try {
-  await page.goto(`http://127.0.0.1:${PORT}/?capture=1&shot=${encodeURIComponent(SHOT)}`, {
+  await page.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&shot=${encodeURIComponent(SHOT)}`, {
     waitUntil: 'domcontentloaded',
     timeout: TIMEOUT,
   });
@@ -106,17 +106,14 @@ try {
       { s: SHOT, settle: SETTLE }
     );
     logs.push(`[shot] ${JSON.stringify(applied)}`);
+    if (!applied || typeof applied !== 'object' || applied.error) {
+      throw new Error(applied?.error ?? 'shot API unavailable');
+    }
 
-    // Pump deterministic frames so temporal effects converge.
-    await page.evaluate(
-      (n) =>
-        new Promise((done) => {
-          let i = 0;
-          const tick = () => (++i >= n ? done() : requestAnimationFrame(tick));
-          requestAnimationFrame(tick);
-        }),
-      SETTLE
-    );
+    // Lockstep mode owns the engine clock, so the settle budget is exact and
+    // no simulation state advances during Playwright round trips.
+    await page.evaluate((n) => window.__PUMP__(n), SETTLE);
+    await page.evaluate(() => window.__PRESENT__(2));
 
     mkdirSync(dirname(OUT), { recursive: true });
     await page.screenshot({ path: OUT, type: 'png' });
