@@ -135,10 +135,19 @@ maxDelta 71 を許容する gate は実際の退行をほぼ検出できず、ga
 ### 最終結果 — 全 11 ショット、2 回実行の差分
 
 ```
-9 / 11 ショットが完全に bit-identical  (changedPct 0, maxDelta 0)
-残り 2 つ (combat, weapon) も maxDelta 1  ← clustered lighting の浮動小数の累積順
---tol=1 で withinEpsilon: true / exit 0
+--tol=1 で withinEpsilon: true / exit 0   ← ゲートは通る
+完全に bit-identical (maxDelta 0) なショット数は 5〜9 / 11 で run ごとに変動
+差が出るショットも maxDelta は必ず 1 (1 LSB)、tol=1 での changedPct は 0
 ```
+
+**maxDelta 1 の出どころは clustered lighting** です。二分探索で
+`clustered=0` にすると完全な 0 になることを確認しています。GPU 上でタイルごとに
+ライトを積む順序が実行ごとに変わりうるため、最下位ビットが揺れます。
+
+「どのショットが 0 になるか」が run ごとに変わるのはそのためで、**1 LSB を超える差は
+一度も観測していません**。したがってゲートは `--tol=1` で運用します。実際の退行
+(ジオメトリ・マテリアル・ライティング・空・露出・HUD の変更) は maxDelta が
+2 桁以上になるので、この許容幅で十分検出できます。
 
 **既知の劣化**: Havok はクロスプラットフォームでの bit-identical を保証しません
 (浮動小数の丸めが CPU 命令セットに依存しうる)。同一マシンでの run-to-run 再現性は
