@@ -2,6 +2,9 @@
 
 Get updates [here](https://shumer.dev/newsletter).
 
+Play it in the browser: **[ericspencer.us/Claude-of-Duty](https://ericspencer.us/Claude-of-Duty/)**
+(community-hosted build of `main`; desktop + WebGL2 required, ~20 s procedural boot).
+
 A first-person shooter built in the browser with Three.js r180 and WebGL2. Roughly
 55k lines across 11 subsystems, written by a fleet of AI agents under orchestration.
 
