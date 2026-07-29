@@ -42,6 +42,44 @@ const SETTLE = Number(args.settle ?? 90);
  */
 const QUERY = typeof args.query === 'string' ? `&${args.query}` : '';
 
+/**
+ * **最初の GPU 検証エラーだけを抜き出して先頭に出す。**
+ *
+ * ## なぜ必要か — このハーネスの欠陥で数時間を溶かした
+ *
+ * WebGPU では 1 つの不正パイプラインを SetPipeline した時点で、**そのフレームの
+ * コマンドバッファ全体が invalid になり Queue.Submit ごと捨てられる**。結果として
+ * 「1 次エラー 1 件」のあとに「invalid due to a previous error」が数十件続く。
+ *
+ * このツールは以前 `logs.slice(-60)` で **末尾だけ**を出していたため、表示されるのは
+ * 巻き添えエラーばかりで、**原因を名指しする 1 次エラーが必ず流れて消えていた**。
+ *
+ * 実例: パーティクルで画面全体が黒くなる不具合。1 次エラーは
+ *
+ *   Vertex buffer count (10) exceeds the maximum number of vertex buffers (8).
+ *
+ * だったが、表示されるのは「PostProcessRTT-highlights の RenderPipeline が不正」という
+ * **まったく別のパスを指す巻き添え**だけだった。そのため「ポストプロセスとの相互作用」
+ * という誤った仮説を長く追うことになった。
+ *
+ * さらに **Babylon は uncaptured error を console.warn で流す** (error ではない) ので、
+ * type で error だけを拾うフィルタでは捕まらない。
+ */
+function firstGpuError(all) {
+  const primary = all.find(
+    (l) => /GPUValidationError|Vertex buffer count|exceeds the maximum|Error while parsing WGSL/i.test(l)
+        && !/due to a previous error/i.test(l)
+  );
+  if (!primary) return '';
+  return [
+    '',
+    '=== FIRST GPU ERROR (根本原因。以降の "due to a previous error" は巻き添え) ===',
+    primary,
+    '='.repeat(70),
+    '',
+  ].join('\n');
+}
+
 const portOpen = (port) =>
   new Promise((res) => {
     const s = net.connect({ port, host: '127.0.0.1' }, () => (s.destroy(), res(true)));
@@ -143,6 +181,7 @@ try {
     .catch(() => 'n/a');
   if (failed || args.verbose) {
     console.error('GPU:', gpu);
+    console.error(firstGpuError(logs));
     console.error(logs.slice(-60).join('\n'));
   }
   await browser.close();

@@ -259,16 +259,47 @@ Babylon の `ShadowGenerator` は **カメラの layerMask も renderingGroupId 
 という Three 版には存在しなかったバグが生まれる。`owNoShadow` メタデータを
 `addShadowCaster` が弾く仕組みは残してあるが、**そもそも登録しない**のが第一の防衛線。
 
-## fx のパーティクルは既定で無効 (未解決)
+## WebGPU の頂点バッファは 8 スロットまで — 超えるとフレーム全体が黒くなる
 
-**粒子を 1 つでも出すとフレーム全体が真っ黒になる。** エラーもワーニングも出ず、
-`scene.getActiveIndices()` は正常値を返し、キャンバスだけが黒くなる
-(hero ショットの平均輝度 84.1 → 6.0)。
+`maxVertexBuffers = 8`。fx のパーティクルで属性 8 本をそれぞれ別バッファに持たせた
+ところ、`position` + `uv` + 8 = **10 スロット**になり CreateRenderPipeline が失敗した:
 
-`?fxparticles=1` で有効化して調査できる。排除済みの仮説は `src/fx/index.js` の
-`particlesEnabled` のコメントに列挙してある (インスタンシング 3 方式・シェーダ出力・
-discard 後の微分・bounding info・GPU 検証エラー)。**デカール・動的光源・弾痕は
-影響を受けないので動作する。**
+    Vertex buffer count (10) exceeds the maximum number of vertex buffers (8).
+
+**症状が原因と全く結びつかない**のがこの罠の厄介さ。不正なパイプラインを SetPipeline
+した時点で **そのフレームのコマンドバッファ全体が invalid になり Queue.Submit ごと
+捨てられる**ため:
+
+- 粒子を 1 つ出すだけで **画面全体** が真っ黒 (hero の平均輝度 84 → 6)
+- フラグメントを完全透明の固定出力にしても黒い (出力内容は無関係)
+- シェーダにサイズを固定で埋めると板が出る
+  (**未使用属性が effect から削られてスロットが 8 以下に収まるため**。
+   「属性が全部ゼロで届く」ように見えたのも同根)
+- `?post=0` でも黒い (ポストとの相互作用ではない)
+- thin instance に変えても黒い (同じ上限)
+
+**対処**: 8 本を stride 128 byte の 1 本のインターリーブ Buffer にまとめ、
+`Buffer.createVertexBuffer` で view を切り出す。Babylon の WebGPU 実装
+(`webgpuCacheRenderPipeline._getVertexInputDescriptor`) は「同一 GPU バッファを連続
+参照する属性」を 1 layout にまとめるので、**position + uv + データ = 3 スロット**に収まる。
+アップロードも 8 回 → 1 回になる。
+
+**頂点属性を増やすときは常にスロット数を数えること。**
+
+## GPU エラーは「最初の 1 件」だけが原因を名指しする
+
+上の不具合の調査が長引いた直接の原因は **ハーネス側の欠陥**だった。
+
+WebGPU では 1 件の不正パイプラインが以降のすべてを巻き添えにするので、ログは
+「invalid due to a previous error」で埋まる。`tools/capture.mjs` は以前 **末尾 60 行**
+しか出しておらず、表示されるのは巻き添えばかりで **原因を名指しする 1 次エラーが必ず
+流れて消えていた**。そのため「ポストプロセスとの相互作用」という誤った仮説を長く追った。
+
+さらに **Babylon は uncaptured error を `console.warn` で流す** (error ではない)。
+type で error だけを拾うフィルタでは捕まらない。
+
+`capture.mjs` は 1 次エラーを抽出して先頭に出すようになっている (`firstGpuError`)。
+**新しいハーネスを書くときも、末尾ではなく先頭を出すこと。**
 
 ## Havok / Babylon の罠 (実測で踏んだもの)
 
