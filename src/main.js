@@ -1,51 +1,77 @@
 import { Engine } from './core/engine.js';
 import { createConfig } from './core/config.js';
 
-import { RenderSystem } from './render/index.js';
 import { MaterialSystem } from './materials/index.js';
 import { SkySystem } from './sky/index.js';
-import { WorldSystem } from './world/index.js';
+import { RenderSystem } from './render/index.js';
 import { PhysicsSystem } from './physics/index.js';
-import { PlayerSystem } from './player/index.js';
-import { WeaponSystem } from './weapons/index.js';
-import { FxSystem } from './fx/index.js';
-import { AiSystem } from './ai/index.js';
-import { UiSystem } from './ui/index.js';
-import { AudioSystem } from './audio/index.js';
+import { WorldSystem } from './world/index.js';
 
 import { installShotApi } from './dev/shots.js';
-import { prewarm } from './core/prewarm.js';
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
-// Deterministic shutter for the pixel gate: the engine does not schedule its own
-// frames, the driver advances exactly N of them through window.__PUMP__. Opt-in,
-// because tools that measure real frame pacing (tools/perf.mjs) need the loop to
-// free-run. See the long comment in src/dev/shots.js.
+/**
+ * 決定的シャッター用のロックステップ。
+ *
+ * engine 自身はフレームを回さず、ドライバが window.__PUMP__ で正確に N フレーム
+ * 進める。opt-in なのは、実フレームレートを測るツール (tools/profile.mjs) では
+ * ループを自走させる必要があるため。詳細は src/dev/shots.js のコメント。
+ */
 const lockstep = capture && params.get('lockstep') === '1';
 
 const config = createConfig({
   quality: params.get('q') ?? 'ultra',
   deterministic: capture,
+  /**
+   * バックエンドは既定で自動 (WebGPU → 駄目なら WebGL2)。
+   *
+   * **キャプチャ時は必ず明示すること。** バックエンドが違えばピクセルは当然一致
+   * しないので、自動フォールバックが黙って起きた状態でベースラインを撮ると
+   * 「最適化で絵が変わった」と誤診する。tools/capture.mjs は常に ?backend=webgpu を
+   * 付ける。
+   */
+  backend: params.get('backend') ?? undefined,
 });
+
+/**
+ * 切り分け用のフラグ。品質プリセットの個々の機能を URL から落とせる。
+ *
+ * ポストプロセスは互いに影響するうえ、WebGPU のエラーは「どのパスが原因か」を
+ * 教えてくれないことが多い。プリセット単位でしか切り替えられないと二分探索が
+ * できないため、機能ごとの穴を開けてある。
+ */
+for (const [key, flag] of [
+  ['clustered', 'clusteredLights'],
+  ['taa', 'taa'],
+  ['gtao', 'gtao'],
+  ['mblur', 'motionBlur'],
+  ['bloom', 'bloom'],
+]) {
+  const v = params.get(key);
+  if (v === '0') config.q[flag] = false;
+  else if (v === '1') config.q[flag] = true;
+}
+
+// 切り分け用: ?post=0 でポストプロセスを丸ごと外す。
+if (params.get('post') === '0') config.post = false;
 
 const canvas = document.getElementById('game');
 
-const engine = new Engine({ canvas, config });
+// WebGPU の初期化が非同期なので、Engine は静的ファクトリで作る。
+const engine = await Engine.create({ canvas, config });
 
-// Registration order is irrelevant — Registry topo-sorts on static deps.
-engine
-  .add(RenderSystem)
-  .add(MaterialSystem)
-  .add(SkySystem)
-  .add(WorldSystem)
-  .add(PhysicsSystem)
-  .add(PlayerSystem)
-  .add(WeaponSystem)
-  .add(FxSystem)
-  .add(AiSystem)
-  .add(UiSystem)
-  .add(AudioSystem);
+/**
+ * 登録順は無関係 — Registry が static deps でトポロジカルソートする。
+ *
+ * 依存関係:
+ *   materials → (なし)
+ *   sky       → (なし)
+ *   render    → sky   (太陽の DirectionalLight が無いと CSM を作れない)
+ *   physics   → (なし)
+ *   world     → materials, physics, render
+ */
+engine.add(MaterialSystem).add(SkySystem).add(RenderSystem).add(PhysicsSystem).add(WorldSystem);
 
 try {
   await engine.init();
@@ -57,37 +83,23 @@ try {
        font:12px/1.5 ui-monospace,monospace;overflow:auto;z-index:9999;white-space:pre-wrap">
 BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
   );
+  window.__BOOT_ERROR__ = String(err.stack ?? err.message);
+  window.__READY__ = true; // ハーネスがタイムアウトせず失敗を報告できるようにする
   throw err;
 }
 
 const shotApi = installShotApi(engine, { capture, lockstep });
 
-// Compile every shader permutation before the frame loop starts. Measured: without
-// this, 86 programs compile lazily during play, up to 30 on one frame, producing
-// 3.1-3.9 SECOND stalls. See src/core/prewarm.js.
-//
-// ON BY DEFAULT since the capture path was made frame-deterministic; opt out with
-// `?prewarm=0`. It is now PROVEN pixel-neutral: `tools/baseline.mjs` with
-// `--query=prewarm=0` vs `--query=prewarm=1` reports identical:true on all 11
-// shots (0 changed pixels, maxDelta 0). The two things that previously made the
-// ~1.4 s pre-warm spend look like a visual change were both boot-duration
-// couplings OUTSIDE the subsystems: (1) the shutter frame index was latency-bound
-// because the engine kept stepping through the driver's round trips — fixed by
-// lockstep in src/dev/shots.js; (2) `will-change: transform` on the compass strip
-// cached a composited-layer raster taken at a wall-clock-dependent moment — fixed
-// in src/ui/style.js.
-const warmup = params.get('prewarm') === '0' ? { ok: false, reason: 'disabled by ?prewarm=0' } : await prewarm(engine);
-console.info('[boot] prewarm', warmup);
-window.__PREWARM__ = warmup;
-
 engine.start();
 
-// Capture harness handshake: only flag ready once a frame has actually landed.
-//
-// BOOT_FRAMES is deliberately a frame COUNT, not a rAF race. In lockstep mode the
-// engine has no loop of its own, so we hand-pump exactly this many frames and only
-// then raise __READY__; the shot is therefore always applied at engine frame 3, no
-// matter how long boot (or pre-warm) took in wall-clock terms.
+/**
+ * キャプチャハーネスとのハンドシェイク。**フレームが実際に landed してから** ready
+ * を立てる。
+ *
+ * BOOT_FRAMES は意図的に「フレーム数」であって rAF レースではない。ロックステップでは
+ * engine が自分のループを持たないので、この数だけ手で送ってから __READY__ を立てる。
+ * したがってショットは常に engine frame 3 で適用され、boot が何秒かかろうと変わらない。
+ */
 const BOOT_FRAMES = 3;
 if (lockstep) {
   await shotApi.pump(BOOT_FRAMES);
@@ -105,6 +117,7 @@ if (lockstep) {
 }
 
 window.__ENGINE__ = engine;
+window.__BACKEND__ = engine.backend;
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => engine.dispose());

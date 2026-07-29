@@ -12,6 +12,7 @@
  *   node tools/capture.mjs --list
  */
 import { chromium } from 'playwright';
+import { WEBGPU_FLAGS, CHROMIUM_CHANNEL } from './chromium-flags.mjs';
 import { spawn } from 'node:child_process';
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -32,6 +33,14 @@ const OUT = resolve(args.out ?? `shots/${SHOT}.png`);
 const TIMEOUT = Number(args.timeout ?? 90000);
 // Frames to render before capture: lets TAA converge, streaming settle, LOD pick.
 const SETTLE = Number(args.settle ?? 90);
+/**
+ * URL に足す追加クエリ (例: --query=q=low&clustered=0)。
+ *
+ * 機能の切り分けに要る。baseline.mjs は元から持っていたが capture.mjs には無く、
+ * 「フラグを足したのに効いていない」ことに気付かないまま切り分けを進める事故が
+ * 起きたので揃えた。
+ */
+const QUERY = typeof args.query === 'string' ? `&${args.query}` : '';
 
 const portOpen = (port) =>
   new Promise((res) => {
@@ -62,18 +71,9 @@ const server = await ensureServer();
 
 const browser = await chromium.launch({
   headless: true,
-  args: [
-    '--use-angle=metal',
-    '--enable-unsafe-webgpu',
-    '--ignore-gpu-blocklist',
-    '--enable-gpu-rasterization',
-    '--enable-zero-copy',
-    '--disable-frame-rate-limit',
-    '--force-color-profile=srgb',
-    '--force-device-scale-factor=1',
-    '--hide-scrollbars',
-    '--mute-audio',
-  ],
+  // WebGPU を掴むには軽量な headless-shell ではなく full Chrome binary が要る。
+  channel: CHROMIUM_CHANNEL,
+  args: WEBGPU_FLAGS,
 });
 
 const page = await browser.newPage({
@@ -87,7 +87,7 @@ page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}\n${e.stack ?? ''
 
 let failed = null;
 try {
-  await page.goto(`http://127.0.0.1:${PORT}/?capture=1&shot=${encodeURIComponent(SHOT)}`, {
+  await page.goto(`http://127.0.0.1:${PORT}/?capture=1&backend=webgpu&shot=${encodeURIComponent(SHOT)}${QUERY}`, {
     waitUntil: 'domcontentloaded',
     timeout: TIMEOUT,
   });
@@ -127,13 +127,18 @@ try {
 } catch (e) {
   failed = e;
 } finally {
+  // 実際に使われたバックエンドを記録する。WebGL2 に落ちたベースラインと WebGPU の
+  // ベースラインを取り違えると「最適化で絵が変わった」と誤診するため。
   const gpu = await page
-    .evaluate(() => {
-      const c = document.createElement('canvas');
-      const gl = c.getContext('webgl2');
-      if (!gl) return 'NO WEBGL2';
-      const d = gl.getExtension('WEBGL_debug_renderer_info');
-      return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    .evaluate(async () => {
+      const backend = window.__BACKEND__ ?? 'unknown';
+      let adapter = 'n/a';
+      if (navigator.gpu) {
+        const a = await navigator.gpu.requestAdapter();
+        const info = a?.info ?? {};
+        adapter = `${info.vendor ?? '?'}/${info.architecture ?? '?'}`;
+      }
+      return `${backend} (${adapter})`;
     })
     .catch(() => 'n/a');
   if (failed || args.verbose) {

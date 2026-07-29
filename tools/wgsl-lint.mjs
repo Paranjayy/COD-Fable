@@ -62,6 +62,40 @@ const TYPED = /\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:vec[234][fiu]?|f32|i32|u32|bo
 
 const findings = [];
 
+/**
+ * WGSL 文字列 (テンプレートリテラル) の中にバッククォートが書かれていないか調べる。
+ *
+ * ## なぜ必要か — これも実際に起きた事故 (2 回)
+ *
+ * WGSL は JS のテンプレートリテラルに埋め込んでいる。その中の JSDoc に
+ * 「識別子をバッククォートで囲む」という普通の書き方をすると、**リテラルがそこで
+ * 終端して JS の構文エラーになる**。しかもエラーメッセージは
+ * 「Unexpected identifier 'eye'」のように、原因と全く無関係に見える文言になる。
+ *
+ * 予約語チェックと違い、これはブラウザを起動する前に JS のパース時点で落ちるので
+ * 発見はできる。ただしメッセージから原因に辿り着くのに時間がかかるため、ここで
+ * 「バッククォートが原因である」と名指しできるようにしておく。
+ */
+function findBacktickInWgsl(src, path) {
+  const out = [];
+  const lines = src.split('\n');
+  let inside = false;
+  lines.forEach((line, i) => {
+    if (!inside && /\/\* wgsl \*\/ `/.test(line)) {
+      inside = true;
+      return;
+    }
+    if (inside && /^\s*`;?\s*$|^\s*`,\s*$/.test(line)) {
+      inside = false;
+      return;
+    }
+    if (inside && line.includes('`')) {
+      out.push({ file: path, line: i + 1, identifier: '`', text: line.trim(), kind: 'backtick' });
+    }
+  });
+  return out;
+}
+
 for (const dir of WGSL_DIRS) {
   let files;
   try {
@@ -73,6 +107,7 @@ for (const dir of WGSL_DIRS) {
     const path = join(dir, f);
     const src = readFileSync(path, 'utf8');
     const lines = src.split('\n');
+    findings.push(...findBacktickInWgsl(src, path.replace(ROOT + '/', '')));
     for (const re of [DECL, TYPED]) {
       re.lastIndex = 0;
       let m;
@@ -100,14 +135,22 @@ const unique = findings.filter((f) => {
 });
 
 if (unique.length) {
-  console.error('WGSL reserved-word identifiers found:\n');
+  console.error('WGSL lint findings:\n');
   for (const f of unique) {
-    console.error(`  ${f.file}:${f.line}  "${f.identifier}" is reserved`);
-    console.error(`    ${f.text}`);
+    if (f.kind === 'backtick') {
+      console.error(`  ${f.file}:${f.line}  WGSL リテラル内にバッククォートがあります`);
+      console.error(`    ${f.text}`);
+      console.error(
+        '    → テンプレートリテラルがここで終端し、無関係に見える JS 構文エラーになります。'
+      );
+    } else {
+      console.error(`  ${f.file}:${f.line}  "${f.identifier}" is reserved`);
+      console.error(`    ${f.text}`);
+      console.error(
+        '    → シェーダが黙って失敗します (例外なし / isReady()=true / 絵は真っ黒)。改名してください。'
+      );
+    }
   }
-  console.error(
-    '\nこれらはシェーダを黙って失敗させます (例外なし / isReady()=true / 絵は真っ黒)。改名してください。'
-  );
   process.exit(1);
 }
 

@@ -73,21 +73,34 @@ fn opticalDepthToSun(pos: vec3f, sunDir: vec3f) -> vec2f {
 /**
  * 視線方向の空の色。
  *
- * `eye` は地表からの高度を足した位置、`dir` は視線、`sunDir` は太陽方向。
+ * eye は地表からの高度を足した位置、dir は視線、sunDir は太陽方向。
  * 戻り値は **線形 HDR** — トーンマップは render 側の責務。
  */
 fn skyRadiance(eye: vec3f, dir: vec3f, sunDir: vec3f, sunIntensity: f32, turbidity: f32) -> vec3f {
   let atmos = raySphere(eye, dir, R_ATMOS);
   if (atmos.y < 0.0) { return vec3f(0.0); }
 
-  // 地面に当たる視線は地面までで打ち切る (地平線より下)。
-  let ground = raySphere(eye, dir, R_GROUND);
-  var tMax = atmos.y;
-  if (ground.y > 0.0 && ground.x > 0.0) { tMax = ground.x; }
+  /**
+   * 地平線より下の視線について。
+   *
+   * 素直に「地面に当たったらそこで打ち切る」と、観測点が地表 +1m しかないため
+   * 下向きの視線は **ほぼ即座に地面に当たり積分がゼロになる**。結果として空
+   * ドームの下半分が真っ黒になり、しかも上半分との境界が硬い線として出る。
+   *
+   * このドームの下半分はワールドジオメトリでほぼ隠れるので、ここでは打ち切らず
+   * 「地平線方向の色をそのまま延長する」ことにする。視線の y を僅かに持ち上げて
+   * 積分することで、地平線の色が下方向へ連続的に伸びる。物理的には正しくないが、
+   * 隠れる領域のために球面積分を厳密に解く価値はない。
+   */
+  var d = dir;
+  if (d.y < 0.0) {
+    d = normalize(vec3f(d.x, mix(0.0, 0.02, clamp(-d.y * 4.0, 0.0, 1.0)), d.z));
+  }
+  let tMax = atmos.y;
 
   let steps = 16;
   let dt = tMax / f32(steps);
-  let mu = dot(dir, sunDir);
+  let mu = dot(d, sunDir);
   let pr = rayleighPhase(mu);
   let pm = miePhase(mu, MIE_G);
 
@@ -99,7 +112,7 @@ fn skyRadiance(eye: vec3f, dir: vec3f, sunDir: vec3f, sunIntensity: f32, turbidi
   var depth = vec2f(0.0);
 
   for (var i = 0; i < steps; i = i + 1) {
-    let p = eye + dir * ((f32(i) + 0.5) * dt);
+    let p = eye + d * ((f32(i) + 0.5) * dt);
     let h = max(0.0, length(p) - R_GROUND);
     let dens = vec2f(exp(-h / H_RAYLEIGH), exp(-h / H_MIE)) * dt;
     depth = depth + dens;
@@ -145,7 +158,7 @@ fn sunDisc(dir: vec3f, sunDir: vec3f, intensity: f32) -> vec3f {
  * ディザ。空のグラデーションは画面の広い面積を緩やかに変化するため、8bit 出力では
  * 必ずバンディングが出る。±0.5/255 の雑音を足して量子化境界を散らす。
  *
- * ハッシュは整数演算で書く。materials/wgsl/noise.js と同じ理由で、`sin` ベースの
+ * ハッシュは整数演算で書く。materials/wgsl/noise.js と同じ理由で、sin ベースの
  * ハッシュは GPU ベンダごとに精度が違い、同じコードが別マシンで別の絵を出す。
  * ディザは振幅こそ小さいが全画素に乗るので、ピクセル一致ゲートには致命的。
  *
@@ -153,7 +166,8 @@ fn sunDisc(dir: vec3f, sunDir: vec3f, intensity: f32) -> vec3f {
  */
 fn dither(px: vec2f) -> f32 {
   let u = vec2u(vec2i(px));
-  var h = u.x * 0x9e3779b9u ^ u.y * 0x85ebca6bu;
+  // WGSL は '*' と '^' の混在に明示の括弧を要求する (C と違い暗黙の優先順位を許さない)。
+  var h = (u.x * 0x9e3779b9u) ^ (u.y * 0x85ebca6bu);
   h ^= h >> 15u; h *= 0x2c1b3c6du;
   h ^= h >> 12u;
   return (f32(h & 0xffffu) / 65536.0 - 0.5) / 255.0;

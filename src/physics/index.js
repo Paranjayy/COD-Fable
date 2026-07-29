@@ -97,6 +97,18 @@ import {
   CharacterSupportedState,
 } from '@babylonjs/core/Physics/v2/characterController.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+/**
+ * **副作用 import。消さないこと。**
+ *
+ * Babylon はツリーシェイキング前提の構成で、`scene.enablePhysics()` /
+ * `scene.getPhysicsEngine()` は Scene のプロトタイプに **このモジュールが拡張として
+ * 生やす**。import しないと `enablePhysics` が存在せず、しかも
+ * 「Cannot read properties of undefined (reading 'setTimeStep')」のように
+ * 一段先で落ちるため原因が分かりにくい。
+ *
+ * 「使っていない import」に見えるので、lint やエディタの自動整理で消されやすい。
+ */
+import '@babylonjs/core/Physics/joinedPhysicsEngineComponent.js';
 
 import { UNITS } from '../core/config.js';
 import { loadHavok } from './havok.js';

@@ -6,10 +6,25 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight.js';
 import { ReflectionProbe } from '@babylonjs/core/Probes/reflectionProbe.js';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Vector3, Vector4 } from '@babylonjs/core/Maths/math.vector.js';
 import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import { Constants } from '@babylonjs/core/Engines/constants.js';
-import { CubeMapToSphericalPolynomialTools } from '@babylonjs/core/Misc/HighDynamicRange/cubemapToSphericalPolynomial.js';
+import { SphericalHarmonics, SphericalPolynomial } from '@babylonjs/core/Maths/sphericalPolynomial.js';
+/**
+ * **副作用 import。消さないこと。**
+ *
+ * `BaseTexture.sphericalPolynomial` は Babylon 9 ではツリーシェイキング対象で、
+ * このモジュールを import して初めてプロパティが生える。無いと素の baseTexture が
+ * 「未実装プロパティ」のスタブを返す。
+ *
+ * 質の悪いことに、PBR 側は **反射テクスチャがキューブなら SH を使うと決め打つ**
+ * (materialHelper.functions.js: 「Assume using spherical polynomial if the
+ * reflection texture is a cube map」)。したがって import を忘れると、描画のたびに
+ * `BindIBLParameters` が `polynomials.l00` を読もうとして
+ * 「Cannot read properties of undefined」で落ちる。エラーは sky ではなく
+ * PBRMaterial.bindForSubMesh に出るので、原因に辿り着きにくい。
+ */
+import '@babylonjs/core/Materials/Textures/baseTexture.polynomial.js';
 
 import { WGSL_ATMOSPHERE } from './wgsl/atmosphere.js';
 
@@ -58,6 +73,8 @@ export class SkySystem {
     this.weather = { ...DEFAULT_WEATHER };
     this._envDirty = true;
     this._envAccum = 0;
+    /** skyParams の再利用バッファ。毎フレーム new しない (Hard rule 5)。 */
+    this._skyParams = new Vector4(0, 0, 0, 0);
   }
 
   async init(ctx) {
@@ -289,12 +306,18 @@ export class SkySystem {
     mat.setVector3('sunDir', this.sunDir);
     mat.setVector3('moonDir', this.moonDir);
     mat.setVector3('camPos', this.ctx.camera.globalPosition);
-    mat.setFloats('skyParams', [
+    /**
+     * vec4f の uniform は **setVector4 で渡すこと**。setFloats は「float の配列」用で、
+     * vec4f に使うと Babylon が配列 uniform として扱い
+     * UniformBuffer.updateUniformArray の中で落ちる。
+     */
+    this._skyParams.set(
       this.weather.sunIntensity,
       this.weather.turbidity,
       this.moon.intensity,
-      0,
-    ]);
+      0
+    );
+    mat.setVector4('skyParams', this._skyParams);
   }
 
   /* ================================================================== */
@@ -314,22 +337,84 @@ export class SkySystem {
     cube.refreshRate = 0;
 
     /**
-     * 拡散環境光用の SH を作り直す。
+     * 拡散環境光の球面調和 (SH) を **空モデルから直接構築する**。
      *
-     * これが無いと Babylon は環境キューブの最下位ミップで拡散を近似する。絵は出るが
-     * 日没時に「空は赤いのに物体は青いまま」という破綻が出る。SH なら方向ごとの色が
-     * 正しく効く。
+     * ## なぜプローブから読み戻さないのか
      *
-     * 失敗しても致命的ではない (拡散がやや不正確になるだけ) ので握り潰す。ここで
-     * 例外を投げて起動を止めるほうが害が大きい。
+     * 最初は CubeMapToSphericalPolynomialTools でプローブのキューブから SH を
+     * 計算していたが、WebGPU では RenderTargetTexture の同期読み戻しができず
+     * null が返る。そして PBR 側は **反射テクスチャがキューブなら SH を使うと
+     * 決め打つ** (materialHelper.functions.js の「Assume using spherical polynomial
+     * if the reflection texture is a cube map」)。結果、描画のたびに
+     * BindIBLParameters が polynomials.l00 を読もうとして落ちる。
+     *
+     * 大気モデルは CPU 側でも安く評価できるので、方向をサンプリングして SH に
+     * 積む方が確実で速い。読み戻しも非同期待ちも要らない。
+     *
+     * ## サンプリング数について
+     *
+     * SH の 2 次までしか使わないので、方向は 64 本もあれば十分に滑らかになる。
+     * これは「解像度」ではなく「低次の積分精度」の問題で、増やしても拡散光は
+     * ほとんど変わらない。
      */
-    try {
-      const sp = CubeMapToSphericalPolynomialTools.ConvertCubeMapTextureToSphericalPolynomial(cube);
-      if (sp) cube.sphericalPolynomial = sp;
-    } catch (err) {
-      console.warn('[sky] SH 生成に失敗しました (拡散環境光がやや不正確になります):', err);
+    const sh = new SphericalHarmonics();
+    const N = 64;
+    // フィボナッチ球で方向を均等に散らす。格子状に取ると極が密になる。
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const dOmega = (4 * Math.PI) / N;
+    for (let i = 0; i < N; i++) {
+      const y = 1 - (i / (N - 1)) * 2;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const th = golden * i;
+      const dir = new Vector3(Math.cos(th) * r, y, Math.sin(th) * r);
+      const c = this._skyColorFor(dir);
+      sh.addLight(dir, c, dOmega);
     }
+    // レンダリング用のスケーリング (Babylon の規約に合わせる)。
+    sh.preScaleForRendering();
+    cube.sphericalPolynomial = SphericalPolynomial.FromHarmonics(sh);
+
     this._envDirty = false;
+  }
+
+  /**
+   * 指定方向の空の色を CPU 側で概算する。SH の構築にだけ使う。
+   *
+   * シェーダの積分を再現するのではなく「上は空色、下は地面の反射、太陽の側は
+   * 暖かい」という 3 要素の合成で近似する。拡散環境光は方向の低周波成分しか
+   * 使わないので、この程度の近似で見た目は破綻しない。
+   */
+  _skyColorFor(dir) {
+    const up = this.sunDir?.y ?? 0.5;
+    const day = clamp01((up + 0.12) / 0.32);
+    const horizon = this._horizonColor();
+    // 天頂は地平線より青く暗い。
+    const zenith = new Color3(horizon.r * 0.55, horizon.g * 0.72, horizon.b * 1.15);
+    const t = clamp01(dir.y * 0.5 + 0.5);
+    // 地面からの照り返し。砂の街なので暖色。
+    const ground = new Color3(0.16 * day + 0.01, 0.13 * day + 0.01, 0.09 * day + 0.012);
+
+    const skyMix = new Color3(
+      horizon.r + (zenith.r - horizon.r) * Math.max(0, dir.y),
+      horizon.g + (zenith.g - horizon.g) * Math.max(0, dir.y),
+      horizon.b + (zenith.b - horizon.b) * Math.max(0, dir.y)
+    );
+    const c = new Color3(
+      ground.r + (skyMix.r - ground.r) * t,
+      ground.g + (skyMix.g - ground.g) * t,
+      ground.b + (skyMix.b - ground.b) * t
+    );
+
+    // 太陽の側は明るく暖かい。太陽そのものは DirectionalLight が担うので、
+    // ここでは周囲のハロぶんだけ足す。
+    if (this.sunDir) {
+      const mu = Math.max(0, Vector3.Dot(dir, this.sunDir));
+      const halo = mu ** 8 * 0.9 * day;
+      c.r += halo * 1.0;
+      c.g += halo * 0.82;
+      c.b += halo * 0.6;
+    }
+    return c;
   }
 
   /* ================================================================== */

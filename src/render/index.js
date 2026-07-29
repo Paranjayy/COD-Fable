@@ -5,6 +5,25 @@ import { MotionBlurPostProcess } from '@babylonjs/core/PostProcesses/motionBlurP
 import { CascadedShadowGenerator } from '@babylonjs/core/Lights/Shadows/cascadedShadowGenerator.js';
 import { ClusteredLightContainer } from '@babylonjs/core/Lights/Clustered/clusteredLightContainer.js';
 import { ImageProcessingConfiguration } from '@babylonjs/core/Materials/imageProcessingConfiguration.js';
+/**
+ * **副作用 import。消さないこと。**
+ *
+ * Babylon 9 はエンジンの機能もツリーシェイキングする。MRT (複数レンダーターゲット)
+ * は既定では生えておらず、これを import しないと GeometryBufferRenderer が
+ * 「this._getEngine(...).createMultipleRenderTarget is not a function」で落ちる。
+ * SSAO2 が depth/normal を得るのに GeometryBufferRenderer を使うため必須。
+ *
+ * 「使っていない import」に見えるので lint やエディタの自動整理で消されやすい。
+ */
+import '@babylonjs/core/Engines/Extensions/engine.multiRender.js';
+/**
+ * WebGPU 用の MRT 実装。**上の import とは別物なので両方要る。**
+ *
+ * Engines/Extensions/ 側は ThinEngine (WebGL 系) に生やすもので、WebGPUEngine には
+ * Engines/WebGPU/Extensions/ 側が必要。片方だけだと WebGPU 実行時に同じ
+ * 「createMultipleRenderTarget is not a function」で落ちる。
+ */
+import '@babylonjs/core/Engines/WebGPU/Extensions/engine.multiRender.js';
 
 /**
  * RENDER — HDR パイプライン、影、ポストプロセス、露出。
@@ -65,8 +84,16 @@ export class RenderSystem {
 
     this._setupImageProcessing(ctx);
     this._setupShadows(ctx, q);
-    this._setupClusteredLights();
-    this._setupPipelines(ctx, q);
+    this._setupClusteredLights(q);
+    /**
+     * ?post=0 でポストチェインを丸ごと飛ばせる。
+     *
+     * 「シーンは描けているがポストが画面を食っている」のか「そもそも何も描けて
+     * いない」のかを切り分けるのに要る。エラーが出ないまま真っ黒になる失敗は、
+     * この 2 つを分けないと原因に近づけない。
+     */
+    if (ctx.config.post !== false) this._setupPipelines(ctx, q);
+    else console.info('[render] ポストプロセスは ?post=0 で無効化されています。');
 
     ctx.events.on('resize', ({ width, height }) => {
       this.screenSize.width = width;
@@ -173,7 +200,12 @@ export class RenderSystem {
   /* Clustered lights                                                   */
   /* ================================================================== */
 
-  _setupClusteredLights() {
+  _setupClusteredLights(q) {
+    if (q.clusteredLights === false) {
+      console.info('[render] clustered lighting は設定で無効化されています。');
+      this.clustered = null;
+      return;
+    }
     /**
      * WebGL2 では clustered lighting が使えない環境がある。使えない場合はコンテナを
      * 作らず addLight() を素通しにする (ライトはシーンに直接効く)。この経路では
@@ -267,8 +299,9 @@ export class RenderSystem {
     pipe.grain.intensity = 3.2;
     pipe.grain.animated = !ctx.config.deterministic;
     pipe.chromaticAberrationEnabled = true;
-    pipe.chromaticAberration.aberrationAmount = 12;
-    pipe.chromaticAberration.radialIntensity = 0.6;
+    // 12 は強すぎて輪郭に赤緑の斑点が出た (実測)。実写のレンズ収差はもっと控えめ。
+    pipe.chromaticAberration.aberrationAmount = 2.4;
+    pipe.chromaticAberration.radialIntensity = 0.5;
 
     this.pipeline = pipe;
 
@@ -278,11 +311,22 @@ export class RenderSystem {
        * Three 版は GTAO を自前実装していた。Babylon の SSAO2 は水平ベースだが実装済み
        * で安定している。ssaoRatio は解像度比 — 0.5 で半解像度。
        */
+      /**
+       * 第 5 引数 `forceGeometryBuffer = true` が必須。
+       *
+       * これを省くと SSAO2 は prepass 経路を選ぶが、prepass のレンダーターゲットは
+       * このパイプライン構成では初期化が間に合わず、毎フレーム
+       * 「Cannot read properties of undefined (reading '2')」で落ちる
+       * (`prePassRenderer.getRenderTarget().textures[getIndex(5)]` の textures が
+       * undefined)。GeometryBufferRenderer 経路なら depth/normal を自前で持つので
+       * 順序に依存しない。
+       */
       const ssao = new SSAO2RenderingPipeline(
         'owSsao',
         this.scene,
         { ssaoRatio: 0.5, blurRatio: 1 },
-        [cam]
+        [cam],
+        true
       );
       ssao.radius = 1.1;
       ssao.totalStrength = 1.05;
@@ -316,10 +360,38 @@ export class RenderSystem {
     // --- モーションブラー ---------------------------------------------
     if (q.motionBlur) {
       /**
-       * オブジェクト単位のモーションブラー。velocity バッファを要求するので、
-       * 有効にすると prepass のコストが乗る。
+       * オブジェクト単位のモーションブラー。velocity バッファを要求する。
+       *
+       * **最後の引数 `forceGeometryBuffer = true` が必須。**
+       *
+       * SSAO2 と MotionBlur は両方とも depth/normal/velocity を必要とするが、既定では
+       * 前者を GeometryBufferRenderer、後者を prepass から取ろうとする。2 つの経路が
+       * 同時に生きると WebGPU のバインドグループが食い違い、**両方を有効にしたときだけ**
+       * 毎フレーム
+       * 「Failed to execute 'createBindGroup' ... 'resource' ... Required member is
+       *  undefined」で落ちる。
+       *
+       * 実際に二分探索で確かめた挙動 (q=high, 640x360, settle=20):
+       *   taa=0       → 9 件のエラー (TAA は無関係)
+       *   gtao=0      → 0 件
+       *   mblur=0     → 0 件
+       *   clustered=0 → 12 件 (clustered も無関係)
+       *
+       * つまり「SSAO2 と MotionBlur の両方が有効なとき」だけの問題。両方を
+       * GeometryBufferRenderer に揃えると経路が 1 本になり解消する。
        */
-      const mb = new MotionBlurPostProcess('owMotionBlur', this.scene, 1.0, cam);
+      const mb = new MotionBlurPostProcess(
+        'owMotionBlur',
+        this.scene,
+        1.0,
+        cam,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true
+      );
       mb.motionStrength = 0.6;
       mb.motionBlurSamples = 12;
       mb.isObjectBased = true;
@@ -363,10 +435,28 @@ export class RenderSystem {
    *
    * `scene.render()` が影・プリパス・ポストを含めて全部やる。Three 版のようにパスを
    * 手で並べる必要はない。
+   *
+   * ## beginFrame() / endFrame() を必ず自分で呼ぶこと
+   *
+   * Babylon の通常の使い方は `engine.runRenderLoop(() => scene.render())` で、この
+   * **runRenderLoop がフレームの前後で beginFrame() と endFrame() を呼んでいる**。
+   * このプロジェクトは決定的キャプチャのために自前でループを回している
+   * (core/engine.js の step()) ので、その 2 つは誰も呼んでくれない。
+   *
+   * WebGL では省いてもほぼ動いてしまうが、**WebGPU では endFrame() がコマンド
+   * バッファの submit と present を行う**ため、省くと:
+   *
+   *   - 例外は一切出ない
+   *   - scene.getActiveIndices() は正しい値を返す (シーンは「描いている」)
+   *   - しかしキャンバスは完全に真っ黒
+   *
+   * という、原因に辿り着きにくい形で失敗する。実際この移植で数十分を溶かした。
    */
   render() {
     this.frame++;
+    this.renderer.beginFrame();
     this.scene.render();
+    this.renderer.endFrame();
   }
 
   resize(w, h) {
