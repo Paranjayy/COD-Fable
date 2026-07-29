@@ -238,18 +238,31 @@ class Character {
     const bx = ctrl.getPosition().x;
     const bz = ctrl.getPosition().z;
 
-    // calculateMovement は「地面の速度 (動く床) と現在速度と希望速度」から実際に
-    // 適用すべき速度を作る。傾斜を滑り落ちる挙動もここに含まれる。
-    const desired = ctrl.calculateMovement(
-      dt,
-      this.system.forwardHint,
-      info.averageSurfaceNormal,
-      ctrl.getVelocity(),
-      info.averageSurfaceVelocity,
-      _v0,
-      this.system.upDir
-    );
-    ctrl.setVelocity(desired);
+    /**
+     * 速度の決め方 — **接地時と空中で経路を分ける**。
+     *
+     * `calculateMovement` は「動く床の速度・現在速度・希望速度」から適用速度を作り、
+     * 傾斜を滑り落ちる挙動まで含めてくれる。接地しているときはこれが正しい。
+     *
+     * だが **空中では使わない**。この関数は面の法線を前提にしており、支持面が無い
+     * ときに渡すと落下速度 (y) を潰してしまう。結果としてキャラクタが空中で
+     * 静止し、永久に接地しない。呼び出し側 (player/movement.js) が重力を積んで
+     * いるので、空中ではその速度をそのまま使うのが正しい。
+     */
+    if (supported) {
+      const desired = ctrl.calculateMovement(
+        dt,
+        this.system.forwardHint,
+        info.averageSurfaceNormal,
+        ctrl.getVelocity(),
+        info.averageSurfaceVelocity,
+        _v0,
+        this.system.upDir
+      );
+      ctrl.setVelocity(desired);
+    } else {
+      ctrl.setVelocity(_v0);
+    }
     ctrl.integrate(dt, info, this.system.gravity);
 
     const after = ctrl.getPosition();

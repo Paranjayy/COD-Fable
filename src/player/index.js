@@ -60,12 +60,44 @@ export class PlayerSystem {
       stepHeight: STANCE.stand.stepHeight,
       slopeLimit: 52,
     });
+    this._snapToGround(spawn.position);
 
     this.movement = new Movement(this.physics, this.rng).attach(this.character);
     this.camera = new CameraRig(ctx.config, this.rng);
     this.camera.yaw = spawn.yaw ?? 0;
 
     this._wireEvents(ctx);
+  }
+
+  /**
+   * スポーン位置を地面に載せる。
+   *
+   * `world.spawn()` の座標は「だいたいこのあたり」を示すもので、地形の高さまでは
+   * 持っていない。そのまま使うとカプセルが空中から落ちるところから始まり:
+   *
+   *   - 落下中は接地していないので **空中制御の弱い加速しか効かない**
+   *   - 実測で、W を 45 フレーム押しても 0.94 m しか進まなかった (期待は約 3.4 m)。
+   *     半分以上のフレームを落下に使っていた
+   *   - キャプチャのショットでも、最初の数フレームだけ絵が動いてしまう
+   *
+   * 真下にレイを落として、足がその高さに来るようカプセル中心を置き直す。
+   * 地面が見つからない場合は spawn の値をそのまま使う (奈落に落ちるのを避ける)。
+   */
+  _snapToGround(position) {
+    /**
+     * **キャストの開始点を高くしすぎないこと。**
+     *
+     * 最初 `position.y + 6` から落としたところ、市場の屋台の日除け (高さ 2.05 m) や
+     * 建物の庇を拾ってしまい、スポーンが 1.8 m → 4.04 m に **上がった**。
+     * 「地面を探す」つもりが「頭上の一番近い天井」を探していた。
+     *
+     * spawn はプレイヤーの立ち位置を指しているので、そこから少し上
+     * (カプセル中心 + 0.5 m) を開始点にすれば、頭上の構造物より下から探し始められる。
+     */
+    const y = this.physics.groundHeight(position.x, position.z, position.y + 0.5);
+    if (!Number.isFinite(y)) return;
+    // 足がその高さに来るようカプセル中心を置く。わずかに浮かせてめり込みを防ぐ。
+    this.character.teleport(position.x, y + STANCE.stand.height * 0.5 + 0.02, position.z);
   }
 
   _wireEvents(ctx) {

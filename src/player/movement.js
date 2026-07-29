@@ -1,4 +1,4 @@
-import { STANCE, MOVE, JUMP_SPEED } from './tuning.js';
+import { STANCE, MOVE, JUMP_SPEED, GRAVITY } from './tuning.js';
 import { clamp, clamp01, approach } from './springs.js';
 
 /**
@@ -148,7 +148,30 @@ export class Movement {
 
     this._updateJump(h, cmd);
 
-    // physics には「速度」を渡す。重力とスロープ処理は Havok 側が行う。
+    /**
+     * **重力は自分で積む。**
+     *
+     * Babylon の `PhysicsCharacterController.integrate(dt, info, gravity)` は
+     * 「与えられた速度で位置を進める」ことはするが、**gravity を速度に積算しない**。
+     * これを Havok 任せだと思い込んでいたため、キャラクタが一切落下せず、
+     * 結果として永久に接地せず (supportedState = UNSUPPORTED)、地上の加速度ではなく
+     * 空中制御の弱い加速だけが効く状態になっていた。
+     *
+     * 症状は「W を押しても 1 フレームあたり数ミリしか進まない」で、入力もイベントも
+     * 正常なので原因が分かりにくい。実測で切り分けた:
+     *
+     *   ctrl.integrate() を重力だけで呼ぶ  → 位置は 1mm も動かない
+     *   ctrl.setVelocity(3,0,0) してから    → 0.025 m 進む (= 3 m/s * 1/120 s)
+     *
+     * つまり integrate は速度を消費するだけ。速度を作るのは呼び出し側の責務。
+     */
+    if (this.grounded && this.velocity.y < 0) {
+      // 接地中は下向き速度を溜めない。溜めると坂を降りるときに跳ねる。
+      this.velocity.y = 0;
+    } else {
+      this.velocity.y = Math.max(-MOVE.terminalSpeed, this.velocity.y + GRAVITY * h);
+    }
+
     c.move(this.velocity.x, this.velocity.y, this.velocity.z);
     this._syncFromCharacter(c);
     this._accumulateStride(h);
