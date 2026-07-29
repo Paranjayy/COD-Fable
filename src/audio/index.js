@@ -29,6 +29,8 @@
  * picked up as well.
  */
 
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+
 import { NoiseBank, SPEED_OF_SOUND, clamp, gain as mkGain } from './dsp.js';
 import { Mixer } from './mixer.js';
 import { SpatialField } from './spatial.js';
@@ -45,6 +47,17 @@ const PROBE_RAYS = 9;
 const PROBE_DIST = 40;
 const DRY_SLOTS = 48;
 const GESTURES = ['pointerdown', 'mousedown', 'keydown', 'touchstart', 'wheel'];
+
+/**
+ * カメラのローカル軸。`scene.useRightHandedSystem = true` (src/core/engine.js)
+ * なので前方は -Z。ここを +Z にすると前後の定位が丸ごと反転し、しかも「音は
+ * 鳴っている」ので気づきにくい。
+ *
+ * モジュールスコープの定数にしてあるのは、毎フレーム Vector3 を作らないため
+ * (ARCHITECTURE Hard rule 5)。読み取り専用として扱うこと。
+ */
+const FORWARD_LOCAL = new Vector3(0, 0, -1);
+const UP_LOCAL = new Vector3(0, 1, 0);
 
 /** Names other subsystems already use, mapped onto our voices. */
 const UI_ALIAS = {
@@ -95,6 +108,9 @@ export class AudioSystem {
     this._probeTimer = 0;
     this._lastProbe = { x: 1e9, y: 0, z: 0 };
     this._origin = { x: 0, y: 0, z: 0 };
+    /** カメラ基底の受け皿。update() でアロケートしないための固定バッファ。 */
+    this._camFwd = new Vector3(0, 0, -1);
+    this._camUp = new Vector3(0, 1, 0);
 
     /* dry (head-locked) voice bookkeeping */
     this._dry = [];
@@ -217,23 +233,35 @@ export class AudioSystem {
       if (actx.state === 'suspended') return; // tab hidden, or resume pending
 
       /* ---- listener from the render camera ----------------------- */
+      //
+      // Babylon 移植: Three の `cam.matrixWorld.elements` から基底を直接取り出す
+      // 代わりに、カメラの API で向きを取る。理由:
+      //
+      //   - Babylon の Camera はワールド行列をビュー行列の逆行列として持ち、
+      //     行列の並びも Three と同じとは限らない。手で添字を打つと、間違えても
+      //     「音は鳴るが定位だけおかしい」という気づきにくい壊れ方をする。
+      //   - `getDirectionToRef` はワールド行列経由なので、シーンの handedness
+      //     (src/core/engine.js で右手系に固定) と FreeCamera の Euler 回転の
+      //     両方を Babylon 側が面倒を見てくれる。
+      //
+      // Web Audio の AudioListener も右手系なので、座標系の変換は不要。
+      // scene.useRightHandedSystem を false に戻すと左右の定位が反転する。
       const cam = ctx.camera;
-      cam.updateMatrixWorld();
-      const e = cam.matrixWorld.elements;
-      this.field.setListener(
-        e[12], e[13], e[14],
-        -e[8], -e[9], -e[10],
-        e[4], e[5], e[6]
-      );
+      const p = cam.globalPosition;
+      cam.getDirectionToRef(FORWARD_LOCAL, this._camFwd);
+      cam.getDirectionToRef(UP_LOCAL, this._camUp);
+      const f = this._camFwd;
+      const u = this._camUp;
+      this.field.setListener(p.x, p.y, p.z, f.x, f.y, f.z, u.x, u.y, u.z);
 
       /* ---- space probe ------------------------------------------- */
       this._probeTimer -= dt;
-      const moved = Math.abs(e[12] - this._lastProbe.x) + Math.abs(e[13] - this._lastProbe.y) +
-        Math.abs(e[14] - this._lastProbe.z);
+      const moved = Math.abs(p.x - this._lastProbe.x) + Math.abs(p.y - this._lastProbe.y) +
+        Math.abs(p.z - this._lastProbe.z);
       if (this._probeTimer <= 0 || moved > 1.6) {
         this._probeTimer = 0.45;
-        this._lastProbe.x = e[12]; this._lastProbe.y = e[13]; this._lastProbe.z = e[14];
-        this._probeSpace(ctx, e[12], e[13], e[14]);
+        this._lastProbe.x = p.x; this._lastProbe.y = p.y; this._lastProbe.z = p.z;
+        this._probeSpace(ctx, p.x, p.y, p.z);
       }
 
       /* ---- subsystems -------------------------------------------- */
