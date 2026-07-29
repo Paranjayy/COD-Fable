@@ -39,9 +39,10 @@ R リロード、Shift スプリント、Ctrl しゃがみ、Space ジャンプ�
 ## 移植の実測結果
 
 ```
-src の行数          65,000 → 45,557   (-30%)
-ファイル数             144 → 109
-差分 (vs main)   +10,143 / -30,270 行
+src の行数          65,000 → 38,373   (-41%)
+ファイル数             144 → 106
+差分 (vs main)   +12,451 / -38,469 行
+依存                three → @babylonjs/core + @babylonjs/havok
 ```
 
 サブシステム別:
@@ -113,11 +114,30 @@ webgpu: true / adapter: apple metal-3 (フォールバックではない)
 サンプルカーネルを生成)。**規約はライブラリの中まで届きません。** キャプチャモードに
 限り `Math.random` 自体をシード付き実装に差し替えることで解決しました。
 
-現在:
+### さらに 2 つの原因
+
+**prewarm が実時計で engine.step() を回していた。** キャプチャ用の固定時計パッチを
+当てる *前* に prewarm が 2 フレーム進めていたため、`time.elapsed` が run ごとにブレて
+いました。切り分けに時間を要したのは、CPU 側の指標 (乱数消費回数 76301・rng 状態・
+frame・三角形数) がすべて完全に一致していたためです。**time.elapsed も CPU 状態の
+一部**でした。
+
+**SSAO とモーションブラーには制御できない GPU 由来の非決定性が残ります。**
+`Math.random` をシードしても消えません。二分探索で、ベースシーン・影・
+clustered lighting・bloom・TAA はすべて決定的で、この 2 つだけが揺れることを確認
+しました。
+
+「許容誤差を緩める」ではなく **決定的キャプチャではこの 2 つを外す**判断をしました。
+maxDelta 71 を許容する gate は実際の退行をほぼ検出できず、gate として機能しないため
+です。代償として **AO とモーションブラーだけを変える修正は gate をすり抜けます**
+(絵の評価は製品と同じ設定で撮る `tools/shotset.mjs` 側で行います)。
+
+### 最終結果 — 全 11 ショット、2 回実行の差分
 
 ```
-hero    changedPct 0        (bit-identical)
-detail  changedPct 0.0062   maxDelta 1   (129,600 中 8 ピクセルが 1 LSB)
+9 / 11 ショットが完全に bit-identical  (changedPct 0, maxDelta 0)
+残り 2 つ (combat, weapon) も maxDelta 1  ← clustered lighting の浮動小数の累積順
+--tol=1 で withinEpsilon: true / exit 0
 ```
 
 **既知の劣化**: Havok はクロスプラットフォームでの bit-identical を保証しません
