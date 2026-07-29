@@ -6,6 +6,7 @@ import { SkySystem } from './sky/index.js';
 import { RenderSystem } from './render/index.js';
 import { PhysicsSystem } from './physics/index.js';
 import { WorldSystem } from './world/index.js';
+import { PlayerSystem } from './player/index.js';
 
 import { installShotApi } from './dev/shots.js';
 
@@ -70,8 +71,15 @@ const engine = await Engine.create({ canvas, config });
  *   render    → sky   (太陽の DirectionalLight が無いと CSM を作れない)
  *   physics   → (なし)
  *   world     → materials, physics, render
+ *   player    → physics, world, render
  */
-engine.add(MaterialSystem).add(SkySystem).add(RenderSystem).add(PhysicsSystem).add(WorldSystem);
+engine
+  .add(MaterialSystem)
+  .add(SkySystem)
+  .add(RenderSystem)
+  .add(PhysicsSystem)
+  .add(WorldSystem)
+  .add(PlayerSystem);
 
 try {
   await engine.init();

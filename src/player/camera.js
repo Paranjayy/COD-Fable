@@ -1,356 +1,330 @@
-/**
- * Camera feel.
- *
- * Everything a modern shooter does to make a floating pair of eyes read as a
- * body, layered so no single effect ever dominates:
- *
- *   eye height        stance-smoothed, so crouching is a movement not a cut
- *   view bob          1:2 Lissajous (figure-eight) locked to footstep cadence
- *   step micro-shift  a per-footfall vertical spring on top of the bob
- *   landing impact    dip + pitch + roll from the actual impact speed
- *   strafe / turn roll a degree of bank into the direction of travel
- *   slide             deep dip, forward push and a shoulder roll
- *   mantle            curve-driven offsets handed over by MantleMotion
- *   breathing sway    two detuned sines, amplified by ADS, wounds, suppression
- *   recoil            spring-damper impulse channel owned by the camera
- *   kick              a second, independent channel the weapon system pushes
- *   trauma shake      noise-driven, decays, used by explosions and heavy hits
- *   FOV               critically-damped springs: ADS crisp, sprint breathing
- *
- * Position offsets are built in the *yaw* basis (not the full view basis) so
- * looking up does not turn vertical bob into forward/backward lurch.
- */
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 
-import * as THREE from 'three';
 import { CAMERA, MOVE } from './tuning.js';
-import {
-  Spring, RecoilAxis, clamp, clamp01, lerp, approach, hashNoise, DEG,
-} from './springs.js';
+import { Spring, RecoilAxis, approach, clamp, clamp01, hashNoise, TAU } from './springs.js';
+import { basisFromYaw } from './movement.js';
 
+/**
+ * カメラの触感 — 揺れ、反動、傾き、呼吸、FOV。
+ *
+ * ## なぜ移動と分けるのか
+ *
+ * Three 版は移動とカメラが同じファイルにあり、「移動の調整をするとカメラの見え方が
+ * 変わる」という結合が起きていた。ここでは **movement が決めた状態を読むだけ**にして、
+ * 逆向きの依存を作らない。camera は速度も姿勢も書き換えない。
+ *
+ * ## 加算の順序
+ *
+ * 目の位置 = キャラクタ位置 + 目の高さ + (bob + 着地の沈み + 傾きのオフセット + 揺れ)
+ * 向き     = (yaw, pitch) + 反動 + 呼吸 + 傾きのロール + 揺れ
+ *
+ * すべて **加算** で、掛け算にしない。掛け算にすると 1 つの成分をゼロにしたときに
+ * 他の成分まで消え、調整の因果が追えなくなる。
+ */
 export class CameraRig {
-  constructor(ctx) {
-    this.ctx = ctx;
-    const C = CAMERA;
+  constructor(config, rng) {
+    this.config = config;
+    this.rng = rng;
 
-    // ---- smoothed stance -------------------------------------------------
-    this.eye = 1.66;
-    this.crouchBlend = 0;
+    /** 水平角。右手系で +Y 軸まわり。 */
+    this.yaw = 0;
+    /** 上下角。正で上。 */
+    this.pitch = 0;
 
-    // ---- bob -------------------------------------------------------------
+    // --- 反動 ---
+    const r = CAMERA.recoil;
+    this.recoilPitch = new RecoilAxis(r.freq, r.damping, r.residualTau, r.residualShare);
+    this.recoilYaw = new RecoilAxis(r.freq, r.damping, r.residualTau, r.residualShare);
+    this.recoilRoll = new RecoilAxis(r.freq * 0.8, r.damping, r.residualTau, r.residualShare);
+    /** 銃を構えた腕がカメラを押し戻す成分 (メートル)。 */
+    this.punch = new Spring(r.punchFreq, r.punchDamping, 0);
+
+    // --- 着地の沈み込み ---
+    this.landDip = new Spring(CAMERA.land.freq, CAMERA.land.damping, 0);
+    this.stepDip = new Spring(CAMERA.step.freq, CAMERA.step.damping, 0);
+
+    // --- 状態 ---
     this.bobPhase = 0;
-    this.bobWeight = 0;
-    this.bobRoll = 0;
-    this.bobPitch = 0;
-
-    // ---- springs ---------------------------------------------------------
-    this.dip = new Spring(C.land.freq, C.land.damping, 0); // landing
-    this.step = new Spring(C.step.freq, C.step.damping, 0); // footfall
-    this.recoilPitch = new RecoilAxis(C.recoil.freq, C.recoil.damping, C.recoil.residualTau, C.recoil.residualShare);
-    this.recoilYaw = new RecoilAxis(C.recoil.freq * 1.08, C.recoil.damping + 0.06, C.recoil.residualTau, C.recoil.residualShare);
-    this.recoilRoll = new RecoilAxis(C.recoil.freq * 0.86, C.recoil.damping + 0.1, C.recoil.residualTau, 0.24);
-    this.punch = new Spring(C.recoil.punchFreq, C.recoil.punchDamping, 0);
-    /** Second, independent channel: `weapons` pushes into this one. */
-    this.kickPitch = new RecoilAxis(11, 0.58, 0.22, 0.28);
-    this.kickYaw = new RecoilAxis(11.5, 0.6, 0.22, 0.28);
-    this.kickRoll = new RecoilAxis(9, 0.62, 0.22, 0.22);
-
-    // ---- rolls -----------------------------------------------------------
-    this.strafeRoll = 0;
-    this.turnRoll = 0;
-    this.slideRoll = 0;
-    this.airRoll = 0;
-
-    // ---- shake -----------------------------------------------------------
     this.trauma = 0;
-    this.shakeTime = 0;
-
-    // ---- breathing -------------------------------------------------------
+    this.leanAmount = 0;
+    this.rollAmount = 0;
     this.breathPhase = 0;
+    this.suppression = 0;
+    this.adsProgress = 0;
+    this.fovScale = 1;
 
-    // ---- fov -------------------------------------------------------------
-    this.baseFov = ctx.config.fov;
-    this.fov = this.baseFov;
-    this.fovMove = 1;
-    this.fovAds = 1;
+    /** 出力。lateUpdate で Babylon のカメラに書き込まれる。 */
+    this.eye = new Vector3();
+    this.rotation = new Vector3(); // (pitch, yaw, roll)
+    this.fov = config.fov;
 
-    // ---- slide -----------------------------------------------------------
-    this.slideBlend = 0;
-    this.slideSide = 1;
-
-    // ---- outputs (read by weapons for counter-motion) --------------------
-    this.viewKick = { pitch: 0, yaw: 0, roll: 0, punch: 0 };
-    this.bobOffset = new THREE.Vector3();
-    this.offset = new THREE.Vector3();
-    this.eyePosition = new THREE.Vector3();
-    this.rotation = new THREE.Euler(0, 0, 0, 'YXZ');
-    this.forward = new THREE.Vector3(0, 0, -1);
-
-    // scratch
-    this._fwd = new THREE.Vector3();
-    this._right = new THREE.Vector3();
+    this._noiseSeed = 0;
   }
 
-  reset(eye) {
-    this.eye = eye;
-    this.bobPhase = 0;
-    this.bobWeight = 0;
-    this.dip.reset(0);
-    this.step.reset(0);
-    this.recoilPitch.reset();
-    this.recoilYaw.reset();
-    this.recoilRoll.reset();
-    this.kickPitch.reset();
-    this.kickYaw.reset();
-    this.kickRoll.reset();
-    this.punch.reset(0);
-    this.trauma = 0;
-    this.strafeRoll = 0;
-    this.turnRoll = 0;
-    this.slideRoll = 0;
-    this.slideBlend = 0;
-    this.fovMove = 1;
-    this.fovAds = 1;
+  /**
+   * マウス/スティックの視点入力を積む。
+   *
+   * ADS 中は感度を落とす。これをやらないと、倍率のある光学サイトで狙いが暴れる。
+   */
+  addLook(dx, dy, adsProgress) {
+    const scale = 1 - adsProgress * (1 - this.config.adsSensScale);
+    this.yaw -= dx * scale;
+    this.pitch -= dy * scale;
+    const lim = CAMERA.pitchLimit;
+    this.pitch = clamp(this.pitch, -lim, lim);
+    // yaw は 2π で畳む。畳まないと長時間プレイで浮動小数の精度が落ちる。
+    if (this.yaw > Math.PI) this.yaw -= TAU;
+    else if (this.yaw < -Math.PI) this.yaw += TAU;
   }
 
-  /* ==================================================================== */
-  /* impulses — the public feel API                                       */
-  /* ==================================================================== */
-
-  /** Camera-owned recoil. Angles in radians; `punch` in metres. */
-  addRecoil(pitch = 0, yaw = 0, roll = 0, punch = 0) {
+  /** 武器から呼ばれる反動。角度はラジアン、punch はメートル。 */
+  addRecoil(pitch, yaw, roll, punch = 0) {
     this.recoilPitch.kick(pitch);
     this.recoilYaw.kick(yaw);
     this.recoilRoll.kick(roll);
-    if (punch) this.punch.impulse(-punch * 14);
+    if (punch) this.punch.impulse(punch);
   }
 
-  /** Weapon-driven kick — a separate channel so the two never fight. */
-  addKick(pitch = 0, yaw = 0, roll = 0) {
-    this.kickPitch.kick(pitch);
-    this.kickYaw.kick(yaw);
-    this.kickRoll.kick(roll);
-  }
-
+  /** 画面全体の揺れ。0..1 で累積し、二乗で効かせる (小さい値が目立ちすぎない)。 */
   addTrauma(a) {
     this.trauma = clamp01(this.trauma + a);
   }
 
-  onLand(speed) {
-    const L = CAMERA.land;
-    const t = clamp01((speed - L.minSpeed) / (L.fullSpeed - L.minSpeed));
-    if (t <= 0) return 0;
-    // Perceptual curve: a 3 m/s landing should still be felt a little.
-    const mag = Math.pow(t, 0.72);
-    this.dip.impulse(-L.dipImpulse * mag);
-    this.recoilPitch.kick(L.pitch * mag);
-    this.recoilRoll.kick(L.roll * mag * (this.slideSide || 1));
-    this.addTrauma(L.trauma * mag * mag);
-    return mag;
+  /** 被弾時の抑圧。呼吸の揺れが大きくなる。 */
+  addSuppression(a) {
+    this.suppression = clamp01(this.suppression + a);
   }
-
-  onFootstep(running, stance) {
-    const S = CAMERA.step;
-    let amp = S.impulse * (running ? S.sprintScale : 1);
-    if (stance === 'crouch') amp *= 0.55;
-    else if (stance === 'prone') amp *= 0.3;
-    this.step.impulse(-amp);
-  }
-
-  onSlideStart(side) {
-    this.slideSide = side || 1;
-    this.dip.impulse(-0.9);
-    this.addTrauma(0.12);
-  }
-
-  /* ==================================================================== */
-  /* per-frame composition                                                */
-  /* ==================================================================== */
 
   /**
-   * @param {number} dt
-   * @param {import('./movement.js').Movement} m
-   * @param {object} health  { fraction, low }
+   * 1 フレーム更新する。
+   *
+   * @param dt   可変フレーム時間
+   * @param move Movement のインスタンス (読み取りのみ)
+   * @param opts { ads, leanInput, health, physics }
    */
-  update(dt, m, health) {
-    const C = CAMERA;
-    const cfg = this.ctx.config;
-    const ads = clamp01(m.adsAmount);
+  update(dt, move, opts) {
+    const speed = Math.hypot(move.velocity.x, move.velocity.z);
+    const ads = opts.ads ? 1 : 0;
+    this.adsProgress = approach(this.adsProgress, ads, CAMERA.fov.adsTau, dt);
 
-    // ---- stance / eye height --------------------------------------------
-    const targetEye = m.eyeHeight + (m.sliding ? -0.1 : 0);
-    const growing = targetEye > this.eye;
-    const tau = m.stance === 'prone' || this.eye < 0.75
-      ? MOVE.stanceTau.prone
-      : growing ? MOVE.stanceTau.crouchStand : MOVE.stanceTau.standCrouch;
-    this.eye = approach(this.eye, targetEye, tau, dt);
-    this.crouchBlend = clamp01(1 - (this.eye - 1.0) / 0.66);
+    this._updateBob(dt, move, speed);
+    this._updateLean(dt, move, opts);
+    this._updateRoll(dt, move, opts);
+    this._updateSprings(dt);
+    this._updateBreath(dt, move, opts);
+    this._updateShake(dt);
+    this._updateFov(dt, move);
+    this._compose(move);
+  }
 
-    // ---- slide envelope --------------------------------------------------
-    const slideTarget = m.sliding ? 1 - 0.45 * m.slideProgress : 0;
-    this.slideBlend = approach(this.slideBlend, slideTarget, m.sliding ? 0.045 : 0.09, dt);
+  /* ------------------------------------------------------------------ */
 
-    // ---- yaw basis -------------------------------------------------------
-    const sy = Math.sin(m.yaw), cy = Math.cos(m.yaw);
-    this._fwd.set(-sy, 0, -cy);
-    this._right.set(cy, 0, -sy);
+  _updateBob(dt, move, speed) {
+    const b = CAMERA.bob;
+    /**
+     * 歩行の揺れは **移動距離** で位相を進める。時間で進めると、歩く速さを変えた
+     * ときに歩調と揺れがずれる (movement の足音と同じ理由)。
+     */
+    if (move.grounded && !move.sliding) {
+      const stride = move.stanceDef.strideLength;
+      this.bobPhase += (speed * dt) / Math.max(stride, 0.1) * Math.PI;
+      this._bobFade = approach(this._bobFade ?? 0, 1, 0.06, dt);
+    } else {
+      // 空中では素早く消す。落下中に揺れているとフワフワして見える。
+      this._bobFade = approach(this._bobFade ?? 0, 0, b.airFade, dt);
+    }
+    if (this.bobPhase > TAU * 8) this.bobPhase -= TAU * 8;
 
-    // ---- bob -------------------------------------------------------------
-    this._updateBob(dt, m, ads);
+    const norm = clamp(speed / MOVE.sprintSpeed, 0, b.speedCap) ** b.speedExp;
+    const adsScale = 1 - this.adsProgress * (1 - b.adsScale);
+    const amp = norm * (this._bobFade ?? 0) * adsScale;
 
-    // ---- springs ---------------------------------------------------------
-    this.dip.step(dt);
-    this.step.step(dt);
-    this.punch.step(dt);
+    // 1:2 のリサージュ。横 1 周期に対して縦 2 周期 = 8 の字。
+    this.bobX = Math.sin(this.bobPhase) * b.ampX * amp;
+    this.bobY = -Math.abs(Math.cos(this.bobPhase)) * b.ampY * amp;
+    this.bobZ = Math.sin(this.bobPhase * 2) * b.ampZ * amp;
+    this.bobRoll = Math.sin(this.bobPhase) * b.roll * amp;
+    this.bobPitch = Math.cos(this.bobPhase * 2) * b.pitch * amp;
+  }
+
+  /** 足が着いた瞬間の微小な沈み。footstep イベントごとに呼ぶ。 */
+  onFootstep(running) {
+    this.stepDip.impulse(-CAMERA.step.impulse * (running ? CAMERA.step.sprintScale : 1));
+  }
+
+  /** 着地。落下速度に応じて沈み込みと揺れを与える。 */
+  onLand(speed) {
+    const l = CAMERA.land;
+    if (speed < l.minSpeed) return 0;
+    const t = clamp01((speed - l.minSpeed) / (l.fullSpeed - l.minSpeed));
+    this.landDip.impulse(-l.dipImpulse * t);
+    this.recoilPitch.kick(-l.pitch * t);
+    this.recoilRoll.kick(l.roll * t * (this.rng.float() < 0.5 ? -1 : 1));
+    this.addTrauma(l.trauma * t);
+    return t;
+  }
+
+  _updateLean(dt, move, opts) {
+    const want = move.stance === 'stand' && !move.sprinting ? opts.leanInput : 0;
+    this.leanAmount = approach(this.leanAmount, want, MOVE.lean.rate, dt);
+
+    /**
+     * 傾いた先が壁なら押し戻す。
+     *
+     * これが無いと、ドア枠から覗こうとしたときにカメラが壁を突き抜けて隣室が見える
+     * (いわゆる wall-peek のチート的な挙動になる)。physics に球を投げて詰める。
+     */
+    if (Math.abs(this.leanAmount) > 0.01 && opts.physics && move.position) {
+      const { rx, rz } = basisFromYaw(this.yaw);
+      const dir = { x: rx * Math.sign(this.leanAmount), y: 0, z: rz * Math.sign(this.leanAmount) };
+      const from = {
+        x: move.position.x,
+        y: move.position.y + move.eyeHeight - move.height * 0.5,
+        z: move.position.z,
+      };
+      const reach = Math.abs(this.leanAmount) * MOVE.lean.offset + CAMERA.wallPad;
+      const hit = opts.physics.sphereCast(from, dir, MOVE.lean.probeRadius, reach);
+      if (hit.hit) {
+        const allowed = Math.max(0, hit.distance - CAMERA.wallPad) / MOVE.lean.offset;
+        this.leanAmount = clamp(this.leanAmount, -allowed, allowed);
+      }
+    }
+  }
+
+  _updateRoll(dt, move, opts) {
+    const r = CAMERA.roll;
+    // 横移動と旋回でわずかに傾ける。「見える」のではなく「感じる」量に留める。
+    const { rx, rz } = basisFromYaw(this.yaw);
+    const lateral = move.velocity.x * rx + move.velocity.z * rz;
+    let want = -clamp(lateral / MOVE.sprintSpeed, -1, 1) * r.strafe;
+
+    const yawRate = (this.yaw - (this._lastYaw ?? this.yaw)) / Math.max(dt, 1e-4);
+    this._lastYaw = this.yaw;
+    want += clamp(-yawRate * r.yawRate, -r.yawRateMax, r.yawRateMax);
+
+    if (move.sliding) want += -Math.sign(lateral || 1) * r.slide;
+    else if (!move.grounded) want += clamp(lateral, -1, 1) * r.air;
+
+    this.rollAmount = approach(this.rollAmount, want, r.tau, dt);
+  }
+
+  _updateSprings(dt) {
     this.recoilPitch.step(dt);
     this.recoilYaw.step(dt);
     this.recoilRoll.step(dt);
-    this.kickPitch.step(dt);
-    this.kickYaw.step(dt);
-    this.kickRoll.step(dt);
+    this.punch.step(dt);
+    this.landDip.step(dt);
+    this.stepDip.step(dt);
+  }
 
-    // ---- rolls -----------------------------------------------------------
-    const R = C.roll;
-    const strafeTarget = -m.cmd.moveX * R.strafe * (m.grounded ? 1 : 0.45) * (1 - 0.6 * ads);
-    this.strafeRoll = approach(this.strafeRoll, strafeTarget, R.tau, dt);
-    const turnTarget = clamp(m.yawRate * R.yawRate, -R.yawRateMax, R.yawRateMax) * (1 - 0.5 * ads);
-    this.turnRoll = approach(this.turnRoll, turnTarget, R.tau * 1.4, dt);
-    const slideRollTarget = m.sliding ? -this.slideSide * R.slide : 0;
-    this.slideRoll = approach(this.slideRoll, slideRollTarget, 0.1, dt);
-    const airTarget = m.grounded ? 0 : clamp(-m.velocity.y * 0.02, -1, 1) * R.air;
-    this.airRoll = approach(this.airRoll, airTarget, 0.22, dt);
-
-    // ---- trauma shake ----------------------------------------------------
-    const S = C.shake;
-    this.trauma = Math.max(0, this.trauma - S.decay * dt);
-    const shake = this.trauma * this.trauma;
-    this.shakeTime += dt * S.freq;
-    let shakePitch = 0, shakeYaw = 0, shakeRoll = 0, shakeX = 0, shakeY = 0;
-    if (shake > 1e-4) {
-      shakePitch = hashNoise(this.shakeTime, 11) * shake * S.rot * DEG;
-      shakeYaw = hashNoise(this.shakeTime + 31.7, 23) * shake * S.rot * DEG;
-      shakeRoll = hashNoise(this.shakeTime + 57.1, 37) * shake * S.rot * 0.7 * DEG;
-      shakeX = hashNoise(this.shakeTime * 0.8 + 13.3, 41) * shake * S.pos;
-      shakeY = hashNoise(this.shakeTime * 0.8 + 71.9, 53) * shake * S.pos;
-    }
-
-    // ---- breathing sway --------------------------------------------------
-    const B = C.breath;
-    const moveFactor = clamp01(m.horizontalSpeed / 2.2);
-    let amp = B.amp;
-    amp *= lerp(1, B.adsScale, ads);
-    amp *= lerp(1, B.lowHealthScale, 1 - clamp01(health.fraction));
-    amp *= lerp(1, B.suppressionScale, clamp01(health.suppression ?? 0));
-    amp *= 1 - B.moveDamp * moveFactor;
+  _updateBreath(dt, move, opts) {
+    const b = CAMERA.breath;
     this.breathPhase += dt;
-    const bA = Math.sin(this.breathPhase * Math.PI * 2 * B.freqA);
-    const bB = Math.sin(this.breathPhase * Math.PI * 2 * B.freqB + 1.7);
-    const breathPitch = (bA * 0.7 + bB * 0.3) * amp;
-    const breathYaw = (bB * 0.75 - bA * 0.25) * amp * 1.15;
-    const breathPos = (bA * 0.6 + bB * 0.4) * B.posAmp * (1 - 0.8 * moveFactor);
+    // 2 つの無理数比の正弦を重ねて、周期が読めない揺れにする。単一正弦だと
+    // 「機械的に往復している」ことが目で分かってしまう。
+    const a = Math.sin(this.breathPhase * TAU * b.freqA);
+    const c = Math.sin(this.breathPhase * TAU * b.freqB + 1.7);
 
-    // ---- mantle ----------------------------------------------------------
-    const mm = m.mantleMotion;
-    const mantleY = mm.active ? mm.camY : 0;
-    const mantleFwd = mm.active ? mm.camForward : 0;
-    const mantlePitch = mm.active ? mm.camPitch : 0;
-    const mantleRoll = mm.active ? mm.camRoll : 0;
-
-    // ---- assemble position ----------------------------------------------
-    const base = m.sampleRender(this.ctx.time.alpha);
-    const bobX = this.bobOffset.x;
-    const bobY = this.bobOffset.y;
-    const bobZ = this.bobOffset.z;
-
-    // Lean is applied in world space further down (it comes from the validated
-    // capsule probe, not from the bob basis).
-    const lateral = bobX + shakeX;
-    const vertical = bobY + this.dip.value + this.step.value + shakeY + mantleY + breathPos
-      - this.slideBlend * 0.1;
-    const forward = bobZ + this.punch.value + mantleFwd + this.slideBlend * 0.045;
-
-    this.offset.set(0, 0, 0);
-    this.offset.addScaledVector(this._right, lateral);
-    this.offset.addScaledVector(this._fwd, forward);
-    this.offset.y += vertical;
-
-    this.eyePosition.set(
-      base.x + m.leanOffsetX + this.offset.x,
-      base.y + this.eye + this.offset.y - Math.abs(m.leanAmount) * MOVE.lean.drop,
-      base.z + m.leanOffsetZ + this.offset.z
-    );
-
-    // ---- assemble rotation ----------------------------------------------
-    const pitch = clamp(
-      m.pitch + this.recoilPitch.value + this.kickPitch.value + breathPitch +
-        this.bobPitch + shakePitch + mantlePitch,
-      -CAMERA.pitchLimit,
-      CAMERA.pitchLimit
-    );
-    const yaw = m.yaw + this.recoilYaw.value + this.kickYaw.value + breathYaw + shakeYaw;
-    const roll =
-      this.strafeRoll + this.turnRoll + this.slideRoll + this.airRoll +
-      this.bobRoll + this.recoilRoll.value + this.kickRoll.value + shakeRoll +
-      mantleRoll - m.leanAmount * MOVE.lean.roll;
-
-    this.rotation.set(pitch, yaw, roll);
-
-    // ---- FOV -------------------------------------------------------------
-    const F = C.fov;
-    let moveTarget = 1;
-    if (m.sliding) moveTarget = F.slide;
-    else if (m.tacticalSprint) moveTarget = F.tacSprint;
-    else if (m.sprinting) moveTarget = F.sprint;
-    else if (!m.grounded && m.velocity.y < -6) moveTarget = F.air;
-    this.fovMove = approach(this.fovMove, moveTarget, F.moveTau, dt);
-    this.fovAds = approach(this.fovAds, lerp(1, cfg.adsFovScale, ads), F.adsTau, dt);
-    this.baseFov = cfg.fov;
-    this.fov = this.baseFov * this.fovMove * this.fovAds;
-
-    // ---- publish the kick channel for the viewmodel ----------------------
-    this.viewKick.pitch = this.recoilPitch.value + this.kickPitch.value;
-    this.viewKick.yaw = this.recoilYaw.value + this.kickYaw.value;
-    this.viewKick.roll = this.recoilRoll.value + this.kickRoll.value;
-    this.viewKick.punch = this.punch.value;
-  }
-
-  _updateBob(dt, m, ads) {
-    const B = CAMERA.bob;
-    const speed = m.horizontalSpeed;
-
-    // Phase comes from the movement machine's gait accumulator (pi per footfall)
-    // rather than being integrated here, so the bob can never drift out of sync
-    // with the footstep events after a jump or a stance change. The +pi/2 offset
-    // puts the horizontal extreme exactly on the footfall.
-    this.bobPhase = m.stepPhase + Math.PI * 0.5;
-
-    // Weight: speed-scaled (sprint bobs more than a walk, but not linearly),
-    // faded out in the air and while sliding or aiming.
-    let w = Math.min(B.speedCap, Math.pow(speed / 4.57, B.speedExp));
-    if (!m.grounded || m.sliding) w = 0;
-    w *= lerp(1, B.adsScale, ads);
-    if (m.stance === 'prone') w *= 0.35;
-    this.bobWeight = approach(this.bobWeight, w, B.airFade, dt);
-
-    const th = this.bobPhase;
-    const wt = this.bobWeight;
-    this.bobOffset.set(
-      Math.sin(th) * B.ampX * wt,
-      Math.sin(th * 2) * B.ampY * wt,
-      Math.cos(th * 2) * B.ampZ * wt
-    );
-    this.bobRoll = -Math.sin(th) * B.roll * wt;
-    this.bobPitch = Math.cos(th * 2) * B.pitch * wt;
-  }
-
-  /** Write the composed transform onto the engine camera. */
-  applyTo(camera) {
-    camera.position.copy(this.eyePosition);
-    camera.rotation.set(this.rotation.x, this.rotation.y, this.rotation.z);
-    if (Math.abs(camera.fov - this.fov) > 1e-3) {
-      camera.fov = this.fov;
-      camera.updateProjectionMatrix();
+    let scale = 1;
+    scale *= 1 + this.adsProgress * (b.adsScale - 1);
+    if (opts.health !== undefined) {
+      const low = clamp01(1 - opts.health / 40);
+      scale *= 1 + low * (b.lowHealthScale - 1);
     }
-    camera.updateMatrixWorld();
-    this.forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    scale *= 1 + this.suppression * (b.suppressionScale - 1);
+    // 動いている間は呼吸の揺れを抑える (体幹が安定している、という表現)。
+    const speed = Math.hypot(move.velocity.x, move.velocity.z);
+    scale *= 1 - clamp01(speed / MOVE.sprintSpeed) * b.moveDamp;
+
+    this.breathPitch = a * b.amp * scale;
+    this.breathYaw = c * b.amp * scale * 0.8;
+    this.breathPos = c * b.posAmp * scale;
+
+    this.suppression = approach(this.suppression, 0, 1.2, dt);
+  }
+
+  _updateShake(dt) {
+    const s = CAMERA.shake;
+    this.trauma = Math.max(0, this.trauma - s.decay * dt);
+    // trauma の二乗で効かせる。線形だと小さな被弾でも画面が大きく揺れる。
+    const t = this.trauma * this.trauma;
+    if (t <= 0) {
+      this.shakePitch = this.shakeYaw = this.shakeRoll = 0;
+      this.shakeX = this.shakeY = 0;
+      return;
+    }
+    /**
+     * 揺れのノイズは `hashNoise` (決定的) を使う。Math.random() を使うと
+     * ARCHITECTURE.md Hard rule 4 に違反し、キャプチャが揺れる。
+     */
+    this._noiseSeed += dt * s.freq;
+    // hashNoise は既に -1..1 を返す。ここで *2-1 すると -3..1 に偏り、揺れが
+    // 一方向に寄る (実際に一度やらかした)。
+    const n = (k) => hashNoise(this._noiseSeed, k);
+    const deg = (Math.PI / 180) * s.rot * t;
+    this.shakePitch = n(1) * deg;
+    this.shakeYaw = n(2) * deg;
+    this.shakeRoll = n(3) * deg * 0.7;
+    this.shakeX = n(4) * s.pos * t;
+    this.shakeY = n(5) * s.pos * t;
+  }
+
+  _updateFov(dt, move) {
+    const f = CAMERA.fov;
+    let want = 1;
+    if (move.tacSprinting) want = f.tacSprint;
+    else if (move.sprinting) want = f.sprint;
+    else if (move.sliding) want = f.slide;
+    else if (!move.grounded) want = f.air;
+
+    this.fovScale = approach(this.fovScale, want, f.moveTau, dt);
+    // ADS は別時定数。移動 FOV より速く効かないと構えが鈍く感じる。
+    const adsFov = 1 - this.adsProgress * (1 - this.config.adsFovScale);
+    this.fov = this.config.fov * this.fovScale * adsFov;
+  }
+
+  /** 全成分を合成して eye / rotation に書き出す。 */
+  _compose(move) {
+    const { fx, fz, rx, rz } = basisFromYaw(this.yaw);
+
+    // 傾きの横移動。
+    const leanOff = this.leanAmount * MOVE.lean.offset;
+    const leanDrop = Math.abs(this.leanAmount) * MOVE.lean.drop;
+
+    // 反動の押し戻しは視線方向の逆に働く。
+    const punch = this.punch.value;
+
+    const p = move.position ?? { x: 0, y: 0, z: 0 };
+    // physics のカプセルは中心が原点。目は中心から (eyeHeight - height/2) 上。
+    const eyeY = p.y + (move.eyeHeight - move.height * 0.5);
+
+    this.eye.set(
+      p.x + rx * (leanOff + this.bobX + this.shakeX) + fx * (this.bobZ - punch),
+      eyeY + this.bobY + this.landDip.value + this.stepDip.value - leanDrop + this.shakeY + this.breathPos,
+      p.z + rz * (leanOff + this.bobX + this.shakeX) + fz * (this.bobZ - punch)
+    );
+
+    this.rotation.set(
+      -(this.pitch + this.recoilPitch.value + this.bobPitch + this.breathPitch + this.shakePitch),
+      this.yaw + this.recoilYaw.value + this.breathYaw + this.shakeYaw,
+      this.rollAmount +
+        this.recoilRoll.value +
+        this.bobRoll +
+        this.shakeRoll +
+        this.leanAmount * MOVE.lean.roll
+    );
+  }
+
+  /**
+   * Babylon のカメラへ書き込む。
+   *
+   * **Babylon の FreeCamera.rotation は (pitch, yaw, roll) で、pitch は下向きが正**。
+   * こちらの内部表現は上向きが正なので、_compose で符号を反転させてある。ここで
+   * 二重に反転させないこと (上下が逆になり、しかも「なんとなく操作できてしまう」)。
+   */
+  applyTo(camera) {
+    camera.position.copyFrom(this.eye);
+    camera.rotation.copyFrom(this.rotation);
+    camera.fov = (this.fov * Math.PI) / 180;
   }
 }
