@@ -135,6 +135,10 @@ export class AiSystem {
     this._lodStats = { irrelevant: 0 };
     this._stagedAgents = [];
     this._stagedSquad = null;
+    /** 直前の入口 bullet:impact の部位 (damage:dealt の部位倍率用 — _wireEvents 参照)。 */
+    this._lastImpactActor = null;
+    this._lastImpactPart = null;
+    this._lastImpactIncident = null;
 
     this._wireEvents(ctx);
     console.info(
@@ -233,6 +237,15 @@ export class AiSystem {
 
     on('bullet:impact', (e) => {
       if (!e || !e.point) return;
+      // damage:dealt には部位が載らない (ARCHITECTURE.md の語彙は headshot のみ)。
+      // physics は入口 impact → damage:dealt を同期・この順で emit するので、
+      // 直前の入口 impact の部位を覚えておき、直後の damage:dealt で部位倍率
+      // (HITBOXES の damageScale: arm 0.65 / leg 0.7 / head 4.0) に使う。
+      if (e.actor instanceof Agent && !e.exit) {
+        this._lastImpactActor = e.actor;
+        this._lastImpactPart = e.part;
+        this._lastImpactIncident = e.incident;
+      }
       for (const a of this.agents) {
         if (!a.alive) continue;
         const d = a.position.distanceTo(e.point);
@@ -246,11 +259,16 @@ export class AiSystem {
       const a = e.target;
       if (!a.alive) return;
       // 部位倍率: Babylon 版 physics は Hit の damageScale を掛けないので、
-      // ここでヘッドショット倍率 (HITBOXES の head=4.0) を適用する。ダメージの
-      // 適用は対象 (この購読) だけが行う — 発行側で適用すると二重に減る。
-      const partScale = e.headshot ? 4.0 : 1;
+      // ここで適用する (部位は直前の bullet:impact から — 上のコメント参照)。
+      // ダメージの適用は対象 (この購読) だけが行う — 発行側でも適用すると二重に減る。
+      const part = e.headshot
+        ? 'head'
+        : e.part ?? (e.target === this._lastImpactActor ? this._lastImpactPart : null) ?? 'torso';
+      const partScale = a.hitboxes?.damageScaleFor(part) ?? (e.headshot ? 4.0 : 1);
       const amount = e.amount * partScale * this._falloff(e.point);
-      a.applyDamage(amount, e.headshot ? 'head' : e.part ?? 'torso', e.point ?? a.position, e.incident);
+      const incident =
+        e.incident ?? (e.target === this._lastImpactActor ? this._lastImpactIncident : null);
+      a.applyDamage(amount, part, e.point ?? a.position, incident);
       if (!a.alive) e.killed = true;
     });
 
