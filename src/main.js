@@ -66,6 +66,12 @@ for (const [key, flag] of [
  * (GPU 由来の非決定性のため。理由は src/render/index.js のコメント)。
  * `?gtao=1` / `?mblur=1` を明示したときだけその上書きを尊重する。
  */
+/**
+ * `?fxparticles=1` でパーティクル層を有効化する。既定は無効 —
+ * 粒子を出すとフレーム全体が黒くなる未解決バグがあるため (src/fx/index.js 参照)。
+ */
+config.fxParticles = params.get('fxparticles') === '1';
+
 config.forcePost = {
   gtao: params.get('gtao') === '1' ? true : undefined,
   mblur: params.get('mblur') === '1' ? true : undefined,

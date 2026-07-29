@@ -21,7 +21,9 @@
  *
  * ## 属性のパッキング
  *
- * 1 粒子 = 32 float (8 x vec4)。インスタンス属性として渡す。
+ * 1 粒子 = 32 float (8 x vec4)。**インスタンス属性ではなく頂点属性**として、
+ * 粒子ごとの 4 頂点すべてに同じ値を持たせる (理由は particles.js のコメント参照)。
+ * `position.xy` だけが頂点ごとに変わり、クアッドの隅を表す。
  *
  *   aPS    pos.xyz, size0
  *   aVS    vel.xyz, size1
@@ -169,8 +171,26 @@ uniform uFog: vec4f;
 
 @fragment
 fn main(input: FragmentInputs) -> FragmentOutputs {
-  if (input.vCol.a <= 0.0) { discard; }
   let tex = textureSample(uSprite, uSpriteSampler, input.vUv);
+
+  /**
+   * **微分は discard より前で取る。**
+   *
+   * WGSL の dpdx / dpdy は **一様な制御フローの中でしか使えない**。discard の
+   * 後に置くと、隣接ピクセルが破棄されたときの微分が未定義になり、WebGPU が
+   * パイプラインを不正と判定する。
+   *
+   * 実際にこれを踏んだときの症状: パーティクルを 1 つでも出すと
+   * **シーン全体が真っ黒**になった。エラーはブラウザ console に GPUValidationError
+   * として出るが、内容は「PostProcessRTT-highlights の RenderPipeline が
+   * 以前のエラーにより不正」という **まったく別のパス**を指しており、原因の
+   * パーティクルシェーダには一言も言及しない。1 つの不正パイプラインが
+   * コマンドバッファ全体を無効化するため、後続のポストパスが巻き添えで倒れる。
+   */
+  let dTexX = dpdx(tex.r);
+  let dTexY = dpdy(tex.r);
+
+  if (input.vCol.a <= 0.0) { discard; }
   var a = tex.a * input.vCol.a;
   if (a < 0.0035) { discard; }
   var c = input.vCol.rgb * tex.rgb;
@@ -185,7 +205,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
      */
     let rr = dot(input.vQ, input.vQ);
     var nrm = vec3f(input.vQ, sqrt(max(0.03, 1.0 - rr)));
-    nrm = normalize(nrm - vec3f(dpdx(tex.r), dpdy(tex.r), 0.0) * 7.0);
+    nrm = normalize(nrm - vec3f(dTexX, dTexY, 0.0) * 7.0);
     let ndl = dot(nrm, uniforms.uSunDir);
     // wrap ライティング。半透明の媒質は裏からも透ける。
     let wrap = max(0.0, (ndl + 0.42) / 1.42);

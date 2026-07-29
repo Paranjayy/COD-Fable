@@ -89,6 +89,42 @@ export class FxSystem {
     this.atlases = atlases;
 
     const q = ctx.config.q;
+
+    /**
+     * ## パーティクル層は既定で無効 (既知の未解決バグ)
+     *
+     * **粒子を 1 つでも出すとフレーム全体が真っ黒になる。** エラーもワーニングも
+     * 出ず、scene.getActiveIndices() は正常値を返し、キャンバスだけが黒くなる。
+     * 実測: hero ショットの平均輝度 84.1 → 6.0。
+     *
+     * ### 排除済みの仮説 (すべて実測)
+     *
+     *  1. インスタンス属性が届いていない
+     *     → geometry の instanced VertexBuffer では実際に全てゼロで届いた。
+     *       thin instance に変え、さらに「1 粒子 4 頂点」の頂点属性方式にも
+     *       変えたが、黒くなる症状は変わらない
+     *  2. シェーダの出力が画面を塗り潰している
+     *     → フラグメントを完全透明 (vec4f(0,0,0,0)) の固定出力にしても黒いまま。
+     *       **描くこと自体**が問題で、出力内容ではない
+     *  3. discard の後で dpdx/dpdy を呼んでいる (WGSL では不正)
+     *     → 微分を discard より前に移したが変わらず (この修正自体は正しいので残置)
+     *  4. bounding info 未同期で半透明ソートが壊れている
+     *     → 有限の巨大 bounding box を与えたが変わらず
+     *  5. GPU の検証エラー
+     *     → ショット適用後のエラーはゼロ。以前観測した
+     *       「PostProcessRTT-highlights の RenderPipeline が不正」は上流の
+     *       別エラーの巻き添えだった
+     *
+     * ### 残る有力な仮説
+     *
+     * ShaderMaterial (needAlphaBlending) を HDR パイプラインの半透明パスに
+     * 差し込むこと自体が、DefaultRenderingPipeline の合成と噛み合っていない可能性。
+     * `?fxparticles=1` で有効化して調査を続けられる。
+     *
+     * **デカール・動的光源・弾痕は影響を受けないので有効のまま。** 着弾の
+     * 弾痕と焦げ跡は出るが、火花と土煙が出ない状態で出荷している。
+     */
+    this.particlesEnabled = ctx.config.fxParticles === true;
     /**
      * 加算層と lit 層で予算を分ける。
      *
@@ -96,6 +132,12 @@ export class FxSystem {
      * 同じリングに混ぜると、煙が火花を押し出して「撃っているのに火花が出ない」に
      * なるので必ず分ける。
      */
+    if (!this.particlesEnabled) {
+      console.warn(
+        '[fx] パーティクル層は既定で無効です (既知の未解決バグ: 粒子を出すとフレーム全体が黒くなる)。' +
+          ' ?fxparticles=1 で有効化できます。デカールと動的光源は動作します。'
+      );
+    }
     this.add = new ParticleLayer({
       capacity: Math.round(q.particleBudget * 0.35),
       mode: 'additive',
@@ -194,11 +236,11 @@ export class FxSystem {
    */
   _bindEmitters() {
     this.emitAdd = (s) => {
-      if (this.disabled) return;
+      if (this.disabled || !this.particlesEnabled) return;
       this.add.emit(s, this._now);
     };
     this.emitLit = (s) => {
-      if (this.disabled) return;
+      if (this.disabled || !this.particlesEnabled) return;
       this.lit.emit(s, this._now);
     };
     this.emitViewAdd = this.emitAdd;

@@ -12,6 +12,12 @@ import { WGSL_PARTICLE_VERT, WGSL_PARTICLE_FRAG } from './wgsl/particle.js';
 /** 1 粒子あたりの float 数。8 x vec4。 */
 export const STRIDE = 32;
 
+/**
+ * インスタンス属性の名前。**WGSL の `attribute` 宣言と 1 対 1 で対応する。**
+ * 片方だけ変えると、その属性だけゼロで届いて静かに壊れる。
+ */
+const ATTR_KINDS = ['aPS', 'aVS', 'aLife', 'aRot', 'aCol0', 'aCol1', 'aMisc', 'aExtra'];
+
 // インターリーブされたスロットのオフセット
 const O_PS = 0; // pos.xyz, size0
 const O_VS = 4; // vel.xyz, size1
@@ -100,38 +106,78 @@ export class ParticleLayer {
     this.spawned = 0;
     this.scene = o.scene;
 
-    this.array = new Float32Array(this.capacity * STRIDE);
 
-    // --- 板ポリ 1 枚 ---------------------------------------------------
-    const mesh = new Mesh(`fx-particles-${o.mode}`, o.scene);
-    const vd = new VertexData();
-    vd.positions = [-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0];
-    vd.uvs = [0, 0, 1, 0, 1, 1, 0, 1];
-    vd.indices = [0, 1, 2, 0, 2, 3];
-    vd.applyToMesh(mesh, false);
-
-    // --- インスタンス属性 ----------------------------------------------
     /**
-     * 8 本の vec4 属性をすべて **1 本のインターリーブバッファ**から切り出す。
+     * --- ジオメトリ: 1 粒子 = 4 頂点 --------------------------------------
      *
-     * 8 本の独立したバッファにすると、1 粒子の書き込みが 8 箇所に散らばって
-     * 差分アップロードの範囲が広がる。インターリーブなら 1 粒子 = 連続した
-     * 32 float なので、「i 番から j 番まで」の 1 範囲で済む。
+     * **インスタンシングは使わない。** Babylon + WebGPU で 2 通り試してどちらも
+     * 失敗したため:
+     *
+     *   (a) geometry に instanced VertexBuffer を足す
+     *       (`mesh.setVerticesBuffer(buffer.createVertexBuffer(..., instanced=true))`)
+     *       → 描画は発行されるが **インスタンス属性が全てゼロで届く**。
+     *          size = mix(0,0,...) = 0 で面積ゼロの板になり、エラーもなく完全に不可視。
+     *          (シェーダにサイズを固定で埋めると板が出ることで確認)
+     *
+     *   (b) `thinInstanceSetBuffer` でカスタム属性を登録
+     *       → **シーン全体が描画されなくなる**。エラーもワーニングも出ず、
+     *          scene.getActiveIndices() は 20 万を返すのにキャンバスは真っ黒。
+     *          単位行列の "matrix" バッファを添えても変わらず。
+     *
+     * どちらも「エラーが出ないまま絵だけが消える」ため、原因の特定に時間がかかる。
+     * ここでは **粒子ごとに 4 頂点を持ち、同じ属性値を 4 回書く**古典的な方式にした。
+     * インスタンシング機構に一切依存しないので、Babylon のバージョンや
+     * バックエンドの都合で静かに壊れることがない。
+     *
+     * 代償: 頂点バッファが 4 倍になり (24k 粒子 = 96k 頂点)、emit の書き込みも
+     * 4 倍 (1 粒子 128 float)。着弾 1 発で数十粒子なので実測上は問題にならない。
      */
-    const engine = o.scene.getEngine();
-    this.buffer = new Buffer(engine, this.array, true, STRIDE, false, true);
-    const bind = (kind, offset) =>
-      mesh.setVerticesBuffer(this.buffer.createVertexBuffer(kind, offset, 4, STRIDE, true));
-    bind('aPS', O_PS);
-    bind('aVS', O_VS);
-    bind('aLife', O_LF);
-    bind('aRot', O_RT);
-    bind('aCol0', O_C0);
-    bind('aCol1', O_C1);
-    bind('aMisc', O_MS);
-    bind('aExtra', O_EX);
+    const mesh = new Mesh(`fx-particles-${o.mode}`, o.scene);
+    const N = this.capacity;
+    /** 各頂点がクアッドのどの隅か。(-0.5..0.5, -0.5..0.5) と UV を兼ねる。 */
+    const corners = new Float32Array(N * 4 * 3);
+    const uvs = new Float32Array(N * 4 * 2);
+    const indices = new Uint32Array(N * 6);
+    const CX = [-0.5, 0.5, 0.5, -0.5];
+    const CY = [-0.5, -0.5, 0.5, 0.5];
+    const UX = [0, 1, 1, 0];
+    const UY = [0, 0, 1, 1];
+    for (let p = 0; p < N; p++) {
+      for (let v = 0; v < 4; v++) {
+        const k = (p * 4 + v) * 3;
+        corners[k] = CX[v];
+        corners[k + 1] = CY[v];
+        corners[k + 2] = 0;
+        const u = (p * 4 + v) * 2;
+        uvs[u] = UX[v];
+        uvs[u + 1] = UY[v];
+      }
+      const o6 = p * 6;
+      const b4 = p * 4;
+      indices[o6] = b4;
+      indices[o6 + 1] = b4 + 1;
+      indices[o6 + 2] = b4 + 2;
+      indices[o6 + 3] = b4;
+      indices[o6 + 4] = b4 + 2;
+      indices[o6 + 5] = b4 + 3;
+    }
+    const vd = new VertexData();
+    vd.positions = corners;
+    vd.uvs = uvs;
+    vd.indices = indices;
+    vd.applyToMesh(mesh, true);
 
-    mesh.forcedInstanceCount = 0;
+    /**
+     * 粒子ごとの属性。**頂点ごとに同じ値を 4 回持つ。**
+     * kind 名は WGSL の `attribute` 宣言と 1 対 1 で対応する。
+     */
+    this.attrs = {};
+    for (const kind of ATTR_KINDS) {
+      const arr = new Float32Array(N * 4 * 4);
+      this.attrs[kind] = arr;
+      mesh.setVerticesData(kind, arr, true, 4);
+    }
+
     /**
      * 粒子はシェーダ内でワールド空間に置かれる。メッシュ自体の変換は恒等で、
      * バウンディングボックスも意味を持たない。**カリングされると全部消える**ので
@@ -139,7 +185,18 @@ export class ParticleLayer {
      */
     mesh.alwaysSelectAsActiveMesh = true;
     mesh.isPickable = false;
-    mesh.doNotSyncBoundingInfo = true;
+    /**
+     * **doNotSyncBoundingInfo は使わない。**
+     *
+     * 半透明メッシュは bounding sphere の中心までの距離でソートされる。同期を
+     * 切ると距離が不定になり、ソートの比較関数が壊れて **フレーム全体が描画
+     * されなくなる** (エラーもワーニングも出ない)。
+     *
+     * 代わりに「巨大な固定の bounding box」を与える。粒子はシェーダ内で
+     * ワールド空間に置かれるためメッシュのバウンディングは意味を持たないが、
+     * ソートが成立する有限の値であることが重要。
+     */
+    mesh.buildBoundingInfo(new Vector3(-1e4, -1e4, -1e4), new Vector3(1e4, 1e4, 1e4));
     /** 影を落とさない / 物理を持たない印。render と physics が見る。 */
     mesh.metadata = { owNoShadow: true, owNoCollision: true, owFx: true };
     // 半透明は最後に描く。加算はさらに後ろ。
@@ -210,50 +267,24 @@ export class ParticleLayer {
     }
     if (i + 1 > this.highWater) this.highWater = i + 1;
 
-    const a = this.array;
-    const b = i * STRIDE;
     const life = Math.max(0.016, s.life);
     const birth = now + s.delay;
+    const A = this.attrs;
+    const invLife = 1 / life;
 
-    a[b + O_PS] = s.x;
-    a[b + O_PS + 1] = s.y;
-    a[b + O_PS + 2] = s.z;
-    a[b + O_PS + 3] = s.size0;
-
-    a[b + O_VS] = s.vx;
-    a[b + O_VS + 1] = s.vy;
-    a[b + O_VS + 2] = s.vz;
-    a[b + O_VS + 3] = s.size1;
-
-    a[b + O_LF] = birth;
-    a[b + O_LF + 1] = 1 / life;
-    a[b + O_LF + 2] = s.drag;
-    a[b + O_LF + 3] = s.gravity;
-
-    a[b + O_RT] = s.rot;
-    a[b + O_RT + 1] = s.spin;
-    a[b + O_RT + 2] = s.stretch;
-    a[b + O_RT + 3] = s.sizeCurve;
-
-    a[b + O_C0] = s.r0;
-    a[b + O_C0 + 1] = s.g0;
-    a[b + O_C0 + 2] = s.b0;
-    a[b + O_C0 + 3] = s.i0;
-
-    a[b + O_C1] = s.r1;
-    a[b + O_C1 + 1] = s.g1;
-    a[b + O_C1 + 2] = s.b1;
-    a[b + O_C1 + 3] = s.i1;
-
-    a[b + O_MS] = s.tile;
-    a[b + O_MS + 1] = s.soft;
-    a[b + O_MS + 2] = s.alpha;
-    a[b + O_MS + 3] = s.alphaCurve;
-
-    a[b + O_EX] = s.turb;
-    a[b + O_EX + 1] = s.turbFreq;
-    a[b + O_EX + 2] = s.seed;
-    a[b + O_EX + 3] = s.flags;
+    // 4 頂点すべてに同じ値を書く。頂点シェーダは corner (position.xy) だけを
+    // 頂点ごとに変え、それ以外はこの値を共有する。
+    for (let v = 0; v < 4; v++) {
+      const b = (i * 4 + v) * 4;
+      A.aPS[b] = s.x;      A.aPS[b + 1] = s.y;       A.aPS[b + 2] = s.z;        A.aPS[b + 3] = s.size0;
+      A.aVS[b] = s.vx;     A.aVS[b + 1] = s.vy;      A.aVS[b + 2] = s.vz;       A.aVS[b + 3] = s.size1;
+      A.aLife[b] = birth;  A.aLife[b + 1] = invLife; A.aLife[b + 2] = s.drag;   A.aLife[b + 3] = s.gravity;
+      A.aRot[b] = s.rot;   A.aRot[b + 1] = s.spin;   A.aRot[b + 2] = s.stretch; A.aRot[b + 3] = s.sizeCurve;
+      A.aCol0[b] = s.r0;   A.aCol0[b + 1] = s.g0;    A.aCol0[b + 2] = s.b0;     A.aCol0[b + 3] = s.i0;
+      A.aCol1[b] = s.r1;   A.aCol1[b + 1] = s.g1;    A.aCol1[b + 2] = s.b1;     A.aCol1[b + 3] = s.i1;
+      A.aMisc[b] = s.tile; A.aMisc[b + 1] = s.soft;  A.aMisc[b + 2] = s.alpha;  A.aMisc[b + 3] = s.alphaCurve;
+      A.aExtra[b] = s.turb; A.aExtra[b + 1] = s.turbFreq; A.aExtra[b + 2] = s.seed; A.aExtra[b + 3] = s.flags;
+    }
 
     if (i < this._dirtyLo) this._dirtyLo = i;
     if (i > this._dirtyHi) this._dirtyHi = i;
@@ -272,20 +303,14 @@ export class ParticleLayer {
    */
   flush(now) {
     if (this._dirtyHi >= this._dirtyLo) {
-      /**
-       * Babylon の Buffer は「部分更新」に updateDirectly(data, offsetInFloats) を
-       * 使う。**第 2 引数は float 単位のオフセット**で、渡すデータは
-       * 「そのオフセットから書き込む分だけ」の subarray。全体を渡すと二重にずれる。
-       */
-      const lo = this._dirtyLo * STRIDE;
-      const hi = (this._dirtyHi + 1) * STRIDE;
-      this.buffer.updateDirectly(this.array.subarray(lo, hi), lo);
+      // 変更のあった属性を再アップロードする。updateVerticesData は範囲指定を
+      // 持たないので全体を送る。emit があったフレームだけなので許容範囲。
+      for (const kind of ATTR_KINDS) this.mesh.updateVerticesData(kind, this.attrs[kind], false, false);
       this._dirtyLo = Infinity;
       this._dirtyHi = -Infinity;
     }
     this.material.setFloat('uTime', now);
     const count = this._wrapped ? this.capacity : this.highWater;
-    this.mesh.forcedInstanceCount = count;
     this.mesh.setEnabled(now < this.expireAt && count > 0);
   }
 
@@ -303,6 +328,5 @@ export class ParticleLayer {
   dispose() {
     this.mesh.dispose();
     this.material.dispose();
-    this.buffer.dispose();
   }
 }
