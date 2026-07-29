@@ -7,6 +7,9 @@ import { RenderSystem } from './render/index.js';
 import { PhysicsSystem } from './physics/index.js';
 import { WorldSystem } from './world/index.js';
 import { PlayerSystem } from './player/index.js';
+import { FxSystem } from './fx/index.js';
+import { UiSystem } from './ui/index.js';
+import { AudioSystem } from './audio/index.js';
 
 import { installShotApi } from './dev/shots.js';
 
@@ -72,6 +75,10 @@ const engine = await Engine.create({ canvas, config });
  *   physics   → (なし)
  *   world     → materials, physics, render
  *   player    → physics, world, render
+ *   fx        → render, materials, physics
+ *   ui        → render
+ *   audio     → (なし)  physics は実行時に peek するだけなので依存にしない。
+ *                       AudioContext はユーザー操作まで作られないので init は常に成功する。
  */
 engine
   .add(MaterialSystem)
@@ -79,7 +86,10 @@ engine
   .add(RenderSystem)
   .add(PhysicsSystem)
   .add(WorldSystem)
-  .add(PlayerSystem);
+  .add(PlayerSystem)
+  .add(FxSystem)
+  .add(UiSystem)
+  .add(AudioSystem);
 
 try {
   await engine.init();
