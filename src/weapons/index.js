@@ -1,62 +1,46 @@
-import * as THREE from 'three';
+import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector.js';
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+
 import { Rng } from '../core/rng.js';
-import { WeaponMaterials, ENV_OCCLUSION } from './materials.js';
+import { WeaponMaterials } from './materials.js';
 import { Viewmodel } from './viewmodel.js';
 import { ProjectileSim } from './ballistics.js';
 import { WEAPON_DEFS, buildRecoilPattern, SPREAD_MODS } from './defs.js';
 import { buildRifle } from './models/rifle.js';
 import { buildSmg } from './models/smg.js';
 import { buildPistol } from './models/pistol.js';
-import { clamp, clamp01, lerp, damp, DEG } from './mathx.js';
+import { lerp, DEG } from './mathx.js';
 
 /**
  * WEAPONS — weapon meshes, the first-person viewmodel rig, ADS, recoil, sway,
- * bob, reload/inspect animation and projectile ballistics.
+ * bob, reload/inspect animation and projectile ballistics (Babylon 移植版)。
  *
  * ────────────────────────────────────────────────────────────────────────────
  * WHAT LIVES HERE
- *   geometry.js   hard-surface kit: chamfered boxes, lathes, extrusions,
- *                 Picatinny rail, M-LOK, knurling, screws, and the Assembly
- *                 that merges everything down to a handful of draw calls.
- *   parts.js      real firearm components built from published dimensions:
- *                 receivers, barrels, muzzle devices, handguards, stocks,
- *                 grips, magazines, optics, iron sights, triggers.
- *   models/*.js   the three weapons assembled from those parts.
- *   hands.js      gloved hands + sleeved arms, two-bone IK from the hand.
- *   viewmodel.js  the animation stack (sway/bob/lag/recoil/ADS/clips).
- *   clips.js      keyframed reload / inspect / draw timelines.
- *   ballistics.js travelling projectiles with gravity and drag.
- *   defs.js       every tuning number, plus the deterministic recoil patterns.
+ *   geometry.js   hard-surface kit (Babylon 移植の中心 — Three 互換 API の Geo)
+ *   parts.js      real firearm components (寸法データ・実質無改変)
+ *   models/*.js   the three weapons (無改変)
+ *   hands.js      gloved hands + sleeved arms, two-bone IK
+ *   viewmodel.js  the animation stack (1 カメラ + renderingGroupId 構成)
+ *   clips.js      keyframed reload / inspect / draw timelines (無改変)
+ *   ballistics.js travelling projectiles with gravity and drag
+ *   defs.js       every tuning number + deterministic recoil patterns (無改変)
  *
  * ────────────────────────────────────────────────────────────────────────────
- * PUBLIC API — `const wp = ctx.get('weapons')`
- * ────────────────────────────────────────────────────────────────────────────
- *   wp.current            { id, label, class, mode, magSize, ... } (the def)
- *   wp.ammo               { mag, chambered, reserve, magSize, total, empty }
- *   wp.fireMode           'auto' | 'burst' | 'semi'
- *   wp.spreadDegrees      live cone half-angle — drive the crosshair gap with it
- *   wp.adsProgress        0..1
- *   wp.reloading / wp.firing / wp.switching / wp.inspecting
- *   wp.weaponIds          ['rifle','smg','pistol']
- *   wp.setWeapon(id)      draw/holster animated swap
- *   wp.nextWeapon()
- *   wp.cycleFireMode()
- *   wp.reload()           no-op if full or empty of reserve
- *   wp.inspect()
- *   wp.tryFire()          honours fire mode + rpm; returns true if a shot left
- *   wp.viewmodel          the rig (fx/ui may read muzzle/eject transforms)
- *   wp.muzzleWorld(v3)    world-space muzzle, for anything that needs it
- *   wp.debugPose(kind)    'idle' | 'ads' | 'fire'  (the capture harness)
- *   wp.stats              { tris, drawCalls, live, fired }
+ * PUBLIC API — `const wp = ctx.get('weapons')` (Three 版から不変)
+ *   wp.current / wp.ammo / wp.fireMode / wp.spreadDegrees / wp.adsProgress
+ *   wp.reloading / wp.firing / wp.switching / wp.inspecting / wp.weaponIds
+ *   wp.setWeapon(id) / wp.nextWeapon() / wp.cycleFireMode()
+ *   wp.reload() / wp.inspect() / wp.canFire() / wp.tryFire()
+ *   wp.muzzleWorld(v3) / wp.getHudState() / wp.debugPose(kind, opts)
+ *   wp.setWeaponImmediate(id) / wp.viewmodel / wp.stats
  *
- * EVENTS EMITTED  (all canonical, see ARCHITECTURE.md)
+ * EVENTS EMITTED  (all canonical, see ARCHITECTURE.md — ペイロード不変)
  *   weapon:fire    { weapon, origin, dir, seed }
  *   weapon:shell   { position, velocity }
  *   weapon:reload  { weapon, phase: 'start'|'magout'|'magin'|'end' }
  *   bullet:tracer  { from, to, speed }
  * `bullet:impact` comes from physics, because physics owns penetration.
- * Anything else (ammo counts, fire mode, the current weapon) is a getter on
- * this object rather than an event, so no new event types are introduced.
  */
 export class WeaponSystem {
   static id = 'weapons';
@@ -72,40 +56,41 @@ export class WeaponSystem {
     this._fireTimer = 0;
     this._burstLeft = 0;
     this._burstCooldown = 0;
-    this._semiLatch = false;
     this._spread = 0;
     this._shotIndex = 0;
     this._sinceShot = 10;
     this._switchTimer = 0;
     this._switchTo = null;
-    this._reloadPhase = null;
 
-    this._muzzle = new THREE.Vector3();
-    this._dir = new THREE.Vector3();
-    this._right = new THREE.Vector3();
-    this._up = new THREE.Vector3();
-    this._tmp = new THREE.Vector3();
-    this._camDir = new THREE.Vector3();
-    this._firePayload = { weapon: null, origin: new THREE.Vector3(), dir: new THREE.Vector3(), seed: 0 };
+    this._muzzle = new Vector3();
+    this._dir = new Vector3();
+    this._right = new Vector3();
+    this._up = new Vector3();
+    this._tmp = new Vector3();
+    this._camDir = new Vector3();
+    // カメラのローカル軸 (RH ビュー行列なので前方は -Z)。
+    this._LOCAL_FWD = new Vector3(0, 0, -1);
+    this._LOCAL_RIGHT = new Vector3(1, 0, 0);
+    this._LOCAL_UP = new Vector3(0, 1, 0);
+    this._firePayload = { weapon: null, origin: new Vector3(), dir: new Vector3(), seed: 0 };
     this._reloadPayload = { weapon: null, phase: 'start' };
     // `weapon:shell` carries the canonical { position, velocity } plus the real
-    // case dimensions and a spin, so fx can size and tumble the brass instead of
-    // guessing: a 9x19 case is less than half the length of a 5.56x45 one.
+    // case dimensions and a spin, so fx can size and tumble the brass.
     this._shellPayload = {
-      position: new THREE.Vector3(),
-      velocity: new THREE.Vector3(),
+      position: new Vector3(),
+      velocity: new Vector3(),
       weapon: null,
       caseLen: 0.0446,
       caseRadius: 0.00495,
       spin: 0,
     };
     this._pendingShots = 0;
-    this._pendingFirst = false;
+    this._fireSeed = 0;
 
     // Deferred shell ejections (a case leaves the port a few ms after the shot).
     this._shellQueue = [];
     for (let i = 0; i < 8; i++) {
-      this._shellQueue.push({ t: -1, pos: new THREE.Vector3(), vel: new THREE.Vector3() });
+      this._shellQueue.push({ t: -1 });
     }
     this._droppedMags = [];
     this._state = {
@@ -131,18 +116,11 @@ export class WeaponSystem {
 
   async init(ctx) {
     this.ctx = ctx;
+    // 決定性: Math.random() 禁止 (ARCHITECTURE.md Hard rule 4)。必ず fork を持つ。
     this.rng = ctx.rng.fork();
     this.mats = new WeaponMaterials(ctx);
     this.sim = new ProjectileSim(ctx);
     this.viewmodel = new Viewmodel(ctx, this.mats);
-    // three only honours `material.envMapIntensity` when the material carries its
-    // OWN `envMap`; for a material lit by `scene.environment` the renderer
-    // overwrites that uniform with `scene.environmentIntensity` every frame
-    // (WebGLRenderer.setProgram, the isMeshStandardMaterial branch). The
-    // viewmodel is drawn from its own scene, so ENV_OCCLUSION — how much of the
-    // sky a shouldered weapon actually sees, see materials.js — has to be
-    // expressed there or it is silently a no-op.
-    ctx.viewScene.environmentIntensity = ENV_OCCLUSION;
     this.viewmodel.onClipEvent = (name, clip) => this._onClipEvent(name, clip);
 
     const t0 = performance.now();
@@ -156,6 +134,7 @@ export class WeaponSystem {
       tris += entry.tris;
       this.states.set(id, {
         def,
+        // 反動パターンは defs.js の patternSeed から決定的に生成される。
         pattern: buildRecoilPattern(def, Rng),
         mag: def.magSize,
         chambered: true,
@@ -169,7 +148,6 @@ export class WeaponSystem {
 
     // Player hooks (all optional: the viewmodel works standalone).
     this.player = ctx.peek('player');
-    this.fx = ctx.peek('fx');
     this.physics = ctx.peek('physics');
     this._off = [];
     this._off.push(
@@ -263,20 +241,16 @@ export class WeaponSystem {
     const vm = this.viewmodel;
     h.name = s.def.label ?? s.def.id;
     h.mode = s.mode;
-    // `a.mag` counts the chambered round, so a topped-off rifle is 31. The HUD
-    // draws one pip per round against magSize, so clamp the *display* to the
-    // magazine capacity rather than overflowing the pip strip.
+    // `a.mag` counts the chambered round; clamp the display to magSize.
     h.ammo = Math.min(a.mag, a.magSize);
     h.reserve = a.reserve;
     h.magSize = a.magSize;
     h.reloading = this.reloading;
-    // 0..1 through the active reload clip; the bar is meaningless otherwise.
     h.reloadProgress = h.reloading && vm?.clip?.duration
       ? Math.min(1, vm.clipT / vm.clip.duration)
       : 0;
     h.ads = (vm?.adsT ?? 0) > 0.5;
-    // `ui` maps this to reticle bloom as 4 + spread * 40 px, so hand it a
-    // normalised 0..1 rather than raw degrees.
+    // `ui` maps this to reticle bloom, so hand it a normalised 0..1.
     h.spread = Math.min(1, Math.max(0, this._spread / 6));
     h.firing = this.firing;
     return h;
@@ -315,7 +289,6 @@ export class WeaponSystem {
     this.viewmodel.stopClip();
     const empty = s.mag === 0 && !s.chambered;
     this.viewmodel.play(empty ? 'reloadEmpty' : 'reloadTac');
-    this._pendingReloadEmpty = empty;
     return true;
   }
 
@@ -369,18 +342,17 @@ export class WeaponSystem {
 
     // ---- aim: camera forward + a spread cone ----
     const cam = this.ctx.camera;
-    cam.updateMatrixWorld();
-    this._camDir.set(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
-    this._dir.copy(this._camDir);
+    cam.getDirectionToRef(this._LOCAL_FWD, this._camDir);
+    this._camDir.normalize();
+    this._dir.copyFrom(this._camDir);
     const spreadRad = this._spread * DEG;
     if (spreadRad > 1e-5) {
       const d = this.rng.disc(this._disc ?? (this._disc = { x: 0, y: 0 }));
-      this._right.set(1, 0, 0).applyQuaternion(cam.quaternion);
-      this._up.set(0, 1, 0).applyQuaternion(cam.quaternion);
-      this._dir
-        .addScaledVector(this._right, Math.tan(spreadRad) * d.x)
-        .addScaledVector(this._up, Math.tan(spreadRad) * d.y)
-        .normalize();
+      cam.getDirectionToRef(this._LOCAL_RIGHT, this._right);
+      cam.getDirectionToRef(this._LOCAL_UP, this._up);
+      this._right.scaleAndAddToRef(Math.tan(spreadRad) * d.x, this._dir);
+      this._up.scaleAndAddToRef(Math.tan(spreadRad) * d.y, this._dir);
+      this._dir.normalize();
     }
 
     // ---- projectile ----
@@ -411,7 +383,6 @@ export class WeaponSystem {
     this._sinceShot = 0;
     this.stats.fired++;
     this._pendingShots++;
-    this._pendingFirst = this._pendingFirst || first;
     this._fireSeed = seed;
 
     // Shell leaves the port shortly after the shot, once the bolt is back.
@@ -434,7 +405,6 @@ export class WeaponSystem {
   /* ====================================================================== */
 
   _onClipEvent(name, clipName) {
-    const s = this.state;
     const isReload = clipName === 'reloadTac' || clipName === 'reloadEmpty';
     switch (name) {
       case 'start':
@@ -507,17 +477,16 @@ export class WeaponSystem {
     const proxy = this._magProxy(w);
     if (!proxy) return;
     const mag = w.parts.magazine;
-    mag.updateMatrixWorld();
-    proxy.group.position.setFromMatrixPosition(mag.matrixWorld);
-    proxy.group.quaternion.setFromRotationMatrix(mag.matrixWorld);
-    proxy.group.visible = true;
+    mag.computeWorldMatrix(true);
+    mag.getWorldMatrix().decompose(undefined, proxy.group.rotationQuaternion, proxy.group.position);
+    proxy.group.setEnabled(true);
     // Magazine geometry hangs below its origin, so bias the body centre down.
     const half = w.magLen * 0.45;
     proxy.group.position.y -= half * 0.4;
 
     const vel = this._tmp.set(0, -0.7, 0);
     const pv = this.player?.velocity;
-    if (pv) vel.add(pv);
+    if (pv) vel.addInPlace(pv);
     vel.x += this.rng.signed() * 0.25;
     vel.z += this.rng.signed() * 0.25;
 
@@ -527,8 +496,7 @@ export class WeaponSystem {
         surface: 'rubber',
         mass: 0.38,
         lifetime: 22,
-        restitution: 0.18,
-        object3D: proxy.group,
+        mesh: proxy.group,
       });
       proxy.until = this.ctx.time.elapsed + 22;
     } else {
@@ -543,21 +511,21 @@ export class WeaponSystem {
     if (!pool) {
       pool = [];
       for (let i = 0; i < 2; i++) {
-        const group = new THREE.Object3D();
-        group.name = `dropped-mag-${w.id}-${i}`;
-        group.visible = false;
-        // Share the viewmodel's geometry and materials; the world copy needs no
-        // resources of its own.
-        w.parts.magazine.traverse((o) => {
-          if (o.isMesh) {
-            const m = new THREE.Mesh(o.geometry, o.material);
-            m.position.copy(o.position);
-            m.quaternion.copy(o.quaternion);
-            m.castShadow = true;
-            group.add(m);
-          }
-        });
-        this.ctx.scene.add(group);
+        const group = new TransformNode(`dropped-mag-${w.id}-${i}`, this.ctx.scene);
+        group.rotationQuaternion = new Quaternion();
+        group.setEnabled(false);
+        /**
+         * physics.removeRigidBody は node を dispose する既定動作を持つ。
+         * このプロキシはプールして使い回すので owKeep で保護する。
+         */
+        group.metadata = { owKeep: true };
+        // Share the viewmodel's geometry and materials; world 側は影も落とす。
+        for (const src of w.parts.magazine.getChildMeshes(false)) {
+          const m = src.clone(`${group.name}-${src.name}`, group);
+          m.renderingGroupId = this.ctx.RENDER_GROUP.WORLD;
+          m.alwaysSelectAsActiveMesh = false;
+          m.receiveShadows = true;
+        }
         pool.push({ group, body: null, until: 0 });
         this._droppedMags.push(pool[i]);
       }
@@ -685,7 +653,6 @@ export class WeaponSystem {
         ctx.events.emit('weapon:fire', this._firePayload);
       }
       this._pendingShots = 0;
-      this._pendingFirst = false;
     }
 
     // ---- deferred shell ejection ---------------------------------------
@@ -697,7 +664,7 @@ export class WeaponSystem {
       vm.ejectWorld(this._shellPayload.position);
       vm.ejectVelocity(this._shellPayload.velocity, 2.3 + this.rng.float() * 1.2);
       const pv = this.player?.velocity;
-      if (pv) this._shellPayload.velocity.add(pv);
+      if (pv) this._shellPayload.velocity.addInPlace(pv);
       this._shellPayload.velocity.y += 1.1;
       this._shellPayload.weapon = this.current;
       const shell = vm.active?.shell;
@@ -711,8 +678,8 @@ export class WeaponSystem {
     if (this._droppedMags.length) {
       const now = ctx.time.elapsed;
       for (const p of this._droppedMags) {
-        if (p.group.visible && p.until && now > p.until) {
-          p.group.visible = false;
+        if (p.group.isEnabled() && p.until && now > p.until) {
+          p.group.setEnabled(false);
           if (p.body && this.physics?.removeRigidBody) {
             this.physics.removeRigidBody(p.body);
             p.body = null;
@@ -727,9 +694,10 @@ export class WeaponSystem {
   /* ====================================================================== */
 
   /**
-   * Freeze the viewmodel in a photogenic state.
-   * The harness applies a shot, then pumps `SETTLE` frames before grabbing the
-   * frame, so 'fire' schedules a short burst that peaks right at the capture.
+   * Freeze the viewmodel in a photogenic state ('idle' | 'ads' | 'fire')。
+   * ハーネスはショット適用後に settle フレームを送るので、'fire' は撮影される
+   * フレーム付近で連射が続いているようイベントを散らしてある (Three 版の実測:
+   * フラッシュコア寿命 52ms に対しシャッターの着地が数フレームぶれる)。
    */
   debugPose(kind = 'idle', opts = {}) {
     const vm = this.viewmodel;
@@ -773,26 +741,6 @@ export class WeaponSystem {
     this._state.sprint = false;
     this._state.speed = 0;
     this._state.trigger = false;
-    // Frames (at the harness's fixed 60 Hz) on which to fire for the 'fire'
-    // shot. The burst has to land at the END of the harness's settle window: a
-    // flash core lives 52 ms (~3 frames), so the last rounds must leave the
-    // barrel a frame or two before the grab or there is nothing to photograph.
-    // `grabFrame` is how many frames the harness will pump — it is a CLI flag
-    // (`--settle`), so it cannot be hard-coded here. The offsets below straddle
-    // the grab because the harness pumps on its own rAF chain, which can land a
-    // frame either side of the engine's.
-    // A flash core lives 52 ms — about three frames at 60 Hz — while the exact
-    // frame the shutter lands on is only known to within a handful of frames
-    // (the harness pumps its settle count on its own rAF chain, then the
-    // screenshot RPC costs a few more). So: three spaced rounds early to fill
-    // the frame with drifting smoke, brass in flight and a tracer, then a
-    // sustained tail on a 2-frame cadence, so a flash is lit continuously
-    // across the whole uncertainty window.
-    //
-    // The cadence was 3 frames, which is the flash core's own lifetime rounded
-    // UP: measured across settle 86/88/90/92/94, frame 90 landed in the trough
-    // between two cores and photographed a dying flash (10k hot pixels against
-    // 26-29k on either side). Two frames guarantees overlap.
     if (kind === 'fire') {
       const grab = Math.round(opts?.grabFrame ?? 90);
       const frames = [grab - 26, grab - 19, grab - 12];
@@ -833,8 +781,8 @@ export class WeaponSystem {
     for (const off of this._off ?? []) off();
     this.sim?.clear();
     for (const p of this._droppedMags) {
-      p.group.removeFromParent();
       if (p.body && this.physics?.removeRigidBody) this.physics.removeRigidBody(p.body);
+      p.group.dispose();
     }
     this._droppedMags.length = 0;
     this.viewmodel?.dispose();

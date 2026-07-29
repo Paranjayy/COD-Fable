@@ -1,7 +1,10 @@
-import * as THREE from 'three';
-import { Arm, HAND_POSES } from './hands.js';
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+import { Vector3, Quaternion, Matrix } from '@babylonjs/core/Maths/math.vector.js';
+
+import { Arm } from './hands.js';
 import { buildClips, makeSampleResult } from './clips.js';
-import { triCount, mergeAll } from './geometry.js';
+import { triCount, mergeAll, disk, diskRing, meshFromGeo } from './geometry.js';
+import { quatXYZToRef, yawPitchFromQuat } from './vmath.js';
 import {
   Spring,
   Spring3,
@@ -16,85 +19,57 @@ import {
 } from './mathx.js';
 
 /**
- * THE VIEWMODEL RIG.
+ * THE VIEWMODEL RIG — Babylon 移植版。
  *
- * Everything the player looks at for the whole game happens in this file. It is
- * a stack of *additive procedural layers* over one base pose — no baked clips
- * for anything continuous:
+ * アニメーションスタック (base / sway / bob / lag / recoil / clip) は Three 版から
+ * 無改変で持ち越し。変わったのは**シーングラフの土台**だけ:
  *
- *   base      hip / ADS / sprint / low-ready pose blend
- *   sway      layered incommensurate noise, so idle never visibly loops
- *   bob       stride-driven figure-eight, scaled by speed and stance
- *   lag       the gun TRAILS camera rotation on a spring, overshoots, settles.
- *             This is the single detail that makes a viewmodel feel real.
- *   recoil    per-shot rotational + positional impulse, spring-damper return
- *   clip      keyframed reload / inspect / draw additive offset
+ *   Three 版: 専用の viewScene + viewCamera (専用ライトリグ → README の 20 倍
+ *             irradiance 事故の温床)
+ *   この版:  world と同じ scene に置き、メッシュに renderingGroupId =
+ *             RENDER_GROUP.VIEWMODEL を立てる。グループ手前で深度だけクリア
+ *             されるので壁は貫通しない (core/engine.js の設計コメント参照)。
  *
- * ADS alignment is computed, not authored: the rig solves for the translation
- * that puts the weapon's sight node exactly on the camera axis at the right eye
- * relief, so the optic is pixel-centred at full ADS whatever the weapon.
+ * 【重要・構成上の制約】
+ *  - **ビューモデル専用のライトを追加しないこと。** world と同じ IBL・同じ露出で
+ *    焼かれることがこの構成の目的そのもの。
+ *  - 専用ニアクリップは無い。camera.minZ = 0.05 m より手前に置かない。
+ *  - 専用 FOV も無い。ADS の FOV は player カメラが絞る (config.adsFovScale)。
+ *    Three 版にあった viewFov (ビューモデルだけ別 FOV) は適用先が存在しないため
+ *    落とした — ADS 時に武器が一緒に拡大されるのは織り込み済みの代償で、
+ *    eyeRelief ベースの ADS ソルブが位置側で吸収する。
  *
  * The scene graph:
- *   viewScene
- *     anchor          <- copies the world camera transform every frame, so the
- *                        gun is lit and shadowed as if it were in the world
+ *   scene
+ *     anchor          <- copies the world camera transform every frame
  *       rig           <- the animation stack writes here
  *         weapon      <- body meshes + moving-part groups
  *         armL/armR   <- two-bone IK, hands welded to the weapon's grips
- *       reticle       <- collimated dot, placed on the optical axis in camera
- *                        space so it behaves like real glass
+ *       reticle       <- collimated dot on the optical axis (camera space)
  */
 
-const _v = new THREE.Vector3();
-const _v2 = new THREE.Vector3();
-const _v3 = new THREE.Vector3();
-const _q = new THREE.Quaternion();
-const _q2 = new THREE.Quaternion();
-const _e = new THREE.Euler(0, 0, 0, 'XYZ');
-const _m = new THREE.Matrix4();
-const _axisX = new THREE.Vector3(1, 0, 0);
-const _axisY = new THREE.Vector3(0, 1, 0);
-const _axisZ = new THREE.Vector3(0, 0, 1);
-
-/**
- * Re-shape the curvature vertex masks baked by `materials.bakeMasks`.
- *
- * bakeMasks writes a LINEAR convexity ramp into vColor.rgb (wear / grime / AO).
- * On architecture that is right — a wall has interior vertices for the ramp to
- * fall off against. On chamfered hard-surface geometry there are none, so the
- * ramp runs from the chamfer to the middle of the panel and the whole face
- * reads as worn metal. Raising the exponent collapses that ramp back onto the
- * chamfer's own vertices, which is the outer 1-2 mm of the edge — the only place
- * a rifle actually polishes through.
- *
- * @param {THREE.BufferGeometry} geo   must already carry a `color` attribute
- */
-function shapeMasks(geo, o) {
-  const col = geo.getAttribute('color');
-  if (!col) return geo;
-  const a = col.array;
-  const amp = [o.wearAmp ?? 1, o.grimeAmp ?? 1, o.aoAmp ?? 1];
-  const exp = [o.wearExp ?? 1, o.grimeExp ?? 1, o.aoExp ?? 1];
-  for (let i = 0; i < a.length; i += 3) {
-    for (let k = 0; k < 3; k++) {
-      const v = a[i + k];
-      a[i + k] = v <= 0 ? 0 : amp[k] * Math.pow(v > 1 ? 1 : v, exp[k]);
-    }
-  }
-  col.needsUpdate = true;
-  return geo;
-}
+const _v = new Vector3();
+const _v2 = new Vector3();
+const _v3 = new Vector3();
+const _q = new Quaternion();
+const _q2 = new Quaternion();
+const _m = new Matrix();
+const _NEG_Z = new Vector3(0, 0, -1);
+const _POS_Z = new Vector3(0, 0, 1);
 
 /** Right-handed hand basis from a finger direction and a back-of-hand direction. */
 function handBasis(out, finger, back) {
   _v.set(-finger[0], -finger[1], -finger[2]).normalize(); // hand +Z
   _v2.set(back[0], back[1], back[2]);
-  _v2.addScaledVector(_v, -_v2.dot(_v));
-  if (_v2.lengthSq() < 1e-8) _v2.set(0, 1, 0).addScaledVector(_v, -_v.y);
+  _v.scaleAndAddToRef(-Vector3.Dot(_v2, _v), _v2);
+  if (_v2.lengthSquared() < 1e-8) {
+    _v2.set(0, 1, 0);
+    _v.scaleAndAddToRef(-_v.y, _v2);
+  }
   _v2.normalize(); // hand +Y
-  _v3.crossVectors(_v2, _v).normalize(); // hand +X
-  _m.makeBasis(_v3, _v2, _v);
-  return out.setFromRotationMatrix(_m);
+  Vector3.CrossToRef(_v2, _v, _v3);
+  _v3.normalize(); // hand +X
+  return Quaternion.RotationQuaternionFromAxisToRef(_v3, _v2, _v, out);
 }
 
 export class Viewmodel {
@@ -102,13 +77,15 @@ export class Viewmodel {
     this.ctx = ctx;
     this.mats = mats;
     this.rng = ctx.rng.fork();
+    const scene = ctx.scene;
+    this.scene = scene;
+    this.RENDER_GROUP = ctx.RENDER_GROUP;
 
-    this.anchor = new THREE.Object3D();
-    this.anchor.name = 'ow-viewmodel-anchor';
-    this.rig = new THREE.Object3D();
-    this.rig.name = 'ow-viewmodel-rig';
-    this.anchor.add(this.rig);
-    ctx.viewScene.add(this.anchor);
+    this.anchor = new TransformNode('ow-viewmodel-anchor', scene);
+    this.anchor.rotationQuaternion = new Quaternion();
+    this.rig = new TransformNode('ow-viewmodel-rig', scene);
+    this.rig.rotationQuaternion = new Quaternion();
+    this.rig.parent = this.anchor;
 
     // ---- arms -------------------------------------------------------------
     const handMats = {
@@ -117,119 +94,72 @@ export class Viewmodel {
       seam: mats.get('glove_seam'),
       sleeve: mats.get('sleeve'),
     };
-    // Shoulder joints in CAMERA space: ~200 mm lateral, ~210 mm below the eye
-    // and only just behind it.
-    //
-    // Two constraints fight here. Too far BACK and a 570 mm arm cannot reach the
-    // handguard, so the two-bone solve clamps and the elbow locks dead straight
-    // — the "broomstick arm". Too far FORWARD (a properly bladed stance) and the
-    // upper arm itself lands inside the near frustum, so a 100 mm-wide sleeve
-    // fills half the screen. The support hand is therefore placed on the REAR of
-    // the handguard instead, which buys the reach without moving the joint into
-    // shot.
+    /**
+     * Shoulder joints in CAMERA space (~200 mm lateral, ~210 mm below the eye)。
+     * 後ろすぎると 630 mm の腕が届かず肘がロック、前すぎると上腕がニアクリップに
+     * 入る — 数値の経緯は Three 版 hands.js の実測コメントに詳しい。
+     */
     this.armR = new Arm(1, handMats, {
+      scene,
       scale: 1,
       shoulderX: 0.205,
       shoulderY: -0.2,
       shoulderZ: 0.06,
       pose: 'grip',
     });
-    // The shoulders stay BEHIND the eye. Blading the support shoulder forward to
-    // reach the handguard was tried and measured: at z=-0.075 the 89 mm forearm
-    // sleeve crosses the frame diagonally and hides the barrel and the muzzle,
-    // which is precisely the failure the note above warns about. The reach is
-    // bought by cheating the bones 10% long instead — see hands.js L_UPPER.
     this.armL = new Arm(-1, handMats, {
+      scene,
       scale: 0.97,
       shoulderX: 0.2,
       shoulderY: -0.22,
       shoulderZ: 0.02,
       pose: 'clamp',
     });
-    this.rig.add(this.armR.root);
-    this.rig.add(this.armL.root);
-    /**
-     * The arms get the SAME curvature-mask treatment the weapon does. Without
-     * this every wear/grime/AO number in `sleeve`, `glove`, `glove_pad` and
-     * `glove_seam` is dead code — see Arm.bakeSurfaceMasks. It has to happen
-     * before `_fitSupportHand` runs, because that adds contact AO into the same
-     * attribute with Math.max and would otherwise be overwritten.
-     */
-    const bakeArms = this.mats.lib?.bakeMasks?.bind(this.mats.lib) ?? null;
-    if (bakeArms) {
-      this.armR.bakeSurfaceMasks(bakeArms, shapeMasks, this.rng);
-      this.armL.bakeSurfaceMasks(bakeArms, shapeMasks, this.rng);
+    this.armR.root.parent = this.rig;
+    this.armL.root.parent = this.rig;
+    for (const arm of [this.armR, this.armL]) {
+      for (const m of arm.root.getChildMeshes(false)) {
+        m.renderingGroupId = this.RENDER_GROUP.VIEWMODEL;
+        // 影は受けるが落とさない (CSM のカスケードには登録しない)。
+        m.receiveShadows = true;
+      }
     }
-    // Body-fixed shoulders, expressed in camera space and re-based into rig
-    // space every frame so the elbows do not swing when the gun moves.
-    this.shoulderR = new THREE.Vector3(0.205, -0.2, 0.06);
-    this.shoulderL = new THREE.Vector3(-0.2, -0.22, 0.02);
+    // Body-fixed shoulders, camera space; re-based into rig space every frame.
+    this.shoulderR = new Vector3(0.205, -0.2, 0.06);
+    this.shoulderL = new Vector3(-0.2, -0.22, 0.02);
 
     // ---- reticle ----------------------------------------------------------
-    this.reticle = new THREE.Object3D();
-    this.reticle.name = 'ow-reticle';
-    this.anchor.add(this.reticle);
     /**
-     * A 2 MOA dot with a soft halo, a dark keyline and a 12-segment outer ring.
-     *
-     * All four are authored at UNIT radius and scaled together by the dot's
-     * angular size in `_updateReticle`, so the whole reticle is one shape that
-     * grows and shrinks as a unit — proportions can never drift.
-     *
-     *   core     the emitter. 0xff1a08 at intensity 1.35, and the intensity is
-     *            measured — twice, because the first analysis was wrong.
-     *
-     *            The old note here reasoned about how much GREEN the emitter adds
-     *            and concluded 3.2 was safe. It is not, and the reason is the tone
-     *            curve, not the additive maths: the frame is graded with AgX (see
-     *            render/composite.js), and AgX's whole signature is that it
-     *            DESATURATES as it approaches display white. A pixel whose red
-     *            channel is 3.2 over a mid-grey background comes out of the curve
-     *            at rgb(255,248,239) whatever its green and blue were — measured on
-     *            ads.png, a white dot, exactly what the previous note said it had
-     *            fixed. There is no colour available up there.
-     *            0.95 keeps the core on the near-linear part of the curve, where a
-     *            saturated red stays a saturated red, and the halo + ring below are
-     *            what carry the "it is an emitter" read instead of raw radiance.
-     *   halo     1.6x the core radius, ~6% alpha. This is the bloom seed and the
-     *            reason the dot looks like it is BEHIND glass. It has to stay
-     *            tight; the old 0.0095 rad / 0.34 alpha halo was 23 px across and
-     *            was what actually read on screen — a soft salmon blob.
-     *   rim      a NORMALLY blended dark keyline. Additive blending cannot draw
-     *            anything darker than what is behind it, so without a separate
-     *            ring the dot dissolves the moment it crosses a blown-out sky.
-     *   ring     12 arc segments at 3.2x the dot radius, 35% of its radiance.
-     *            A bare dot at 8 px is indistinguishable from a dead subpixel;
-     *            the segmented ring is what makes it read as an EMITTER, and it
-     *            is the standard 65 MOA circle-dot every modern sight ships.
+     * 2 MOA ドット + ハロー + 暗い縁取り + 12 分割リング。全部ユニット半径で
+     * 作り `_updateReticle` が角サイズでまとめてスケールする (形が崩れない)。
+     * 輝度・サイズの数値は Three 版で AgX の肩を測って決めたもの (ACES でも
+     * 「白飛びさせず赤を保つ」方向は同じなので流用)。
      */
-    const core = new THREE.CircleGeometry(1, 32);
-    const halo = new THREE.CircleGeometry(1.6, 32);
-    const rim = new THREE.RingGeometry(1, 1.42, 32, 1);
+    this.reticle = new TransformNode('ow-reticle', scene);
+    this.reticle.rotationQuaternion = new Quaternion();
+    this.reticle.parent = this.anchor;
+    const core = disk(1, 32);
+    const halo = disk(1.6, 32);
+    const rim = diskRing(1, 1.42, 32);
     const RING_SEGS = 12;
     const ringArcs = [];
     for (let i = 0; i < RING_SEGS; i++) {
       const a0 = (i / RING_SEGS) * TAU;
-      ringArcs.push(new THREE.RingGeometry(2.98, 3.42, 4, 1, a0, (TAU / RING_SEGS) * 0.56));
+      ringArcs.push(diskRing(2.98, 3.42, 4, a0, (TAU / RING_SEGS) * 0.56));
     }
-    const ring = mergeAll(ringArcs);
-    this._reticleGeo = [core, halo, rim, ring];
-    this.dotCore = new THREE.Mesh(core, mats.reticle(0xff1206, 0.95));
-    this.dotHalo = new THREE.Mesh(halo, mats.reticle(0xff2a0c, 0.34));
-    this.dotRim = new THREE.Mesh(rim, mats.reticleOutline(0.85));
-    this.dotRing = new THREE.Mesh(ring, mats.reticle(0xff1206, 0.95 * 0.5));
-    this.dotHalo.renderOrder = 19;
-    this.dotRim.renderOrder = 20;
-    this.dotRing.renderOrder = 20;
-    this.dotCore.renderOrder = 21;
-    this.reticle.add(this.dotHalo);
-    this.reticle.add(this.dotRim);
-    this.reticle.add(this.dotRing);
-    this.reticle.add(this.dotCore);
+    const ringGeo = mergeAll(ringArcs);
+    this.dotCore = meshFromGeo('ow-dot-core', core, mats.reticle(0xff1206, 0.95), scene);
+    this.dotHalo = meshFromGeo('ow-dot-halo', halo, mats.reticle(0xff2a0c, 0.34), scene);
+    this.dotRim = meshFromGeo('ow-dot-rim', rim, mats.reticleOutline(0.85), scene);
+    this.dotRing = meshFromGeo('ow-dot-ring', ringGeo, mats.reticle(0xff1206, 0.95 * 0.5), scene);
+    // 加算板の描画順 (Three の renderOrder 相当は alphaIndex)。
+    this.dotHalo.alphaIndex = 19;
+    this.dotRim.alphaIndex = 20;
+    this.dotRing.alphaIndex = 20;
+    this.dotCore.alphaIndex = 21;
     for (const m of [this.dotCore, this.dotHalo, this.dotRim, this.dotRing]) {
-      m.frustumCulled = false;
-      m.userData.owNoPrepass = true;
-      m.userData.owNoShadow = true;
+      m.parent = this.reticle;
+      m.renderingGroupId = this.RENDER_GROUP.VIEWMODEL;
     }
 
     // ---- animation state --------------------------------------------------
@@ -262,6 +192,7 @@ export class Viewmodel {
     this._prevYaw = 0;
     this._prevPitch = 0;
     this._hasPrev = false;
+    this._yp = { yaw: 0, pitch: 0 };
 
     // clip playback
     this.clip = null;
@@ -277,31 +208,23 @@ export class Viewmodel {
     this.magVisible = true;
 
     // preallocated working state
-    this._basePos = new THREE.Vector3();
-    this._baseQuat = new THREE.Quaternion();
-    this._adsPos = new THREE.Vector3();
-    this._adsQuat = new THREE.Quaternion();
-    this._tmpPos = new THREE.Vector3();
-    this._tmpQuat = new THREE.Quaternion();
-    this._handPos = new THREE.Vector3();
-    this._handQuat = new THREE.Quaternion();
-    this._handPosL = new THREE.Vector3();
-    this._handQuatL = new THREE.Quaternion();
-    this._sightLocal = new THREE.Vector3();
-    this._lhandTarget = new THREE.Vector3();
-    this._lhandFinger = [0, 0, 0];
-    this._lhandBack = [0, 0, 0];
-    this._muzzleWorld = new THREE.Vector3();
-    this._muzzleDir = new THREE.Vector3();
-    this._ejectWorld = new THREE.Vector3();
-    this._ejectVel = new THREE.Vector3();
+    this._basePos = new Vector3();
+    this._baseQuat = new Quaternion();
+    this._adsPos = new Vector3();
+    this._adsQuat = new Quaternion();
+    this._tmpPos = new Vector3();
+    this._tmpQuat = new Quaternion();
+    this._handPos = new Vector3();
+    this._handQuat = new Quaternion();
+    this._handPosL = new Vector3();
+    this._handQuatL = new Quaternion();
+    this._sightLocal = new Vector3();
+    this._muzzleWorld = new Vector3();
 
     this.debugFrozen = false;
-    /** Set false by the preview harness to leave the cameras alone. */
+    /** キャプチャ以外でカメラ追従を切りたいハーネス用フック。 */
     this.trackCamera = true;
     this.rigOverride = null;
-    this._scriptedFire = -1;
-    this._scriptShots = 0;
   }
 
   /* ====================================================================== */
@@ -313,70 +236,24 @@ export class Viewmodel {
    * One mesh per material per assembly: a whole rifle lands in 7-9 draw calls.
    */
   addWeapon(model, def) {
-    const group = new THREE.Object3D();
-    group.name = `weapon-${model.id}`;
-    group.visible = false;
-    this.rig.add(group);
+    const group = new TransformNode(`weapon-${model.id}`, this.scene);
+    group.parent = this.rig;
+    group.setEnabled(false);
 
     let tris = 0;
     const meshes = [];
-    const bake = this.mats.lib?.bakeMasks?.bind(this.mats.lib) ?? null;
 
-    const build = (asm, parent, wearScale = 1) => {
+    const build = (asm, parent) => {
       const map = asm.build();
       for (const [matKey, geo] of map) {
-        // Curvature masks: convex chamfers wear to bright metal, creases fill
-        // with grime. This is what stops the gun reading as clean plastic.
-        if (bake) {
-          /**
-           * Chamfered hard-surface geometry has no interior vertices on a face,
-           * so a per-vertex edge mask interpolates linearly from the chamfer all
-           * the way to the far side of the panel: a rail tooth, a mount top face
-           * or a handguard slat comes out uniformly worn, which is what turned
-           * the rail teeth into flat near-white bars and the mount into beige MDF.
-           *
-           * Bake the mask at full amplitude and then SHAPE it (below): raising the
-           * exponent is the only knob that pulls a vertex-interpolated ramp back
-           * onto the outer millimetre or two of the edge, because it pushes
-           * everything below the chamfer's own vertices toward zero.
-           */
-          const soft = matKey === 'polymer' || matKey === 'rubber' || matKey === 'polymer_tan';
-          bake(geo, { wear: 1, grime: 1, ao: 1, edgeThreshold: 0.16, rng: this.rng });
-          shapeMasks(geo, {
-            /**
-             * wearAmp comes DOWN and grimeAmp goes UP.
-             *
-             * With the viewmodel recalibrated to be diffuse-dominant (see
-             * materials.js `alu`), the wear layer's contrast against the base
-             * albedo is what decides whether a chamfer reads as polished alloy or
-             * as a white pencil line, and on small parts — where every vertex is
-             * convex — it decides whether a takedown pin reads as steel or as a
-             * cream plastic cube. 0.9 -> 0.62 on hard surfaces.
-             *
-             * Grime is the opposite: it is the only mask that paints the CONCAVE
-             * side of the geometry, so it is what puts dirt in the magwell corners,
-             * the trigger-guard fillet, the rail slots and the seam between the
-             * handguard panels. Those creases were reading perfectly clean, which
-             * is a large part of "props read as pasted-on decals" applied to a gun.
-             */
-            wearAmp: (soft ? 0.42 : 0.62) * wearScale,
-            wearExp: soft ? 3.4 : 2.8,
-            grimeAmp: 1.15,
-            grimeExp: 1.25,
-            aoAmp: 1.0,
-            aoExp: 1.15,
-          });
-        }
-        const mesh = new THREE.Mesh(geo, this.mats.get(matKey));
-        mesh.name = `${asm.name}-${matKey}`;
-        // The viewmodel does not cast into the cascades (it is not in the world
-        // scene), but it absolutely must RECEIVE the sun shadow: without this the
-        // gun is lit at full sun while the street around it is in shade, which is
-        // the single most obvious "pasted-on sticker" tell.
-        mesh.castShadow = false;
-        mesh.receiveShadow = true;
-        mesh.frustumCulled = false;
-        parent.add(mesh);
+        const mesh = meshFromGeo(`${asm.name}-${matKey}`, geo, this.mats.get(matKey), this.scene);
+        mesh.parent = parent;
+        mesh.renderingGroupId = this.RENDER_GROUP.VIEWMODEL;
+        /**
+         * ビューモデルは CSM のキャスタには登録しない (カメラ直付けの影が地面を
+         * 這うため) が、**受ける**のは必須 — 日陰で銃だけ日向は最悪の「貼り紙」。
+         */
+        mesh.receiveShadows = true;
         meshes.push(mesh);
         tris += triCount(geo);
       }
@@ -386,15 +263,16 @@ export class Viewmodel {
 
     const parts = {};
     for (const [name, asm] of Object.entries(model.moving)) {
-      const sub = new THREE.Object3D();
-      sub.name = `${model.id}-${name}`;
-      group.add(sub);
-      build(asm, sub, name === 'magazine' ? 0.8 : 1);
+      const sub = new TransformNode(`${model.id}-${name}`, this.scene);
+      sub.parent = group;
+      build(asm, sub);
       parts[name] = sub;
     }
 
     // Seat the moving parts at their rest transforms.
     const n = model.nodes;
+    // magazine だけはクォータニオン駆動 (_magFromHand の slerp が要るため)。
+    if (parts.magazine) parts.magazine.rotationQuaternion = new Quaternion();
     if (parts.magazine && n.magSeat) applyNode(parts.magazine, n.magSeat);
     if (parts.charging && n.chargeRest) applyNode(parts.charging, n.chargeRest);
     if (parts.bolt && n.boltRest) applyNode(parts.bolt, n.boltRest);
@@ -411,22 +289,24 @@ export class Viewmodel {
       meshes,
       tris,
       clips: buildClips(model.nodes, def),
-      // the sight point and its axis, in weapon space
-      sight: new THREE.Vector3().fromArray(model.nodes.sight),
-      ironSight: new THREE.Vector3().fromArray(model.nodes.ironSight ?? model.nodes.sight),
-      muzzle: new THREE.Vector3().fromArray(model.nodes.muzzle),
-      eject: new THREE.Vector3().fromArray(model.nodes.eject),
-      ejectDir: new THREE.Vector3().fromArray(model.nodes.ejectDir ?? [1, 0.4, 0.2]).normalize(),
+      sight: Vector3.FromArray(model.nodes.sight),
+      ironSight: Vector3.FromArray(model.nodes.ironSight ?? model.nodes.sight),
+      muzzle: Vector3.FromArray(model.nodes.muzzle),
+      eject: Vector3.FromArray(model.nodes.eject),
+      ejectDir: Vector3.FromArray(model.nodes.ejectDir ?? [1, 0.4, 0.2]).normalize(),
       optic: model.nodes.opticGlass ?? null,
-      magSeatPos: new THREE.Vector3().fromArray(model.nodes.magSeat.pos),
-      magSeatQuat: new THREE.Quaternion().setFromEuler(
-        new THREE.Euler().fromArray(model.nodes.magSeat.rot)
+      magSeatPos: Vector3.FromArray(model.nodes.magSeat.pos),
+      magSeatQuat: quatXYZToRef(
+        model.nodes.magSeat.rot[0],
+        model.nodes.magSeat.rot[1],
+        model.nodes.magSeat.rot[2],
+        new Quaternion()
       ),
       gripR: model.nodes.gripR,
       gripL: model.nodes.gripL,
-      chargePull: new THREE.Vector3().fromArray(model.nodes.chargePull ?? [0, 0, 0]),
-      boltTravel: new THREE.Vector3().fromArray(model.nodes.boltTravel ?? [0, 0, 0]),
-      slideTravel: new THREE.Vector3().fromArray(model.nodes.slideTravel ?? [0, 0, 0]),
+      chargePull: Vector3.FromArray(model.nodes.chargePull ?? [0, 0, 0]),
+      boltTravel: Vector3.FromArray(model.nodes.boltTravel ?? [0, 0, 0]),
+      slideTravel: Vector3.FromArray(model.nodes.slideTravel ?? [0, 0, 0]),
       triggerPull: model.nodes.triggerPull ?? -0.3,
       magLen: model.magSize?.len ?? 0.2,
       shell: model.shell,
@@ -440,86 +320,32 @@ export class Viewmodel {
   /**
    * GROUND THE SUPPORT HAND ON THE HANDGUARD — once, at build time.
    *
-   * Two halves, and both are needed: geometry alone still reads as two floating
-   * objects, and AO alone cannot close a 10 mm gap.
-   *
-   *  1. `Arm.fitToCylinder` searches each distal joint for the rotation that puts
-   *     that fingertip's contact patch on the handguard surface (<=1 mm off, up
-   *     to 1.5 mm buried), measured through the real transform chain rather than
-   *     derived analytically — see the note there for why the analytic version
-   *     was 8-14 mm out in every frame despite the maths being right.
-   *  2. The contact points that come back are then used to bake a contact-AO
-   *     gradient into BOTH sides of the interface: the handguard here, the glove
-   *     in `Arm.bakeContactAO`. 0.55 multiply at the contact, easing to 1.0 over
-   *     12 mm.
-   *
-   * The AO mask lives in vColor.b, which the library's shader turns into
-   * `orm.r *= 1 - vColor.b * wear[2]`; wear[2] is 0.5 on every weapon material,
-   * so a mask of 0.9 is the 0.55 multiply asked for.
+   * Three 版はここで (1) 指先の接触ソルブ (2) 接触 AO の頂点カラー焼き込み を
+   * やっていた。(2) は頂点マスクシェーダごと Babylon 版に存在しないので落とし、
+   * ポーズ品質を決める (1) だけを残す。
    */
   _fitSupportHand(w) {
     const hg = w.model.nodes.handguard;
     const gL = w.gripL;
     if (!hg || !gL || w.id === 'pistol') return;
-    this._handPosL.fromArray(gL.pos);
+    this._handPosL.set(gL.pos[0], gL.pos[1], gL.pos[2]);
     handBasis(this._handQuatL, gL.finger ?? [0.82, 0.5, -0.28], gL.back ?? [-0.5, 0.32, -0.8]);
     const poseName = `clamp:${w.id}`;
     this.armL.setPose('clamp');
-    const contacts = this.armL.fitToCylinder(
-      this._handPosL,
-      this._handQuatL,
-      hg.axis,
-      hg.dir,
-      hg.r,
-      { clearance: 0.001, poseName }
-    );
+    this.armL.fitToCylinder(this._handPosL, this._handQuatL, hg.axis, hg.dir, hg.r, {
+      clearance: 0.001,
+      poseName,
+    });
     w.lhandPose = poseName;
-    // Only keep contacts that actually landed on the handguard's own extent —
-    // a fingertip that overshot past the end cap must not paint AO on the barrel.
-    const z0 = Math.max(hg.z0, hg.z1);
-    const z1 = Math.min(hg.z0, hg.z1);
-    const kept = contacts.filter((p) => p.z <= z0 + 0.012 && p.z >= z1 - 0.012);
-    this.armL.bakeContactAO(kept, 0.012, 0.7);
-    this._bakeContactAOOnWeapon(w, kept, 0.012, 0.9);
     this.armL.setPose(poseName);
-  }
-
-  /**
-   * The weapon side of the same contact gradient. The handguard geometry already
-   * carries wear/grime/AO masks from `bakeMasks`, so this only ever RAISES the
-   * AO channel — the edge-wear and grime layers are untouched.
-   */
-  _bakeContactAOOnWeapon(w, contacts, radius, peak) {
-    if (!contacts.length) return;
-    const r2 = radius * radius;
-    for (const mesh of w.meshes) {
-      const geo = mesh.geometry;
-      const pos = geo.getAttribute('position');
-      const col = geo.getAttribute('color');
-      if (!pos || !col) continue;
-      for (let i = 0; i < pos.count; i++) {
-        _v.fromBufferAttribute(pos, i);
-        let closest = Infinity;
-        for (const c of contacts) {
-          const d2 = _v.distanceToSquared(c);
-          if (d2 < closest) closest = d2;
-        }
-        if (closest > r2) continue;
-        const t = 1 - Math.sqrt(closest) / radius;
-        const s = t * t * t * (t * (t * 6 - 15) + 10);
-        const k = i * 3 + 2;
-        col.array[k] = Math.max(col.array[k], peak * s);
-      }
-      col.needsUpdate = true;
-    }
   }
 
   setActive(id) {
     const w = this.weapons.get(id);
     if (!w || w === this.active) return this.active;
-    if (this.active) this.active.group.visible = false;
+    if (this.active) this.active.group.setEnabled(false);
     this.active = w;
-    w.group.visible = true;
+    w.group.setEnabled(true);
     this.recPos.reset();
     this.recRot.reset();
     this.settle.reset();
@@ -528,7 +354,7 @@ export class Viewmodel {
     this.magInHand = 0;
     this.magVisible = true;
     this.armR.setPose('grip');
-    // The FITTED clamp for this weapon, not the authored one — see _fitSupportHand.
+    // The FITTED clamp for this weapon, not the authored one.
     this.armL.setPose(w.lhandPose ?? (id === 'pistol' ? 'cup' : 'clamp'));
     return w;
   }
@@ -576,7 +402,6 @@ export class Viewmodel {
     if (!w) return;
     const r = w.def.recoil;
     const ads = this.adsT;
-    // Aiming braces the weapon: less travel, faster return.
     const scale = lerp(1, 0.54, ads) * (first ? 1.18 : 1);
     const jitter = 0.86 + this.rng.float() * 0.3;
     this.recPos.f = r.freq;
@@ -597,7 +422,6 @@ export class Viewmodel {
       (-yaw * 4.5 - this.rng.signed() * r.yaw * 0.8) * scale * wr,
       (this.rng.signed() * 0.4 + 0.6) * r.roll * scale * wr
     );
-    // Slow settling drift after a burst — the muzzle keeps wandering a little.
     const ws = TAU * this.settle.f;
     this.settle.kick(
       this.rng.signed() * 0.0012 * scale * ws,
@@ -622,7 +446,7 @@ export class Viewmodel {
   /**
    * @param {number} dt
    * @param {object} s  { ads, sprint, lowReady, speed, crouch, airborne,
-   *                      trigger, empty, cycleTime }
+   *                      trigger, empty }
    */
   update(dt, s) {
     const w = this.active;
@@ -634,21 +458,20 @@ export class Viewmodel {
 
     /* -------- camera-relative anchor ---------------------------------- */
     const cam = this.ctx.camera;
-    const vcam = this.ctx.viewCamera;
     if (this.trackCamera) {
-      cam.updateMatrixWorld();
-      this.anchor.position.setFromMatrixPosition(cam.matrixWorld);
-      this.anchor.quaternion.setFromRotationMatrix(cam.matrixWorld);
-      // Keep the viewmodel camera coincident with the world camera: the renderer
-      // uses that to decide the gun can share the world's shadow cascades.
-      vcam.position.copy(this.anchor.position);
-      vcam.quaternion.copy(this.anchor.quaternion);
+      /**
+       * カメラのワールド行列 (= view の逆行列) をそのまま貰う。RH ビュー行列
+       * なのでカメラ空間は GL 流 (-Z 前方 / +X 右 / +Y 上) — defs.js の
+       * ポーズ数値 (Three 規約) がそのまま通る根拠。
+       */
+      cam.getWorldMatrix().decompose(undefined, this.anchor.rotationQuaternion, this.anchor.position);
     }
+    this.anchor.computeWorldMatrix(true);
 
     /* -------- angular velocity for the lag layer ---------------------- */
-    _e.setFromQuaternion(this.anchor.quaternion, 'YXZ');
-    const yaw = _e.y;
-    const pitch = _e.x;
+    yawPitchFromQuat(this.anchor.rotationQuaternion, this._yp);
+    const yaw = this._yp.yaw;
+    const pitch = this._yp.pitch;
     if (this._hasPrev && dt > 1e-5) {
       const dy = wrapPi(yaw - this._prevYaw) / dt;
       const dp = wrapPi(pitch - this._prevPitch) / dt;
@@ -682,39 +505,36 @@ export class Viewmodel {
     const hipP = def.hipPos;
     const hipR = def.hipRot;
     this._basePos.set(hipP[0], hipP[1], hipP[2]);
-    _e.set(hipR[0], hipR[1], hipR[2], 'XYZ');
-    this._baseQuat.setFromEuler(_e);
+    quatXYZToRef(hipR[0], hipR[1], hipR[2], this._baseQuat);
 
     // Sprint / low-ready poses replace the hip pose.
     if (this.sprintT > 1e-3) {
       const p = def.sprintPos;
       const r = def.sprintRot;
       this._tmpPos.set(p[0], p[1], p[2]);
-      _e.set(r[0], r[1], r[2], 'XYZ');
-      this._tmpQuat.setFromEuler(_e);
-      this._basePos.lerp(this._tmpPos, this.sprintT);
-      this._baseQuat.slerp(this._tmpQuat, this.sprintT);
+      quatXYZToRef(r[0], r[1], r[2], this._tmpQuat);
+      Vector3.LerpToRef(this._basePos, this._tmpPos, this.sprintT, this._basePos);
+      Quaternion.SlerpToRef(this._baseQuat, this._tmpQuat, this.sprintT, this._baseQuat);
     }
     if (this.lowReadyT > 1e-3) {
       const p = def.lowReadyPos;
       const r = def.lowReadyRot;
       this._tmpPos.set(p[0], p[1], p[2]);
-      _e.set(r[0], r[1], r[2], 'XYZ');
-      this._tmpQuat.setFromEuler(_e);
-      this._basePos.lerp(this._tmpPos, this.lowReadyT);
-      this._baseQuat.slerp(this._tmpQuat, this.lowReadyT);
+      quatXYZToRef(r[0], r[1], r[2], this._tmpQuat);
+      Vector3.LerpToRef(this._basePos, this._tmpPos, this.lowReadyT, this._basePos);
+      Quaternion.SlerpToRef(this._baseQuat, this._tmpQuat, this.lowReadyT, this._baseQuat);
     }
 
     /* -------- ADS pose: solved, not authored --------------------------- */
     if (ads > 1e-4) {
       const cant = def.adsCant;
-      _e.set(cant[0], cant[1], cant[2], 'XYZ');
-      this._adsQuat.setFromEuler(_e);
+      quatXYZToRef(cant[0], cant[1], cant[2], this._adsQuat);
       // sight point in rig space, then the translation that lands it on axis
-      this._sightLocal.copy(w.sight).applyQuaternion(this._adsQuat);
-      this._adsPos.set(0, 0, -def.eyeRelief).sub(this._sightLocal);
-      this._basePos.lerp(this._adsPos, ads);
-      this._baseQuat.slerp(this._adsQuat, ads);
+      this._sightLocal.copyFrom(w.sight);
+      this._sightLocal.rotateByQuaternionToRef(this._adsQuat, this._sightLocal);
+      this._adsPos.set(0, 0, -def.eyeRelief).subtractInPlace(this._sightLocal);
+      Vector3.LerpToRef(this._basePos, this._adsPos, ads, this._basePos);
+      Quaternion.SlerpToRef(this._baseQuat, this._adsQuat, ads, this._baseQuat);
     }
 
     /* -------- additive layers ------------------------------------------ */
@@ -727,7 +547,7 @@ export class Viewmodel {
     const swayX = n[0].fbm(t * nr[0], 3) * 0.55 + n[3].fbm(t * nr[3] * 2.3, 2) * 0.45;
     const swayY = n[1].fbm(t * nr[1], 3) * 0.55 + n[4].fbm(t * nr[4] * 2.1, 2) * 0.45;
     const swayZ = n[2].fbm(t * nr[2], 2) * 0.6 + n[5].fbm(t * nr[5] * 1.7, 2) * 0.4;
-    // Breathing: a slow 0.22 Hz cycle under the noise.
+    // Breathing: a slow cycle under the noise.
     const breath = Math.sin(t * 1.38) * 0.5 + Math.sin(t * 0.61 + 1.1) * 0.25;
 
     let px = swayX * 0.0075 * swayScale;
@@ -742,7 +562,6 @@ export class Viewmodel {
     const bobAmt =
       def.bobScale * clamp01(speed / 4.2) * lerp(1, 0.28, ads) * (s.airborne ? 0.25 : 1);
     if (speed > 0.05) {
-      // Stride frequency scales with speed; sprint takes longer strides.
       this.bobPhase += dt * (3.1 + speed * 0.72) * (s.sprint ? 1.05 : 1);
       if (this.bobPhase > TAU * 64) this.bobPhase -= TAU * 64;
     }
@@ -816,22 +635,15 @@ export class Viewmodel {
     }
 
     /* -------- compose -------------------------------------------------- */
-    this.rig.position.set(
-      this._basePos.x + px,
-      this._basePos.y + py,
-      this._basePos.z + pz
-    );
-    _e.set(rx, ry, rz, 'XYZ');
-    _q.setFromEuler(_e);
-    this.rig.quaternion.copy(this._baseQuat).multiply(_q);
-    // The standalone preview harness pins the rig so the weapon can be framed
-    // in its own space; everything downstream reads the composed transform.
+    this.rig.position.set(this._basePos.x + px, this._basePos.y + py, this._basePos.z + pz);
+    quatXYZToRef(rx, ry, rz, _q);
+    // Three 版の rig.quaternion.copy(base).multiply(q) と同じ合成順 (base ⊗ 加算層)。
+    this._baseQuat.multiplyToRef(_q, this.rig.rotationQuaternion);
     if (this.rigOverride) {
-      this.rig.position.copy(this.rigOverride.position);
-      this.rig.quaternion.copy(this.rigOverride.quaternion);
+      this.rig.position.copyFrom(this.rigOverride.position);
+      this.rig.rotationQuaternion.copyFrom(this.rigOverride.rotationQuaternion);
     }
-    this.rig.updateMatrix();
-    this.rig.updateMatrixWorld(true);
+    this.rig.computeWorldMatrix(true);
 
     /* -------- hands (first: the magazine can be held by one) ---------- */
     this._solveHands(w, res);
@@ -841,14 +653,6 @@ export class Viewmodel {
 
     /* -------- reticle -------------------------------------------------- */
     this._updateReticle(w, ads);
-
-    /* -------- viewmodel FOV ------------------------------------------- */
-    const fovBase = 60;
-    const targetFov = fovBase * lerp(1, def.viewFov, ads);
-    if (Math.abs(vcam.fov - targetFov) > 1e-3) {
-      vcam.fov = targetFov;
-      vcam.updateProjectionMatrix();
-    }
   }
 
   /* ---------------------------------------------------------------------- */
@@ -901,42 +705,41 @@ export class Viewmodel {
     if (p.magazine) {
       const inHand = res.active ? res.parts.mag : 0;
       this.magVisible = res.active ? res.parts.magVisible : true;
-      p.magazine.visible = this.magVisible;
+      p.magazine.setEnabled(this.magVisible);
       if (inHand > 1e-4) {
-        // Follow the support hand: the magazine is gripped by its spine.
         this._magFromHand(w, p.magazine, inHand);
       } else {
-        p.magazine.position.copy(w.magSeatPos);
-        p.magazine.quaternion.copy(w.magSeatQuat);
+        p.magazine.position.copyFrom(w.magSeatPos);
+        p.magazine.rotationQuaternion.copyFrom(w.magSeatQuat);
       }
     }
   }
 
   _magFromHand(w, magGroup, weight) {
-    // The hand target is a WRIST in weapon space, so the magazine has to be
-    // offset into the palm (about 62 mm along the hand's -Z, the metacarpal
-    // axis) before the along-the-magazine offset — otherwise the mag is gripped
-    // by thin air behind the hand.
-    _q.copy(this._handQuatL);
-    _v.copy(this._handPosL);
-    _v2.set(0, w.magLen * 0.62, -0.062).applyQuaternion(_q);
-    _v.add(_v2);
-    magGroup.position.lerpVectors(w.magSeatPos, _v, weight);
-    _q2.copy(w.magSeatQuat).slerp(_q, weight);
-    magGroup.quaternion.copy(_q2);
+    // The hand target is a WRIST in weapon space: offset into the palm (62 mm
+    // along the hand's -Z) before the along-the-magazine offset.
+    _q.copyFrom(this._handQuatL);
+    _v.copyFrom(this._handPosL);
+    _v2.set(0, w.magLen * 0.62, -0.062);
+    _v2.rotateByQuaternionToRef(_q, _v2);
+    _v.addInPlace(_v2);
+    Vector3.LerpToRef(w.magSeatPos, _v, weight, magGroup.position);
+    Quaternion.SlerpToRef(w.magSeatQuat, _q, weight, magGroup.rotationQuaternion);
   }
 
   _solveHands(w, res) {
     // Shoulders are body-fixed: express the camera-space anchor in rig space.
-    _q.copy(this.rig.quaternion).invert();
-    _v.copy(this.shoulderR).sub(this.rig.position).applyQuaternion(_q);
-    this.armR.shoulder.copy(_v);
-    _v.copy(this.shoulderL).sub(this.rig.position).applyQuaternion(_q);
-    this.armL.shoulder.copy(_v);
+    this.rig.rotationQuaternion.conjugateToRef(_q);
+    _v.copyFrom(this.shoulderR).subtractInPlace(this.rig.position);
+    _v.rotateByQuaternionToRef(_q, _v);
+    this.armR.shoulder.copyFrom(_v);
+    _v.copyFrom(this.shoulderL).subtractInPlace(this.rig.position);
+    _v.rotateByQuaternionToRef(_q, _v);
+    this.armL.shoulder.copyFrom(_v);
 
     // ---- shooting hand: welded to the grip ----
     const gR = w.gripR;
-    this._handPos.fromArray(gR.pos);
+    this._handPos.set(gR.pos[0], gR.pos[1], gR.pos[2]);
     handBasis(this._handQuat, gR.finger ?? [0, -0.35, -0.94], gR.back ?? [0.95, 0.25, 0.18]);
     this.armR.solve(this._handPos, this._handQuat);
     this.armR.setTrigger(this.triggerT);
@@ -960,36 +763,31 @@ export class Viewmodel {
   }
 
   /**
-   * The collimated dot.
-   *
-   * A red dot sight is a collimator: the reticle sits at optical infinity along
-   * the tube axis, so its apparent direction from the eye is the tube axis —
-   * independent of where the eye is. Reproducing that exactly (rather than
-   * gluing a sprite to the glass) is why the dot stays on target while the
-   * weapon sways, and why it vignettes out when you look through the tube from
-   * an angle.
+   * The collimated dot — レティクルは光学的無限遠にあるので、見かけの方向は
+   * チューブ軸そのもの。スプライトをガラスに貼らずこれを再現するから、武器が
+   * 揺れてもドットは照準点に残り、斜めから覗くとビネットで消える。
    */
   _updateReticle(w, ads) {
     const optic = w.optic;
     if (!optic) {
-      this.reticle.visible = false;
+      this.reticle.setEnabled(false);
       return;
     }
-    // Optic axis and lens centre, both in camera space. The weapon group is a
-    // child of the rig which is a child of the anchor, so camera space is just
-    // the rig transform applied to the weapon-local values — no inverses, no
-    // allocation.
-    _v.fromArray(optic.center).applyQuaternion(this.rig.quaternion).add(this.rig.position);
-    _v3.set(0, 0, -1).applyQuaternion(this.rig.quaternion).normalize();
+    // Optic axis and lens centre, both in camera (anchor) space.
+    _v.set(optic.center[0], optic.center[1], optic.center[2]);
+    _v.rotateByQuaternionToRef(this.rig.rotationQuaternion, _v);
+    _v.addInPlace(this.rig.position);
+    _v3.copyFrom(_NEG_Z);
+    _v3.rotateByQuaternionToRef(this.rig.rotationQuaternion, _v3);
+    _v3.normalize();
 
     // Where the axis ray from the eye crosses the lens plane.
-    const s = _v.dot(_v3);
+    const s = Vector3.Dot(_v, _v3);
     if (s <= 0.02) {
-      this.reticle.visible = false;
+      this.reticle.setEnabled(false);
       return;
     }
-    _v2.copy(_v3).multiplyScalar(s); // dot position in camera space
-    // Vignette: how far off the lens centre the apparent dot lands.
+    _v2.copyFrom(_v3).scaleInPlace(s); // dot position in camera space
     const offX = _v2.x - _v.x;
     const offY = _v2.y - _v.y;
     const off = Math.hypot(offX, offY);
@@ -998,39 +796,29 @@ export class Viewmodel {
     alpha *= lerp(0.55, 1, ads); // brighter once the eye is behind the glass
 
     if (alpha <= 0.01) {
-      this.reticle.visible = false;
+      this.reticle.setEnabled(false);
       return;
     }
-    this.reticle.visible = true;
-    this.reticle.position.copy(_v2);
-    this.reticle.lookAt(this.anchor.getWorldPosition(_v));
+    this.reticle.setEnabled(true);
+    this.reticle.position.copyFrom(_v2);
+    // 板 (+Z 法線) を目 (カメラ空間原点) に向ける。
+    _v3.copyFrom(_v2).scaleInPlace(-1 / Math.max(1e-6, _v2.length()));
+    Quaternion.FromUnitVectorsToRef(_POS_Z, _v3, this.reticle.rotationQuaternion);
     /**
-     * SIZE. Angular, so it is FOV-independent within a stance — but not constant
-     * across stances, because the requirement is a fixed number of PIXELS.
-     *
-     * A geometrically honest 2 MOA emitter subtends 0.58 mrad, which at the
-     * viewmodel camera's 0.97 mrad/px (60 deg over 1080 px) is 0.6 px: a dead
-     * subpixel, which is exactly what the old 0.0012 rad dot measured as. Every
-     * shipped red dot cheats this, and cheats it in the same direction — the
-     * reticle is drawn at a legible size and grows as you come into the glass,
-     * because that is the perceptual experience of putting your eye behind a
-     * collimator. So:
-     *   hipfire  0.00385 rad -> 4.0 px radius,  7.9 px dot
-     *   ADS      0.00655 rad -> 7.9 px radius, 15.7 px dot   (0.83 mrad/px)
-     * with the halo at 1.6x and the segmented ring at 3.2x, both scaled off the
-     * same number so the reticle never changes shape.
+     * SIZE: 幾何学的に正直な 2 MOA は 0.6 px (死んだサブピクセル) なので、
+     * 市販のダットサイトと同じ方向にチートする — 判読できるサイズで描き、
+     * 目がガラスに近づくほど育てる。hip 4 px / ADS 7.9 px 半径。
      */
     const coreR = s * lerp(0.00385, 0.00655, ads);
-    this.dotCore.scale.setScalar(coreR);
-    this.dotRim.scale.setScalar(coreR);
-    this.dotHalo.scale.setScalar(coreR);
-    this.dotRing.scale.setScalar(coreR);
-    this.dotCore.material.opacity = alpha;
-    this.dotRim.material.opacity = alpha * 0.8;
-    this.dotRing.material.opacity = alpha;
-    // The halo is a bloom seed, not a glow: 6% at 1.6x the core radius adds ~1 px
-    // of soft falloff and nothing else.
-    this.dotHalo.material.opacity = alpha * 0.06;
+    this.dotCore.scaling.setAll(coreR);
+    this.dotRim.scaling.setAll(coreR);
+    this.dotHalo.scaling.setAll(coreR);
+    this.dotRing.scaling.setAll(coreR);
+    this.dotCore.material.alpha = alpha;
+    this.dotRim.material.alpha = alpha * 0.8;
+    this.dotRing.material.alpha = alpha;
+    // The halo is a bloom seed, not a glow.
+    this.dotHalo.material.alpha = alpha * 0.06;
   }
 
   /* ====================================================================== */
@@ -1041,24 +829,25 @@ export class Viewmodel {
   muzzleWorld(out) {
     const w = this.active;
     if (!w) return out.set(0, 0, 0);
-    w.group.updateMatrixWorld();
-    out.copy(w.muzzle).applyMatrix4(w.group.matrixWorld);
-    // viewScene space == world space because the anchor tracks the camera.
+    w.group.computeWorldMatrix(true);
+    Vector3.TransformCoordinatesToRef(w.muzzle, w.group.getWorldMatrix(), out);
     return out;
   }
 
   ejectWorld(out) {
     const w = this.active;
     if (!w) return out.set(0, 0, 0);
-    w.group.updateMatrixWorld();
-    out.copy(w.eject).applyMatrix4(w.group.matrixWorld);
+    w.group.computeWorldMatrix(true);
+    Vector3.TransformCoordinatesToRef(w.eject, w.group.getWorldMatrix(), out);
     return out;
   }
 
   ejectVelocity(out, speed = 2.6) {
     const w = this.active;
     if (!w) return out.set(0, 0, 0);
-    out.copy(w.ejectDir).transformDirection(w.group.matrixWorld).multiplyScalar(speed);
+    w.group.computeWorldMatrix(true);
+    Vector3.TransformNormalToRef(w.ejectDir, w.group.getWorldMatrix(), out);
+    out.normalize().scaleInPlace(speed);
     return out;
   }
 
@@ -1066,23 +855,23 @@ export class Viewmodel {
   boreDir(out) {
     const w = this.active;
     if (!w) return out.set(0, 0, -1);
-    out.set(0, 0, -1).transformDirection(w.group.matrixWorld).normalize();
-    return out;
+    w.group.computeWorldMatrix(true);
+    Vector3.TransformNormalToRef(_NEG_Z, w.group.getWorldMatrix(), out);
+    return out.normalize();
   }
 
   dispose() {
-    for (const w of this.weapons.values()) {
-      for (const m of w.meshes) m.geometry.dispose();
-    }
+    // anchor 以下 (rig / weapons / arms / reticle) を再帰破棄。
+    // マテリアルは WeaponMaterials が所有しているのでここでは触らない。
+    this.anchor.dispose(false, false);
     this.weapons.clear();
-    this.armL.dispose();
-    this.armR.dispose();
-    for (const g of this._reticleGeo) g.dispose();
-    this.anchor.removeFromParent();
   }
 }
 
 function applyNode(obj, node) {
-  obj.position.fromArray(node.pos);
-  if (node.rot) obj.rotation.fromArray(node.rot);
+  obj.position.set(node.pos[0], node.pos[1], node.pos[2]);
+  if (node.rot) {
+    if (obj.rotationQuaternion) quatXYZToRef(node.rot[0], node.rot[1], node.rot[2], obj.rotationQuaternion);
+    else obj.rotation.set(node.rot[0], node.rot[1], node.rot[2]);
+  }
 }

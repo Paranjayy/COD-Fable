@@ -7,6 +7,7 @@ import { RenderSystem } from './render/index.js';
 import { PhysicsSystem } from './physics/index.js';
 import { WorldSystem } from './world/index.js';
 import { PlayerSystem } from './player/index.js';
+import { WeaponSystem } from './weapons/index.js';
 import { FxSystem } from './fx/index.js';
 import { UiSystem } from './ui/index.js';
 import { AudioSystem } from './audio/index.js';
@@ -75,6 +76,7 @@ const engine = await Engine.create({ canvas, config });
  *   physics   → (なし)
  *   world     → materials, physics, render
  *   player    → physics, world, render
+ *   weapons   → materials, physics
  *   fx        → render, materials, physics
  *   ui        → render
  *   audio     → (なし)  physics は実行時に peek するだけなので依存にしない。
@@ -87,6 +89,7 @@ engine
   .add(PhysicsSystem)
   .add(WorldSystem)
   .add(PlayerSystem)
+  .add(WeaponSystem)
   .add(FxSystem)
   .add(UiSystem)
   .add(AudioSystem);
