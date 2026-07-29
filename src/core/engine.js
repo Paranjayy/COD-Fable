@@ -100,11 +100,12 @@ export class Engine {
     const forced = config.backend; // 'webgpu' | 'webgl2' | undefined (=auto)
     let engine = null;
     let backend = null;
+    let target = canvas;
 
     const wantWebGPU = forced !== 'webgl2' && (await WebGPUEngine.IsSupportedAsync);
     if (wantWebGPU) {
       try {
-        const gpu = new WebGPUEngine(canvas, {
+        const gpu = new WebGPUEngine(target, {
           antialias: false, // AA は TAA / FXAA がポストで担当する
           stencil: true,
           powerPreference: 'high-performance',
@@ -117,12 +118,29 @@ export class Engine {
       } catch (err) {
         console.warn('[engine] WebGPU init failed, falling back to WebGL2:', err);
         engine = null;
+        /**
+         * **キャンバスを作り直してからフォールバックする。**
+         *
+         * `HTMLCanvasElement.getContext()` は最初に成功した context type で
+         * キャンバスを固定し、以後**別 type の getContext は null を返す**。
+         * `IsSupportedAsync` は navigator.gpu とアダプタの可用性しか見ないので、
+         * 「対応していると判定されたが initAsync が失敗する」経路が存在する。
+         * その場合 WebGPU の context が既にキャンバスに bind されており、
+         * 同じキャンバスで WebGL2 を作ろうとしても失敗する。
+         *
+         * 同じ id / class / 属性を持つ新しい canvas に差し替えることで、
+         * フォールバックが実際に機能するようにする。**この経路は実機で
+         * 再現させて検証できていない** (initAsync を意図的に失敗させる手段が
+         * 無いため) ので、フォールバックが必要になった環境では最初に
+         * ここを疑うこと。
+         */
+        target = replaceCanvas(canvas);
       }
     }
 
     if (!engine) {
       engine = new WebGL2Engine(
-        canvas,
+        target,
         false,
         {
           stencil: true,
@@ -134,6 +152,7 @@ export class Engine {
       );
       backend = 'webgl2';
     }
+    canvas = target;
 
     if (forced === 'webgpu' && backend !== 'webgpu') {
       throw new Error('?backend=webgpu was requested but WebGPU is unavailable in this browser');
@@ -367,6 +386,20 @@ export class Engine {
     this.scene.dispose();
     this.babylon.dispose();
   }
+}
+
+/**
+ * キャンバスを同等の新しい要素に差し替える。
+ *
+ * WebGPU の context が bind 済みのキャンバスでは WebGL2 の getContext が失敗するため、
+ * フォールバック時にだけ使う。id / class / style / 属性を引き継ぐので、CSS と
+ * `document.getElementById('game')` はそのまま効く。
+ */
+function replaceCanvas(old) {
+  const next = document.createElement('canvas');
+  for (const attr of old.attributes) next.setAttribute(attr.name, attr.value);
+  old.replaceWith(next);
+  return next;
 }
 
 /**
