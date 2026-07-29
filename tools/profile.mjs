@@ -35,6 +35,8 @@ const FRAMES = Number(args.frames ?? 900);
  * 切り分けるため。中央値のフレーム時間だけを見ていると、この区別は絶対に付かない。
  */
 const NOFIRE = !!args.nofire;
+/** `--noai` で AI の交戦ステージを起動しない。AI 起因のヒッチを切り分けるため。 */
+const NOAI = !!args.noai;
 
 const browser = await chromium.launch({
   headless: true,
@@ -82,12 +84,13 @@ const internal = await page.evaluate(() => {
 });
 
 // Enable player control and run a scripted gameplay sequence while sampling.
-await page.evaluate(() => {
+await page.evaluate((noai) => {
+  window.__NOAI__ = noai;
   const e = window.__ENGINE__;
   e.input.enabled = true; e.input.frozen = false;
   e.ctx.peek('player')?.setControlEnabled?.(true);
-  e.ctx.peek('ai')?.debugStage?.('firefight');
-});
+  if (!window.__NOAI__) e.ctx.peek('ai')?.debugStage?.('firefight');
+}, NOAI);
 
 const result = await page.evaluate(({ FRAMES, NOFIRE }) => new Promise((done) => {
   const e = window.__ENGINE__;
