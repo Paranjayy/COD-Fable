@@ -11,35 +11,64 @@ import { Input } from './input.js';
 import { Rng } from './rng.js';
 
 /**
- * レイヤーマスク — ワールドとビューモデル(一人称の手/銃)の描き分け。
+ * レイヤーマスク。
  *
- * ## なぜ「2 つの Scene」ではなく「1 Scene + 2 カメラ」なのか
+ * ワールドとビューモデルの描き分けは **renderingGroupId** で行い、layerMask は
+ * 「特定のパスから外したいもの」用に残してある (影のプローブ等)。区別の理由は
+ * RENDER_GROUP のコメントを参照。
+ */
+export const LAYER = {
+  /** 通常のワールドジオメトリ。 */
+  WORLD: 0x0fffffff,
+};
+
+/**
+ * 描画グループ — ワールドとビューモデル(一人称の手/銃)の描き分け。
  *
- * Three.js 版は `scene` と `viewScene` の 2 つを持ち、ビューモデル専用のライト
- * リグを viewScene 側に組んでいた。その結果 README に記録された既知の根本原因が
- * 生まれている:
+ * ## なぜ「2 つの Scene」でも「2 台のカメラ」でもないのか
+ *
+ * Three.js 版は `scene` と `viewScene` の 2 シーン構成で、ビューモデル専用の
+ * ライトリグを持っていた。その結果 README に記録された既知の根本原因が生まれた:
  *
  *   > viewmodel の light rig が world の約 20 倍の irradiance を出しており、
  *   > view scene では *黒* のマテリアルですら L=110 (背景 91) で描かれる。
  *   > 全武器の albedo を物理値の 1/3 に誤魔化して辻褄を合わせているため、
  *   > ゲーム中で最も注視されるオブジェクトのマテリアル表現力が頭打ち。
  *
- * これは「2 つの独立した照明環境を人間が手で一致させ続ける」構造そのものが
- * 原因で、放置すれば移植先でも必ず再発する。Babylon では 1 つの Scene を
- * layerMask で描き分ければ、ビューモデルは **world と同一の IBL / 同一の
- * ライトリスト / 同一の露出** で焼かれるため、20 倍のズレは構造的に発生しえない。
+ * 原因は「2 つの独立した照明環境を人手で一致させ続ける」構造そのもの。放置すれば
+ * 移植先でも必ず再発するので、**照明・露出・トーンマップを 1 本しか持たない構成**に
+ * する必要がある。
  *
- * 代償はビューモデル用のニアクリップを別に持てないこと。これは 2 台目のカメラ
- * (`viewCamera`, near=0.005) を activeCameras の 2 番目に置くことで解決する。
- * Babylon は activeCameras を順に描画し、2 台目以降はカラーを保持したまま
- * **深度だけをクリア**するので、銃が壁にめり込むことはない (Three 版が
- * viewScene を分けていた本来の目的はこれで満たされる)。
+ * 最初 activeCameras に 2 台並べる構成にしたが、これは誤りだった:
+ * **Babylon のポストプロセスはカメラ単位で適用される**ため、パイプラインを 1 台目に
+ * だけ付けるとビューモデルにトーンマップもブルームも露出も掛からず、両方に付けると
+ * ポストが 2 回走る。どちらも「照明環境が 2 つある」のと同じ病に戻る。
+ *
+ * 正解は **1 カメラ + renderingGroupId**:
+ *
+ *   group 0 … ワールド
+ *   group 1 … ビューモデル (このグループの手前で **深度だけクリア**する)
+ *
+ * 深度クリアにより銃が壁を貫通しない (viewScene を分けていた本来の目的)。同時に
+ * ポストチェインは 1 本なので、ビューモデルは定義上ワールドと同一の露出・同一の
+ * IBL で焼かれる。20 倍のズレは構造的に発生しえない。
+ *
+ * ## 代償 (意図的に受け入れているもの)
+ *
+ * ビューモデル専用のニアクリップと FOV を持てない。したがって:
+ *
+ *   - ビューモデルは camera.minZ (0.05 m) より手前に置けない。weapons 側は
+ *     必ずこれより奥に配置すること。
+ *   - ADS でワールド FOV を絞ると武器も一緒にスケールする。実機の FPS は武器に
+ *     別 FOV を持たせるのが普通だが、weapons 側が ADS 遷移で位置と姿勢を動かす
+ *     ぶんで吸収する方針とした。
+ *
+ * この 2 点は「照明が 1 本であること」と引き換えに選んだ。逆にすると README に
+ * 記録された事故を再導入することになる。
  */
-export const LAYER = {
-  /** 通常のワールドジオメトリ。 */
-  WORLD: 0x0fffffff,
-  /** 一人称ビューモデル専用。world カメラからは見えない。 */
-  VIEWMODEL: 0x10000000,
+export const RENDER_GROUP = {
+  WORLD: 0,
+  VIEWMODEL: 1,
 };
 
 /**
@@ -141,7 +170,13 @@ export class Engine {
     scene.clearColor = new Color4(0, 0, 0, 1);
     this.scene = scene;
 
-    /** ワールドカメラ。回転は player サブシステムが yaw/pitch で駆動する。 */
+    /**
+     * 唯一のカメラ。回転は player サブシステムが yaw/pitch で駆動する。
+     *
+     * カメラを 1 台に絞る理由は RENDER_GROUP のコメントを参照 (要点: Babylon の
+     * ポストプロセスはカメラ単位なので、2 台にするとビューモデルの露出が
+     * ワールドから外れる — Three 版で破綻した構図の再導入になる)。
+     */
     const camera = new FreeCamera('worldCamera', new Vector3(0, 1.7, 0), scene);
     camera.minZ = 0.05;
     camera.maxZ = 1200;
@@ -150,23 +185,18 @@ export class Engine {
     /** 入力は core/input.js が一元管理する。Babylon 内蔵の操作は必ず切る。 */
     camera.inputs.clear();
     this.camera = camera;
+    scene.activeCamera = camera;
 
-    /**
-     * ビューモデル用カメラ。activeCameras の 2 番目に置くことで、カラーを保持した
-     * まま深度だけクリアして重ね描きされる — 銃がワールドジオメトリを貫通しない。
-     */
-    const viewCamera = new FreeCamera('viewCamera', Vector3.Zero(), scene);
-    viewCamera.minZ = 0.005;
-    viewCamera.maxZ = 12;
-    viewCamera.fov = degToRad(60);
-    viewCamera.layerMask = LAYER.VIEWMODEL;
-    viewCamera.inputs.clear();
-    this.viewCamera = viewCamera;
-
-    scene.activeCameras = [camera, viewCamera];
-    /** カラーは 1 台目でのみクリア、深度はカメラ間でクリアされる (Babylon 既定)。 */
     scene.autoClear = true;
     scene.autoClearDepthAndStencil = true;
+    /**
+     * ビューモデルのグループに入る **手前で深度をクリア**する。
+     *
+     * 第 2 引数 (autoClearDepthStencil) が true、第 3 引数 (depth) が true、
+     * 第 4 引数 (stencil) が false。カラーはクリアしないので、ワールドの絵の上に
+     * 深度だけリセットして重ね描きされる = 銃が壁を貫通しない。
+     */
+    scene.setRenderingAutoClearDepthStencil(RENDER_GROUP.VIEWMODEL, true, true, false);
 
     this.time = {
       /** 開始からの秒数 (scale 適用済み)。 */ elapsed: 0,
@@ -183,9 +213,10 @@ export class Engine {
       /** Babylon の Scene。全サブシステムが共有する唯一のシーン。 */
       scene,
       camera,
-      viewCamera,
-      /** レイヤーマスク定数。ビューモデルに属するメッシュは LAYER.VIEWMODEL を立てる。 */
+      /** レイヤーマスク定数。 */
       LAYER,
+      /** 描画グループ定数。ビューモデルのメッシュは RENDER_GROUP.VIEWMODEL を立てる。 */
+      RENDER_GROUP,
       canvas,
       config,
       events: this.events,
