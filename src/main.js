@@ -10,10 +10,12 @@ import { WorldSystem } from './world/index.js';
 import { PlayerSystem } from './player/index.js';
 import { WeaponSystem } from './weapons/index.js';
 import { FxSystem } from './fx/index.js';
+import { AiSystem } from './ai/index.js';
 import { UiSystem } from './ui/index.js';
 import { AudioSystem } from './audio/index.js';
 
 import { installShotApi } from './dev/shots.js';
+import { prewarm } from './core/prewarm.js';
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
@@ -120,6 +122,22 @@ BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
   throw err;
 }
 
+/**
+ * ゲームループを回す前に全マテリアルのパイプラインを事前生成する。
+ *
+ * これが無いと、カメラが旋回して新しいメッシュが視界に入るたびに WebGPU の
+ * パイプライン生成で **数百 ms 停止する**。実測は src/core/prewarm.js の冒頭を参照。
+ *
+ * `?prewarm=0` で無効化できる。**pixel gate で「pre-warm の有無で絵が変わらない」
+ * ことを確認するため**の穴で、常用するものではない。
+ */
+const warmup =
+  params.get('prewarm') === '0'
+    ? { ok: false, reason: 'disabled by ?prewarm=0' }
+    : await prewarm(engine);
+console.info('[boot] prewarm', warmup);
+window.__PREWARM__ = warmup;
+
 const shotApi = installShotApi(engine, { capture, lockstep });
 
 engine.start();
@@ -147,6 +165,12 @@ if (lockstep) {
   };
   requestAnimationFrame(readyProbe);
 }
+
+/**
+ * `?systime=1` でサブシステム別の所要時間計測を有効にする。
+ * tools/profile.mjs がヒッチの内訳を取るために使う。
+ */
+if (params.get('systime') === '1') engine.sysTime = {};
 
 window.__ENGINE__ = engine;
 window.__BACKEND__ = engine.backend;

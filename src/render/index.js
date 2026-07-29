@@ -24,6 +24,11 @@ import '@babylonjs/core/Engines/Extensions/engine.multiRender.js';
  * 「createMultipleRenderTarget is not a function」で落ちる。
  */
 import '@babylonjs/core/Engines/WebGPU/Extensions/engine.multiRender.js';
+/**
+ * **副作用 import。** `scene.enableGeometryBufferRenderer()` はこのモジュールが
+ * Scene に生やす。SSAO2 と MotionBlur が depth/normal/velocity を取る経路。
+ */
+import '@babylonjs/core/Rendering/geometryBufferRendererSceneComponent.js';
 
 /**
  * RENDER — HDR パイプライン、影、ポストプロセス、露出。
@@ -158,11 +163,31 @@ export class RenderSystem {
      */
     csm.stabilizeCascades = true;
     /**
-     * `autoCalcDepthBounds` はシーン深度から各カスケードの範囲を毎フレーム決め直す。
-     * 近景の影の解像度は上がるが、**カメラが動くたびに分割位置が変わる**ので
-     * 決定的キャプチャでは切る (フレーム数が変われば絵が変わってしまう)。
+     * `autoCalcDepthBounds` は **常に切る**。
+     *
+     * 当初は「決定的キャプチャのときだけ切る」つもりだったが、実測の結果これが
+     * ヒッチの唯一の原因だった。
+     *
+     * ## 実測 (1512x982, ultra, 400 フレーム, 発砲なし)
+     *
+     * サブシステム別の計測 (?systime=1) で、ヒッチしたフレームの内訳は:
+     *
+     *     frame 208  555.1ms  render.draw=554.1ms  _fixed.total=0.2ms  weapons.late=0.1ms
+     *     frame 166  551.8ms  render.draw=551.3ms  ...
+     *     frame 250  470.9ms  render.draw=470.3ms  ...
+     *
+     * **フレーム時間のほぼ全部が render.draw の中**で、他のサブシステムは 1ms 未満。
+     * シェーダのコンパイルではない (compiledDuringPlay = 0)。
+     *
+     * 原因は autoCalcDepthBounds が使う DepthReducer が **GPU→CPU の読み戻し**を
+     * 行うこと。読み戻しはパイプラインを同期させるので、WebGPU では特に高くつく。
+     *
+     * 失うもの: 近景の影の解像度が少し落ちる。lambda を上げて手動の分割で妥協する。
+     * 得るもの: 数百 ms のヒッチが消える。README の「中央値のフレーム時間は実際の
+     * 問題を隠す」という教訓がそのまま当てはまる — p50 は良好なのに p99 が 4fps
+     * だった。
      */
-    csm.autoCalcDepthBounds = !ctx.config.deterministic;
+    csm.autoCalcDepthBounds = false;
 
     /**
      * PCSS (接触硬化)。接地点で影が締まり、離れるほどぼける。README の品質バー
@@ -312,28 +337,42 @@ export class RenderSystem {
        * で安定している。ssaoRatio は解像度比 — 0.5 で半解像度。
        */
       /**
-       * 第 5 引数 `forceGeometryBuffer = true` が必須。
+       * ## SSAO の経路 — 2 回の失敗を経てここに落ち着いた
        *
-       * これを省くと SSAO2 は prepass 経路を選ぶが、prepass のレンダーターゲットは
-       * このパイプライン構成では初期化が間に合わず、毎フレーム
-       * 「Cannot read properties of undefined (reading '2')」で落ちる
-       * (`prePassRenderer.getRenderTarget().textures[getIndex(5)]` の textures が
-       * undefined)。GeometryBufferRenderer 経路なら depth/normal を自前で持つので
-       * 順序に依存しない。
+       * SSAO2 は depth/normal を GeometryBufferRenderer か PrePassRenderer から取れる。
+       *
+       * **試行 1: prepass (forceGeometryBuffer=false)**
+       *   → 毎フレーム「Cannot read properties of undefined (reading '2')」で落ちた。
+       *     `scene.enablePrePassRenderer()` を呼んで解決するかと思ったが、
+       *     **今度はシーンが一切描かれなくなった** (エラーゼロ・fps 400・画面は
+       *     HUD だけ)。DefaultRenderingPipeline との合成が噛み合っていない。
+       *     「fps が上がった」を成果と読み違えかけた典型例。
+       *
+       * **試行 2: geometry buffer をフル解像度で**
+       *   → 描画は正しいが **3M 三角形のシーンを毎フレーム二度描く**ことになり、
+       *     フレーム時間の 85% を食った (p50 83fps / p99 3fps / ヒッチ 19 回)。
+       *
+       * **採用: geometry buffer を半解像度で明示的に作る。**
+       *   AO は低周波の情報なので半解像度で十分。二度描きのコストが 1/4 になる。
+       *   MotionBlur も同じ renderer を共有させ、経路を 1 本に保つ (別経路にすると
+       *   WebGPU のバインドグループが食い違い、両方有効なときだけ落ちる)。
        */
+      const gbuf = this.scene.enableGeometryBufferRenderer(0.5);
       const ssao = new SSAO2RenderingPipeline(
         'owSsao',
         this.scene,
         { ssaoRatio: 0.5, blurRatio: 1 },
         [cam],
-        true
+        gbuf ?? true
       );
       ssao.radius = 1.1;
       ssao.totalStrength = 1.05;
-      ssao.expensiveBlur = true;
-      ssao.samples = 16;
+      // expensiveBlur は名前の通り高い。半解像度の AO には効果より代償が大きい。
+      ssao.expensiveBlur = false;
+      ssao.samples = 12;
       ssao.maxZ = 60;
       this.ssao = ssao;
+      this._gbuf = gbuf;
     }
 
     // --- TAA ---------------------------------------------------------
@@ -380,6 +419,12 @@ export class RenderSystem {
        * つまり「SSAO2 と MotionBlur の両方が有効なとき」だけの問題。両方を
        * GeometryBufferRenderer に揃えると経路が 1 本になり解消する。
        */
+      /**
+       * 最後の引数に **SSAO と同じ GeometryBufferRenderer を渡す**。
+       * 別経路 (prepass) にすると WebGPU のバインドグループが食い違い、
+       * 両方有効なときだけ毎フレーム
+       * 「createBindGroup ... Required member is undefined」で落ちる (実測済み)。
+       */
       const mb = new MotionBlurPostProcess(
         'owMotionBlur',
         this.scene,
@@ -390,7 +435,7 @@ export class RenderSystem {
         undefined,
         undefined,
         undefined,
-        true
+        this._gbuf ?? true
       );
       mb.motionStrength = 0.6;
       mb.motionBlurSamples = 12;

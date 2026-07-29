@@ -230,6 +230,22 @@ export class Engine {
       has: (id) => this.registry.has(id),
     };
 
+    /**
+     * サブシステム別の所要時間 (ms)。`?systime=1` で有効。
+     *
+     * ## なぜ必要か
+     *
+     * README に記録された最大の教訓は「中央値のフレーム時間は実際の問題を隠す」
+     * だった。静止カメラで 94fps を報告しながら、実プレイでは 728〜1236ms の停止が
+     * 起きていた。原因の特定には **フレームごとの内訳** が要る。
+     *
+     * ヒッチが出たときに「どのサブシステムのどのフェーズか」を名指しできないと、
+     * 推測でシェーダやポストを疑って時間を溶かすことになる (実際に溶かした)。
+     *
+     * 常時有効にしないのは、performance.now() の呼び出し自体がフレームあたり
+     * 数十回増えるため。
+     */
+    this.sysTime = null;
     this._accum = 0;
     this._last = 0;
     this._running = false;
@@ -298,19 +314,46 @@ export class Engine {
     this._accum += t.dt;
     let steps = 0;
     const fixedSystems = this.registry.with('fixedUpdate');
+    const fixedT0 = this.sysTime ? performance.now() : 0;
     while (this._accum >= FIXED_DT && steps < MAX_SUBSTEPS) {
       for (const sys of fixedSystems) sys.fixedUpdate(FIXED_DT, this.ctx);
       this._accum -= FIXED_DT;
       steps++;
     }
+    if (this.sysTime) {
+      this.sysTime['_fixed.total'] = performance.now() - fixedT0;
+      this.sysTime['_fixed.steps'] = steps;
+    }
     if (steps === MAX_SUBSTEPS) this._accum = 0; // 積み残しは捨てる (spiral of death 回避)
     t.alpha = this._accum / FIXED_DT;
 
-    for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
-    for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
+    const st = this.sysTime;
+    if (st) {
+      for (const sys of this.registry.with('update')) {
+        const a = performance.now();
+        sys.update(t.dt, this.ctx);
+        st[`${sys.constructor.id}.update`] = performance.now() - a;
+      }
+      for (const sys of this.registry.with('lateUpdate')) {
+        const a = performance.now();
+        sys.lateUpdate(t.dt, this.ctx);
+        st[`${sys.constructor.id}.late`] = performance.now() - a;
+      }
+    } else {
+      for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
+      for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
+    }
 
     const renderSystem = this.registry.peek('render');
-    if (typeof renderSystem?.render === 'function') renderSystem.render(this.ctx);
+    if (typeof renderSystem?.render === 'function') {
+      if (st) {
+        const a = performance.now();
+        renderSystem.render(this.ctx);
+        st['render.draw'] = performance.now() - a;
+      } else {
+        renderSystem.render(this.ctx);
+      }
+    }
 
     this.input.endFrame();
   }
