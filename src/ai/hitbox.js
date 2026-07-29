@@ -61,6 +61,8 @@ export class HitboxSet {
     this._vb = new Vector3();
     this._dir = new Vector3();
     this._q = new Quaternion();
+    /** SetQTransform 用スクラッチ [[x,y,z],[qx,qy,qz,qw]] (毎フレーム再利用)。 */
+    this._transform = [[0, 0, 0], [0, 0, 0, 1]];
 
     for (const [part, a, b, r, dmg] of specs) {
       const ia = rig.index(a);
@@ -81,8 +83,12 @@ export class HitboxSet {
       shape.filterCollideMask = phys.LAYER.PLAYER; // レイを通すための非ゼロ値 (冒頭コメント参照)
       const body = new PhysicsBody(node, PhysicsMotionType.ANIMATED, false, scene);
       body.shape = shape;
-      // Havok にノードの変換を毎ステップ読ませる (既定 true = 追従しない)
-      body.disablePreStep = false;
+      /**
+       * 追従は sync() が自前で行う (下のコメント参照) ため、Babylon の
+       * pre-step (disablePreStep=false → 毎ステップ SetQTransform) は使わない。
+       * body→node の書き戻し (executeStep 末尾の sync) も不要なので切る。
+       */
+      body.disableSync = true;
 
       // Hit.actor / Hit.part / surface='flesh' を載せる (冒頭コメント参照)
       phys._meta.set(body, {
@@ -98,8 +104,27 @@ export class HitboxSet {
     }
   }
 
-  /** アニメーション済みのボーン位置へ全カプセルを追従させる。毎フレーム呼ぶ。 */
+  /**
+   * アニメーション済みのボーン位置へ全カプセルを追従させる。毎フレーム呼ぶ。
+   *
+   * ## なぜ Babylon の pre-step ではなく自前テレポート + 再登録なのか (実測)
+   *
+   * この Babylon fork の Havok では、ワールド追加後の kinematic ボディを
+   * SetQTransform (pre-step の TELEPORT 経路も同じ) で動かすと、**ボディの
+   * 実座標は動くのにクエリ用 broadphase が更新されず、レイキャストに二度と
+   * 当たらなくなる** (最小再現で確認済み: 0.05m/frame の微小移動でも発生し、
+   * 以後どの座標でも hit しない)。SetTargetQTransform (ACTION 経路) は逆に
+   * ボディが目標に追従しなかった。
+   *
+   * 回避策: SetQTransform で座標を書いた直後に HP_World_RemoveBody →
+   * HP_World_AddBody で broadphase へ登録し直す。42 ボディ (7×6 体) × 60Hz で
+   * 問題ないコストであることは capture で確認済み。plugin の内部 (_hknp) に
+   * 触れているのは公開 API に相当経路が無いため — Babylon 側でこのバグが
+   * 直ったら disablePreStep=false に戻してこのメソッドを縮退させること。
+   */
   sync(animator) {
+    const plugin = this.phys.plugin;
+    const hk = plugin._hknp;
     for (let i = 0; i < this.parts.length; i++) {
       const p = this.parts[i];
       animator.bonePos(p.a, this._va);
@@ -116,6 +141,20 @@ export class HitboxSet {
         this._q.setFromUnitVectors(UP, this._dir);
         n.rotationQuaternion.set(this._q.x, this._q.y, this._q.z, this._q.w);
       }
+      // Havok へテレポート + broadphase 再登録 (上のコメント参照)
+      const pd = p.body._pluginData;
+      const region = pd.worldRegion ?? plugin._worldRegions[0];
+      const o = region.floatingOrigin;
+      this._transform[0][0] = n.position.x - o.x;
+      this._transform[0][1] = n.position.y - o.y;
+      this._transform[0][2] = n.position.z - o.z;
+      this._transform[1][0] = this._q.x;
+      this._transform[1][1] = this._q.y;
+      this._transform[1][2] = this._q.z;
+      this._transform[1][3] = this._q.w;
+      hk.HP_Body_SetQTransform(pd.hpBodyId, this._transform);
+      hk.HP_World_RemoveBody(region.world, pd.hpBodyId);
+      hk.HP_World_AddBody(region.world, pd.hpBodyId, false);
     }
   }
 
