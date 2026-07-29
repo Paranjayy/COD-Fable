@@ -1,6 +1,7 @@
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 import { VertexBuffer } from '@babylonjs/core/Buffers/buffer.js';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 
 import { PALETTE } from './palette.js';
 
@@ -34,6 +35,50 @@ export class WorldBuilder {
     this.solo = [];
     /** paletteKey -> タイル実寸 (m) のキャッシュ。 */
     this._tileCache = new Map();
+    /** LEVEL→WORLD 変換 (setTransform)。既定は恒等 = レベル座標のまま。 */
+    this._yaw = 0;
+    this._tx = 0;
+    this._tz = 0;
+    this._cos = 1;
+    this._sin = 0;
+  }
+
+  /**
+   * LEVEL→WORLD 変換を設定する。**全 push より前に 1 度だけ呼ぶこと。**
+   *
+   * layout.js の座標は「通りが -Z に走る LEVEL 空間」で書かれており、カメラショット
+   * (dev/shots.js) やスポーンは「回転済みの WORLD 空間」で書かれている。Three 版は
+   * Assembler.setTransform がこの変換をジオメトリに焼き込んでいたが、最初の Babylon
+   * 移植でこれが**丸ごと欠落**し、hero カメラ (12,1.75,18) が東側の建物の中に埋まる
+   * (= 空が「真っ黒」に見える) 事故を起こした。座標データを触るときはこの 2 空間の
+   * 区別を必ず意識すること。
+   *
+   * 変換は scene graph の親ノードではなく**頂点に焼き込む** (メッシュの position/
+   * rotation.y に適用 → MergeMeshes が world matrix ごと統合する)。親ノード方式だと
+   * physics / lampHeads / AI などメッシュ外の座標データが変換から漏れやすい。
+   */
+  setTransform(yaw, tx, tz) {
+    this._yaw = yaw;
+    this._tx = tx;
+    this._tz = tz;
+    this._cos = Math.cos(yaw);
+    this._sin = Math.sin(yaw);
+    return this;
+  }
+
+  /**
+   * LEVEL 座標の点を WORLD 座標へ写す。
+   *
+   * メッシュは _file() が自動で変換するが、**メッシュでない座標データ** (街灯の
+   * 灯具位置、窓明かりの PointLight 位置など) はこれを通すこと。通し忘れると
+   * ライトだけが回転前の位置に取り残される。
+   */
+  toWorld(x, y, z) {
+    return new Vector3(
+      x * this._cos + z * this._sin + this._tx,
+      y,
+      -x * this._sin + z * this._cos + this._tz
+    );
   }
 
   /**
@@ -114,6 +159,23 @@ export class WorldBuilder {
   }
 
   _file(mesh, key, opts) {
+    /**
+     * LEVEL→WORLD 変換をここで適用する。push 系の全メソッドがこの関数を通るので、
+     * 適用点はここ 1 箇所 (SSOT)。
+     *
+     * rotation.y への加算で正しい理由: Babylon の Euler は Ry·Rx·Rz の順に掛かるため、
+     * `Ry(yaw + ry)·Rx·Rz = Ry(yaw)·(Ry(ry)·Rx·Rz)` — つまり「ローカル回転のあとに
+     * 全体 yaw」と等価になる。push 後に呼び出し側が rotation.x / rotation.z を
+     * 上書きしても (アーチ・ヤシの葉・瓦礫・電線がやる)、この合成は壊れない。
+     * **ただし push 後に position を上書きするコードを書いてはいけない** — その値は
+     * 変換前の LEVEL 座標として解釈されず、そのまま WORLD 座標になってしまう。
+     */
+    const p = mesh.position;
+    const wx = p.x * this._cos + p.z * this._sin + this._tx;
+    const wz = -p.x * this._sin + p.z * this._cos + this._tz;
+    p.set(wx, p.y, wz);
+    mesh.rotation.y += this._yaw;
+
     mesh.metadata = {
       owPalette: key,
       owSurface: this.surfaceOf(key),

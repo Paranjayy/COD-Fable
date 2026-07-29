@@ -31,6 +31,20 @@ import { STREET, ALLEYS, BUILDINGS, GATE, SET_PIECES } from './layout.js';
  * **Babylon の clustered lighting ではこの問題が発生しない**ので、バラストライトも
  * 可視数の固定も不要になった。ライトはただ置くだけでよい (詳細は render/index.js)。
  */
+/**
+ * LEVEL→WORLD 変換。**値は Three 版 (main ブランチ) からそのまま引き継ぐこと。**
+ *
+ * layout.js は「通りが -Z に走る LEVEL 空間」で書かれている。一方、カメラショット
+ * (dev/shots.js)・スポーン・AI の配置は「この yaw で回転済みの WORLD 空間」で
+ * 書かれている。この変換が無いと hero カメラ (12,1.75,18) は東側の建物の**内部**に
+ * 埋まり、「空が真っ黒 / 世界が屋内に見える」という一見シェーダ起因に見える壊れ方を
+ * する (実際にこの移植で数時間を溶かした)。値を変えると全ショットの構図と全
+ * スポーンが同時にずれるので、絶対に単独でいじらないこと。
+ */
+const LEVEL_YAW = 0.5877;
+const LEVEL_TX = 0.9;
+const LEVEL_TZ = 1.34;
+
 export class WorldSystem {
   static id = 'world';
   static deps = ['materials', 'physics', 'render'];
@@ -58,6 +72,8 @@ export class WorldSystem {
 
     const b = new WorldBuilder(ctx.scene, materials);
     this.builder = b;
+    // LEVEL 空間のレイアウトを WORLD 空間へ。push より前に設定すること (builder 参照)。
+    b.setTransform(LEVEL_YAW, LEVEL_TX, LEVEL_TZ);
 
     this._buildGround(b);
     this._buildAlleys(b);
@@ -449,7 +465,8 @@ export class WorldSystem {
       const hz = z + Math.sin(ry) * armLen;
       b.pushBox((x + hx) / 2, 5.15, (z + hz) / 2, armLen, 0.1, 0.1, 'metal_dark', { ry });
       b.pushBox(hx, 5.0, hz, 0.5, 0.16, 0.28, 'metal_dark', { ry });
-      this.lampHeads.push(new Vector3(hx, 4.86, hz));
+      // 灯具位置はメッシュではないので LEVEL→WORLD を自分で通す (builder.toWorld 参照)。
+      this.lampHeads.push(b.toWorld(hx, 4.86, hz));
     }
 
     // 瓦礫。小石を撒く。
@@ -569,9 +586,10 @@ export class WorldSystem {
     for (const def of BUILDINGS) {
       if (def.streetSide === undefined) continue;
       const s = def.streetSide === 1 ? 1 : -1;
+      // def.x / def.z は LEVEL 空間 (layout.js) なので WORLD へ写してから置く。
       const l = new PointLight(
         `win_${def.id}`,
-        new Vector3(def.x, 2.2, def.z + s * (def.d / 2 + 0.6)),
+        this.builder.toWorld(def.x, 2.2, def.z + s * (def.d / 2 + 0.6)),
         ctx.scene
       );
       l.diffuse = new Color3(1.0, 0.78, 0.5);

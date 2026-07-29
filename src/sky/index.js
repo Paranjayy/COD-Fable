@@ -27,6 +27,7 @@ import { SphericalHarmonics, SphericalPolynomial } from '@babylonjs/core/Maths/s
 import '@babylonjs/core/Materials/Textures/baseTexture.polynomial.js';
 
 import { WGSL_ATMOSPHERE } from './wgsl/atmosphere.js';
+import { Celestial } from './celestial.js';
 
 /**
  * SKY — 物理ベースの大気、太陽/月、時刻、IBL、フォグ。
@@ -59,6 +60,30 @@ const DEFAULT_WEATHER = {
   fogDensity: 0.0042,
   /** 太陽光の強さ。 */
   sunIntensity: 22.0,
+  /**
+   * 空の放射輝度スケール。**太陽と同じ単位系に揃えるための係数**。
+   *
+   * ## なぜ必要か (実測で判明した問題)
+   *
+   * `_skyColorFor` が返す色は「見た目の空の色」(0..1) で、一方 sun.intensity は 22。
+   * この 2 つを別スケールのまま SH に積むと、日向と日陰の明度差が現実離れする。
+   *
+   * 実測 (hero ショット, 16:30, 1280x720 の領域平均):
+   *   空          RGB 117/145/172
+   *   日向の壁    RGB 109/ 90/ 65
+   *   日陰の壁    RGB  26/ 23/ 19   ← 日向の 1/4。晴天屋外としては暗すぎる
+   *   路面        RGB  18/ 18/ 19   ← ほぼ黒
+   *
+   * 現実の晴天では日陰は日向の 1/5〜1/8 (線形) だが、トーンマップ後の表示値では
+   * もっと持ち上がる。日陰が 26 まで落ちるのは「空からの拡散光が太陽に対して
+   * 1/30 しかない」ことが原因で、露出の問題ではない。
+   *
+   * **ここを上げずに露出で持ち上げると空が白飛びする**。ARCHITECTURE.md の
+   * 「exposure-driven not multiplier-driven」は「露出で全部やれ」という意味ではなく、
+   * 「明るさの辻褄をマテリアルの色で合わせるな」という意味。光源の相対強度は
+   * 光源側で正すのが正しい。
+   */
+  skyIrradiance: 5.5,
 };
 
 export class SkySystem {
@@ -71,6 +96,8 @@ export class SkySystem {
     /** 1 秒あたりに進む時間 (時)。0 で停止。 */
     this.timeRate = 0;
     this.weather = { ...DEFAULT_WEATHER };
+    /** 太陽・月の実位置 (球面天文学)。時刻→位置の対応はショットリストとの契約。 */
+    this.celestial = new Celestial();
     this._envDirty = true;
     this._envAccum = 0;
     /** skyParams の再利用バッファ。毎フレーム new しない (Hard rule 5)。 */
@@ -252,22 +279,18 @@ export class SkySystem {
   /**
    * 太陽・月の方向と光の強さを時刻から決める。
    *
-   * 太陽は東 (+X) から昇り西 (-X) に沈む。季節や緯度は入れていない — このゲームは
-   * 1 つの街の 1 日しか描かないので、少し傾けた円軌道で十分。
+   * 位置は celestial.js の球面天文学から取る (緯度 45N、夏至、日没 19.71 時)。
+   * **簡易軌道で置き換えないこと** — dev/shots.js の時刻 (特に sunset=19.2) は
+   * このモデルの太陽高度 (+4.6° = ゴールデンアワー) を前提に振られており、
+   * 「日没 18 時」の sin カーブに簡略化した最初の移植では sunset ショットが
+   * 真っ暗な夜空になった。
    */
   _updateCelestial() {
-    // 6:00 に日の出、18:00 に日没となる位相。
-    const t = ((this.hours - 6) / 12) * Math.PI;
-    // 真上を通らないよう南に傾ける。影が伸びて絵になる。
-    const tilt = 0.34;
-    const sunDir = new Vector3(
-      Math.cos(t),
-      Math.sin(t),
-      Math.sin(t) * -tilt + Math.cos(t) * 0.12
-    ).normalize();
+    const c = this.celestial.setHour(this.hours);
+    const sunDir = c.sun;
 
     this.sunDir = sunDir;
-    this.moonDir = sunDir.scale(-1);
+    this.moonDir = c.moon;
 
     // DirectionalLight.direction は「光が進む向き」なので太陽方向の逆。
     this.sun.direction = sunDir.scale(-1);
@@ -407,6 +430,7 @@ export class SkySystem {
 
     // 太陽の側は明るく暖かい。太陽そのものは DirectionalLight が担うので、
     // ここでは周囲のハロぶんだけ足す。
+    // (スケールは最後にまとめて掛ける — ハロも同じ単位系に乗せるため)
     if (this.sunDir) {
       const mu = Math.max(0, Vector3.Dot(dir, this.sunDir));
       const halo = mu ** 8 * 0.9 * day;
@@ -414,6 +438,15 @@ export class SkySystem {
       c.g += halo * 0.82;
       c.b += halo * 0.6;
     }
+
+    /**
+     * **太陽と同じ単位系に乗せる。** 詳細は DEFAULT_WEATHER.skyIrradiance のコメント。
+     * ここを掛け忘れると日陰が真っ黒になり、露出で持ち上げようとして空が白飛びする。
+     */
+    const k = this.weather.skyIrradiance;
+    c.r *= k;
+    c.g *= k;
+    c.b *= k;
     return c;
   }
 
