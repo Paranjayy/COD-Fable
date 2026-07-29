@@ -1,61 +1,199 @@
-import * as THREE from 'three';
+import { WebGPUEngine } from '@babylonjs/core/Engines/webgpuEngine.js';
+import { Engine as WebGL2Engine } from '@babylonjs/core/Engines/engine.js';
+import { Scene } from '@babylonjs/core/scene.js';
+import { FreeCamera } from '@babylonjs/core/Cameras/freeCamera.js';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Color4 } from '@babylonjs/core/Maths/math.color.js';
+
 import { Registry, EventBus } from './registry.js';
 import { FIXED_DT, MAX_SUBSTEPS } from './config.js';
 import { Input } from './input.js';
 import { Rng } from './rng.js';
 
 /**
- * The Engine owns the frame loop and the shared context handed to every
- * subsystem. It does NOT know what any subsystem does — it only sequences them.
+ * レイヤーマスク — ワールドとビューモデル(一人称の手/銃)の描き分け。
  *
- * Frame order:
+ * ## なぜ「2 つの Scene」ではなく「1 Scene + 2 カメラ」なのか
+ *
+ * Three.js 版は `scene` と `viewScene` の 2 つを持ち、ビューモデル専用のライト
+ * リグを viewScene 側に組んでいた。その結果 README に記録された既知の根本原因が
+ * 生まれている:
+ *
+ *   > viewmodel の light rig が world の約 20 倍の irradiance を出しており、
+ *   > view scene では *黒* のマテリアルですら L=110 (背景 91) で描かれる。
+ *   > 全武器の albedo を物理値の 1/3 に誤魔化して辻褄を合わせているため、
+ *   > ゲーム中で最も注視されるオブジェクトのマテリアル表現力が頭打ち。
+ *
+ * これは「2 つの独立した照明環境を人間が手で一致させ続ける」構造そのものが
+ * 原因で、放置すれば移植先でも必ず再発する。Babylon では 1 つの Scene を
+ * layerMask で描き分ければ、ビューモデルは **world と同一の IBL / 同一の
+ * ライトリスト / 同一の露出** で焼かれるため、20 倍のズレは構造的に発生しえない。
+ *
+ * 代償はビューモデル用のニアクリップを別に持てないこと。これは 2 台目のカメラ
+ * (`viewCamera`, near=0.005) を activeCameras の 2 番目に置くことで解決する。
+ * Babylon は activeCameras を順に描画し、2 台目以降はカラーを保持したまま
+ * **深度だけをクリア**するので、銃が壁にめり込むことはない (Three 版が
+ * viewScene を分けていた本来の目的はこれで満たされる)。
+ */
+export const LAYER = {
+  /** 通常のワールドジオメトリ。 */
+  WORLD: 0x0fffffff,
+  /** 一人称ビューモデル専用。world カメラからは見えない。 */
+  VIEWMODEL: 0x10000000,
+};
+
+/**
+ * Engine はフレームループと、全サブシステムに配る共有コンテキストだけを持つ。
+ * 各サブシステムが何をするかは一切知らない — 順序付けだけが仕事。
+ *
+ * フレーム順:
  *   1. input.beginFrame()
- *   2. fixedUpdate(FIXED_DT) xN   — physics, deterministic gameplay
- *   3. update(dt)                 — animation, cameras, AI decisions
- *   4. lateUpdate(dt)             — anything that must observe final transforms
- *   5. render subsystem draws
+ *   2. fixedUpdate(FIXED_DT) xN   — physics, 決定的なゲームプレイ
+ *   3. update(dt)                 — アニメーション, カメラ, AI 判断
+ *   4. lateUpdate(dt)             — 最終トランスフォームを見る必要があるもの
+ *   5. render サブシステムが描画
  *   6. input.endFrame()
+ *
+ * この順序は Three 版から一切変えていない。サブシステムの移植時に
+ * 「いつ呼ばれるか」を考え直さずに済ませるため。
  */
 export class Engine {
-  constructor({ canvas, config }) {
+  /**
+   * WebGPU の初期化は非同期なので、コンストラクタではなく静的ファクトリを使う。
+   *
+   * WebGPU が使えない環境では WebGL2 に自動フォールバックする。フォールバック
+   * したかどうかは `engine.backend` で判別でき、`render` サブシステムはこれを見て
+   * compute shader を使うパスを落とす。**黙ってフォールバックさせない**のが重要で、
+   * ピクセルゲート (tools/imagediff.mjs) は backend が違えば一致しないため、
+   * 比較対象を取り違えると「最適化で絵が変わった」と誤診する。
+   */
+  static async create({ canvas, config }) {
+    const forced = config.backend; // 'webgpu' | 'webgl2' | undefined (=auto)
+    let engine = null;
+    let backend = null;
+
+    const wantWebGPU = forced !== 'webgl2' && (await WebGPUEngine.IsSupportedAsync);
+    if (wantWebGPU) {
+      try {
+        const gpu = new WebGPUEngine(canvas, {
+          antialias: false, // AA は TAA / FXAA がポストで担当する
+          stencil: true,
+          powerPreference: 'high-performance',
+          // 決定的キャプチャのため、ブラウザ側の暗黙の DPR 補正を切る
+          adaptToDeviceRatio: false,
+        });
+        await gpu.initAsync();
+        engine = gpu;
+        backend = 'webgpu';
+      } catch (err) {
+        console.warn('[engine] WebGPU init failed, falling back to WebGL2:', err);
+        engine = null;
+      }
+    }
+
+    if (!engine) {
+      engine = new WebGL2Engine(
+        canvas,
+        false,
+        {
+          stencil: true,
+          powerPreference: 'high-performance',
+          preserveDrawingBuffer: false,
+          antialias: false,
+        },
+        false
+      );
+      backend = 'webgl2';
+    }
+
+    if (forced === 'webgpu' && backend !== 'webgpu') {
+      throw new Error('?backend=webgpu was requested but WebGPU is unavailable in this browser');
+    }
+
+    return new Engine({ canvas, config, engine, backend });
+  }
+
+  constructor({ canvas, config, engine, backend }) {
     this.canvas = canvas;
     this.config = config;
+    /** Babylon の描画エンジン (WebGPUEngine か Engine)。 */
+    this.babylon = engine;
+    /** 'webgpu' | 'webgl2' — サブシステムが機能分岐に使う。 */
+    this.backend = backend;
+
     this.registry = new Registry();
     this.events = new EventBus();
     this.input = new Input(canvas, config);
     this.rng = new Rng(config.deterministic ? 0x5eed1234 : (Math.random() * 2 ** 32) >>> 0);
 
-    this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(config.fov, 1, 0.05, 1200);
-    this.camera.rotation.order = 'YXZ';
+    const scene = new Scene(engine);
+    /**
+     * 右手系に固定する。
+     *
+     * Babylon の既定は左手系だが、`src/dev/shots.js` のカメラ座標、ワールドの
+     * レイアウト、既存のすべての方向ベクトルは Three.js (右手系) の意味で書かれて
+     * いる。ここを左手系のままにすると、移植のたびに Z の符号を各所で反転させる
+     * ことになり、しかも間違えても「なんとなく動いてしまう」ため発見が遅れる。
+     * SSOT として engine で一度だけ決めておく。
+     */
+    scene.useRightHandedSystem = true;
+    /** 空は sky サブシステムが描くので、シーン自体のクリア色は黒でよい。 */
+    scene.clearColor = new Color4(0, 0, 0, 1);
+    this.scene = scene;
 
-    /** Separate scene+camera for the first-person viewmodel, drawn with its own
-     *  near plane so hands/weapon never clip into world geometry. */
-    this.viewScene = new THREE.Scene();
-    this.viewCamera = new THREE.PerspectiveCamera(60, 1, 0.005, 12);
+    /** ワールドカメラ。回転は player サブシステムが yaw/pitch で駆動する。 */
+    const camera = new FreeCamera('worldCamera', new Vector3(0, 1.7, 0), scene);
+    camera.minZ = 0.05;
+    camera.maxZ = 1200;
+    camera.fov = degToRad(config.fov);
+    camera.layerMask = LAYER.WORLD;
+    /** 入力は core/input.js が一元管理する。Babylon 内蔵の操作は必ず切る。 */
+    camera.inputs.clear();
+    this.camera = camera;
+
+    /**
+     * ビューモデル用カメラ。activeCameras の 2 番目に置くことで、カラーを保持した
+     * まま深度だけクリアして重ね描きされる — 銃がワールドジオメトリを貫通しない。
+     */
+    const viewCamera = new FreeCamera('viewCamera', Vector3.Zero(), scene);
+    viewCamera.minZ = 0.005;
+    viewCamera.maxZ = 12;
+    viewCamera.fov = degToRad(60);
+    viewCamera.layerMask = LAYER.VIEWMODEL;
+    viewCamera.inputs.clear();
+    this.viewCamera = viewCamera;
+
+    scene.activeCameras = [camera, viewCamera];
+    /** カラーは 1 台目でのみクリア、深度はカメラ間でクリアされる (Babylon 既定)。 */
+    scene.autoClear = true;
+    scene.autoClearDepthAndStencil = true;
 
     this.time = {
-      /** Seconds since start, scaled. */ elapsed: 0,
-      /** Unscaled wall-clock seconds since start. */ raw: 0,
-      /** Last frame delta, scaled and clamped. */ dt: 0,
-      /** Fixed step. */ fixed: FIXED_DT,
-      /** Interpolation alpha between the last two physics steps, 0..1. */ alpha: 0,
+      /** 開始からの秒数 (scale 適用済み)。 */ elapsed: 0,
+      /** 開始からの実時間秒。 */ raw: 0,
+      /** 直前フレームの delta (scale 適用・クランプ済み)。 */ dt: 0,
+      /** 固定ステップ。 */ fixed: FIXED_DT,
+      /** 直近 2 つの物理ステップ間の補間係数 0..1。 */ alpha: 0,
       scale: 1,
       frame: 0,
     };
 
     this.ctx = {
       engine: this,
-      scene: this.scene,
-      camera: this.camera,
-      viewScene: this.viewScene,
-      viewCamera: this.viewCamera,
+      /** Babylon の Scene。全サブシステムが共有する唯一のシーン。 */
+      scene,
+      camera,
+      viewCamera,
+      /** レイヤーマスク定数。ビューモデルに属するメッシュは LAYER.VIEWMODEL を立てる。 */
+      LAYER,
       canvas,
       config,
       events: this.events,
       input: this.input,
       time: this.time,
       rng: this.rng,
+      /** 'webgpu' | 'webgl2' */
+      backend,
       get: (id) => this.registry.get(id),
       peek: (id) => this.registry.peek(id),
       has: (id) => this.registry.has(id),
@@ -89,10 +227,8 @@ export class Engine {
   resize() {
     const w = Math.max(1, this.canvas.clientWidth || innerWidth);
     const h = Math.max(1, this.canvas.clientHeight || innerHeight);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-    this.viewCamera.aspect = w / h;
-    this.viewCamera.updateProjectionMatrix();
+    // Babylon はキャンバスの実解像度を自分で持つので、まず engine に知らせる。
+    this.babylon.resize();
     for (const sys of this.registry.with('resize')) sys.resize(w, h, this.ctx);
     this.events.emit('resize', { width: w, height: h });
   }
@@ -115,10 +251,10 @@ export class Engine {
     this.step(now);
   }
 
-  /** Advance one frame. Exposed so the capture harness can pump frames by hand. */
+  /** 1 フレーム進める。キャプチャハーネスが手動でフレームを送れるよう公開する。 */
   step(now = performance.now()) {
     const t = this.time;
-    // Clamp so a tab-switch or a breakpoint doesn't teleport the simulation.
+    // タブ切り替えやブレークポイントでシミュレーションが飛ばないようクランプ。
     const rawDt = Math.min(0.1, Math.max(0, (now - this._last) / 1000));
     this._last = now;
     t.raw += rawDt;
@@ -136,7 +272,7 @@ export class Engine {
       this._accum -= FIXED_DT;
       steps++;
     }
-    if (steps === MAX_SUBSTEPS) this._accum = 0; // shed backlog rather than spiral
+    if (steps === MAX_SUBSTEPS) this._accum = 0; // 積み残しは捨てる (spiral of death 回避)
     t.alpha = this._accum / FIXED_DT;
 
     for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
@@ -154,5 +290,17 @@ export class Engine {
     this.input.detach();
     for (const sys of [...this.registry.ordered].reverse()) sys.dispose?.();
     this.events.clear();
+    this.scene.dispose();
+    this.babylon.dispose();
   }
+}
+
+/**
+ * config.fov は Three 版から引き継いだ「垂直 FOV の度数」。Babylon の
+ * `camera.fov` はラジアンで、既定では垂直方向 (FOVMODE_VERTICAL_FIXED) なので
+ * 単純変換でよい。ここを間違えると全ショットの画角がズレて pixel gate が常に
+ * 赤になるため、変換は必ずこの 1 箇所を通す。
+ */
+export function degToRad(deg) {
+  return (deg * Math.PI) / 180;
 }
