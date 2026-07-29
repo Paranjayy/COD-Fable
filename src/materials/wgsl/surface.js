@@ -61,6 +61,22 @@ fn applyWear(col: vec3f, h: f32, amount: f32, base: vec3f, uv: vec2f, seed: u32)
   return mix(col, base, clamp(w, 0.0, 1.0));
 }
 
+/**
+ * 色ムラの振れ幅。0 のとき完全に無効化できるようにしてある。
+ *
+ * **ヘルパ関数は必ず main より前に置くこと。** Babylon は WGSL のエントリポイントを
+ * 書き換える際、シェーダ末尾に return fragmentOutputs; を注入する。main の後ろに
+ * 関数があると、その注入が最後の関数の中に入ってしまい
+ * 「return statement type must match its function return type」で落ちる。
+ *
+ * なお、この JSDoc は WGSL 文字列 (テンプレートリテラル) の中にあるので
+ * **バッククォートを書いてはいけない**。書くとリテラルがそこで終端し、
+ * 「Unexpected token 'return'」という一見無関係な JS 構文エラーになる。
+ */
+fn weatherTint(w: f32) -> f32 {
+  return w * 0.42;
+}
+
 @fragment
 fn main(input: FragmentInputs) -> FragmentOutputs {
   let uv = input.vUV;
@@ -155,11 +171,11 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   else if (k == 4) {
     let agg = voronoi2p(g * 26.0, per * 26.0, 1.0, seed);
     let fine = fbm2p(g * 40.0, per * 40.0, 3, 0.5, 2.0, seed + 11u);
-    let macro = fbm2p(g * 1.4, per * 1.4, 4, 0.55, 2.0, seed + 29u);
+    let macroN = fbm2p(g * 1.4, per * 1.4, 4, 0.55, 2.0, seed + 29u);
     // ひび。ridge の稜線だけを細く残す。
     let crack = 1.0 - smoothstep(0.0, uniforms.pa.x, ridge2p(g * 2.4, per * 2.4, 4, 0.5, seed + 43u) - uniforms.pa.y);
     h = 0.60 + (1.0 - agg.x) * 0.22 + (fine - 0.5) * 0.14 - crack * 0.34;
-    col = mix(uniforms.tint, uniforms.tint2, agg.z * 0.6) * (0.80 + fine * 0.34 + macro * 0.16);
+    col = mix(uniforms.tint, uniforms.tint2, agg.z * 0.6) * (0.80 + fine * 0.34 + macroN * 0.16);
     col = mix(col, uniforms.grime, crack * 0.7);
   }
   // ---------------------------------------------------------------- sand --
@@ -175,11 +191,11 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   else if (k == 6) {
     let clod = voronoi2p(g * 12.0, per * 12.0, 0.9, seed);
     let fine = fbm2p(g * 34.0, per * 34.0, 3, 0.5, 2.0, seed + 19u);
-    let macro = fbm2p(g * 1.8, per * 1.8, 5, 0.55, 2.0, seed + 23u);
+    let macroN = fbm2p(g * 1.8, per * 1.8, 5, 0.55, 2.0, seed + 23u);
     // 乾いてひび割れた粘土。voronoi の境界を溝にする。
     let cracks = 1.0 - smoothstep(0.0, 0.06, clod.y) ;
-    h = 0.58 + (1.0 - clod.x) * 0.18 + (fine - 0.5) * 0.16 + (macro - 0.5) * 0.24 - cracks * uniforms.pa.x;
-    col = mix(uniforms.tint, uniforms.tint2, macro) * (0.82 + fine * 0.30);
+    h = 0.58 + (1.0 - clod.x) * 0.18 + (fine - 0.5) * 0.16 + (macroN - 0.5) * 0.24 - cracks * uniforms.pa.x;
+    col = mix(uniforms.tint, uniforms.tint2, macroN) * (0.82 + fine * 0.30);
     col = applyGrime(col, h, uniforms.weather.z * 0.8, uniforms.grime);
   }
   // -------------------------------------------------------------- gravel --
@@ -325,10 +341,5 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
 
   h = clamp(h, 0.0, 1.0);
   fragmentOutputs.color = vec4f(max(col, vec3f(0.0)), h);
-}
-
-/** 色ムラの振れ幅。0 のとき完全に無効化できるようにしてある。 */
-fn weatherTint(w: f32) -> f32 {
-  return w * 0.42;
 }
 `;

@@ -32,6 +32,7 @@ import { chromium } from 'playwright';
 import { PNG } from 'pngjs';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { WEBGPU_FLAGS, CHROMIUM_CHANNEL } from './chromium-flags.mjs';
 import { join } from 'node:path';
 
 const args = Object.fromEntries(
@@ -56,19 +57,6 @@ const KEEP = !!args.keep;
  * `--enable-unsafe-webgpu` は「未実装機能を許可する」ではなく「ブロックリスト
  * や安定版制限を無視して WebGPU を露出する」フラグ。headless では実質必須。
  */
-export const WEBGPU_FLAGS = [
-  '--use-angle=metal',
-  '--enable-unsafe-webgpu',
-  '--enable-features=Vulkan',
-  '--ignore-gpu-blocklist',
-  '--enable-gpu-rasterization',
-  '--enable-zero-copy',
-  '--disable-frame-rate-limit',
-  '--force-color-profile=srgb',
-  '--force-device-scale-factor=1',
-  '--hide-scrollbars',
-  '--mute-audio',
-];
 
 /**
  * 描画内容は "決定的であること" だけを検証したいので、時間にもランダムにも
@@ -166,7 +154,7 @@ try {
     // プロセスを跨いで状態が漏れないことまで含めて検証したい。
     const browser = await chromium.launch({
       headless: true,
-      channel: 'chromium', // headless-shell では WebGPU アダプタが取れない
+      channel: CHROMIUM_CHANNEL, // headless-shell では WebGPU アダプタが取れない
       args: WEBGPU_FLAGS,
     });
     const page = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: 1 });

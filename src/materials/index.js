@@ -64,7 +64,7 @@ export class MaterialSystem {
     }
 
     const t0 = performance.now();
-    for (const name of SURFACE_KEYS) this._build(name);
+    for (const name of SURFACE_KEYS) await this._build(name);
     console.info(
       `[materials] ${SURFACE_KEYS.length} surfaces in ${(performance.now() - t0).toFixed(0)}ms` +
         (this.degraded ? ' (degraded: flat)' : '')
@@ -75,7 +75,7 @@ export class MaterialSystem {
   /* Bake                                                               */
   /* ================================================================== */
 
-  _build(name) {
+  async _build(name) {
     const def = LIBRARY[name];
     const mat = new PBRMaterial(`mat_${name}`, this.scene);
     mat.metadata = { owSurface: def.surface, owLibrary: name };
@@ -93,7 +93,7 @@ export class MaterialSystem {
     }
 
     const size = Math.max(64, Math.round(def.bake.size * this.sizeScale));
-    const tex = this._bakeSet(name, def, size);
+    const tex = await this._bakeSet(name, def, size);
     this.textures.set(name, tex);
 
     mat.albedoTexture = tex.albedo;
@@ -118,8 +118,16 @@ export class MaterialSystem {
     return mat;
   }
 
-  /** 3 パスを焼いて { albedo, normal, orm } を返す。 */
-  _bakeSet(name, def, size) {
+  /**
+   * 3 パスを焼いて { albedo, normal, orm } を返す。
+   *
+   * **各パスは必ず `bake()` を通すこと。** Babylon の ProceduralTexture は
+   * WGSL の頂点シェーダ (`ShadersWGSL/procedural.vertex.js`) を **動的 import** で
+   * 遅延ロードするため、コンストラクタ直後に render() を呼ぶと
+   * 「Invalid call to enableEffect: the effect property is empty!」で落ちる。
+   * さらに 2 パス目以降は 1 パス目の描画結果を読むので、順序も守る必要がある。
+   */
+  async _bakeSet(name, def, size) {
     const b = def.bake;
     const tile = new Vector2(b.tile, b.tile);
 
@@ -134,7 +142,7 @@ export class MaterialSystem {
     src.setVector4('pa', vec4(b.pa ?? [0, 0, 0, 0]));
     src.setVector4('pb', vec4(b.pb ?? [0, 0, 0, 0]));
     src.setVector4('weather', vec4(def.weather));
-    src.render();
+    await bake(src);
 
     // --- pass 2: normal ----------------------------------------------
     /**
@@ -151,7 +159,7 @@ export class MaterialSystem {
     const normal = this._makePT(`${name}_n`, size, WGSL_NORMAL);
     normal.setTexture('src', src);
     normal.setVector4('texel', new Vector4(1 / size, 1 / size, slope, 0));
-    normal.render();
+    await bake(normal);
 
     // --- pass 3: ORM --------------------------------------------------
     const orm = this._makePT(`${name}_orm`, size, WGSL_ORM);
@@ -159,7 +167,7 @@ export class MaterialSystem {
     orm.setVector4('orm', vec4(def.orm));
     // AO のサンプル半径はテクセル単位。解像度に依らず同じ実寸を見るよう size に比例。
     orm.setVector4('texel', new Vector4(1 / size, 1 / size, Math.max(1, size / 256), 0));
-    orm.render();
+    await bake(orm);
 
     for (const t of [src, normal, orm]) {
       t.wrapU = Texture.WRAP_ADDRESSMODE;
@@ -274,6 +282,36 @@ export class MaterialSystem {
     this.materials.clear();
     this.textures.clear();
   }
+}
+
+/**
+ * effect のコンパイル完了を待ってから 1 回だけ描画する。
+ *
+ * `isReady()` は「初回呼び出しで effect を作り始める」副作用を持つので、ポーリング
+ * すること自体がコンパイルのトリガーになる。rAF で回すのは、WebGPU のパイプライン
+ * 生成がフレーム境界で進むため。
+ *
+ * タイムアウトを持たせているのは、WGSL のコンパイルエラー時に isReady() が永遠に
+ * false を返して **無言でハングする**ため。黙って止まるより、どのサーフェスで
+ * 落ちたかを名前付きで投げた方が原因に辿り着ける。
+ */
+function bake(pt, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const t0 = performance.now();
+    const tick = () => {
+      if (pt.isReady()) {
+        pt.render();
+        resolve(pt);
+        return;
+      }
+      if (performance.now() - t0 > timeoutMs) {
+        reject(new Error(`[materials] "${pt.name}" のシェーダが ${timeoutMs}ms 以内に ready にならなかった (WGSL コンパイルエラーの可能性。ブラウザの console を確認)`));
+        return;
+      }
+      requestAnimationFrame(tick);
+    };
+    tick();
+  });
 }
 
 function vec3(a) {
