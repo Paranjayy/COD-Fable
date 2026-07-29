@@ -480,10 +480,13 @@ export class AiSystem {
     const g = this.grid;
     if (!g) return [];
     const anchors = [];
+    // 基準高さは原点の街路。y を渡さないと nearest() が屋上の歩行可能セルに
+    // 平気でスナップし、守備隊が全員ルーフトップに湧く (実測 y=9.5)。
+    const streetY = this.groundAt(0, 0, 40);
     for (let k = 0; k < 8; k++) {
       const a = (k / 8) * Math.PI * 2 + 0.35;
       for (const r of [30, 42, 20]) {
-        const ci = g.nearest(Math.cos(a) * r, Math.sin(a) * r, null, 8);
+        const ci = g.nearest(Math.cos(a) * r, Math.sin(a) * r, streetY, 10, 2.5);
         if (ci < 0) continue;
         const px = g.worldX(ci % g.nx);
         const pz = g.worldZ((ci / g.nx) | 0);
