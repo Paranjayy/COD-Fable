@@ -25,19 +25,17 @@
 // 無改変。GPU 面だけ差し替えた — DataTexture → RawTexture、
 // MeshStandardMaterial → PBRMaterial。
 //
-// 【積み残し・意図的な差分】Three 版が onBeforeCompile で注入していた 2 つの
-// シェーダフックはこの版では未移植:
-//   1. 高周波ディテールタイル (this.details) — 2 スケール系の高周波側。ベイク
-//      自体は残してあるので、移植する場合は Babylon の MaterialPluginBase で
-//      WGSL を注入する (customProgramCacheKey 相当は plugin 名が担う)。
-//   2. シルエットのエッジ減光 (RIM) — 逆光の輪郭コントラスト用。
-// どちらも「絵の質」の項目で、動作には影響しない。resolveMaterials から渡る
-// detail/rim オプションは受け取るが現状は無視する。
+// Three 版が onBeforeCompile で注入していた 2 つのシェーダフック — 高周波
+// ディテールタイル (this.details) と シルエットのエッジ減光 (RIM) — は
+// `MaterialPluginBase` として移植済み (src/ai/shaderplugin.js)。
+// `resolveMaterials` から渡る detail/rim オプションはそこで実際に効く。
 import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
 import { Texture } from '@babylonjs/core/Materials/Textures/texture.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import { Constants } from '@babylonjs/core/Engines/constants.js';
+
+import { SoldierSurfacePlugin, verifyInjection } from './shaderplugin.js';
 
 /* ------------------------------------------------------------------ */
 /* Tileable value noise                                                */
@@ -546,6 +544,34 @@ export function camoTexel(nz, cfg, u, v, out) {
  */
 export const RIM = { strength: 0.62, edge: 0.42, power: 1.9 };
 
+/**
+ * dev スイッチ `?aisurface=off|rim` — 兵士のシェーダフックを段階的に切る。
+ *
+ * **これは飾りではなく、この 2 つの効果が「今も効いていること」を再測定する
+ * 唯一の手段。** どちらも絵の中で他の要因 (露出・TAA・時刻) と混ざるため、
+ * 「乗っているように見える」では検証にならない。3 段階を撮り比べれば
+ * RIM と detail の寄与を画素単位で分離できる。
+ *
+ *   off  plugin を付けない          … 移植前と同じ絵
+ *   rim  RIM だけ (detail タイル無し) … 輪郭減光だけの寄与
+ *   既定 両方
+ *
+ * 実測 (1920x1080, combat ショット, lockstep):
+ *   off -> rim   full 0.76 % の画素が変化、変化画素の平均輝度 45.6 -> 43.9 (-3.8 %)。
+ *                差分マップでは兵士 6 体の**輪郭にだけ**帯が出る。
+ *   rim -> full  9.3 m の兵士を fov 1deg (= 0.19 m 相当) で見て高周波エネルギ
+ *                +20.3 %、fov 4deg (= 0.77 m 相当) で +12.8 %。
+ *                通常 fov 80deg の combat では 0.07 % の画素・最大 1 LSB。
+ *                = 近距離でだけ weave が出て、遠距離では mip chain が正しく
+ *                  畳んでいる (ちらつきの原因にならない)。
+ *
+ * Node (selftest) には `location` が無いので必ずガードすること。
+ */
+const SURFACE_MODE =
+  typeof location !== 'undefined'
+    ? new URLSearchParams(location.search).get('aisurface') ?? 'full'
+    : 'full';
+
 /* ------------------------------------------------------------------ */
 /* Public: the material set                                            */
 /* ------------------------------------------------------------------ */
@@ -570,8 +596,16 @@ export class SoldierMaterials {
     this.sets = {};
     /** set 名 -> { albedo, orm, normal } (RawTexture)。scene がある場合のみ。 */
     this.textures = {};
+    /** detail タイル名 -> RawTexture (rgb=tangent 法線, a=roughness デルタ)。 */
+    this.detailTextures = {};
     this.materials = new Map();
     this._disposables = [];
+    /**
+     * `verifyInjection()` が effect 生成のたびに 1 行ずつ積む検証結果。
+     * `ok === false` の行があれば、シェーダ注入が無言で外れている。
+     * キャプチャ用プローブは `ai.materials.injection` で読む。
+     */
+    this.injection = [];
 
     // ---- camouflage cloth, one bake per pattern ------------------------
     // Measure first, then bake through the budget remap, then report what the
@@ -854,6 +888,18 @@ export class SoldierMaterials {
         this.textures[k] = set;
         this._disposables.push(set.albedo, set.normal, set.orm);
       }
+      /**
+       * detail タイルは **線形** (gammaSpace=false)。rgb は tangent space 法線、
+       * a は 0.5 中心の roughness デルタで、どちらも色ではない。sRGB として
+       * 上げると法線が曲がり、weave の向きが texel ごとに嘘をつく。
+       */
+      for (const k in this.details) {
+        const d = this.details[k];
+        const t = uploadTexture(this.scene, d.data, d.size, false, aniso);
+        t.name = `ai_detail_${k}`;
+        this.detailTextures[k] = t;
+        this._disposables.push(t);
+      }
     }
   }
 
@@ -866,18 +912,24 @@ export class SoldierMaterials {
    * (R=AO, G=roughness, B=metallic)。ここがズレると「全部つるつる/全部金属」に
    * なり、絵から原因を辿りにくい。
    *
-   * `detail` と `rim` は Three 版のシェーダフックのオプション。ファイル冒頭の
-   * 積み残しコメントの通り現状は受けるだけで無視する (キャッシュキーには含めて
-   * おく — 将来 plugin 移植した時にキーを変えずに済むように)。
+   * `detail` と `rim` は `SoldierSurfacePlugin` に渡るシェーダフックのオプション。
+   * `detail.set` に対応する detail タイルが焼かれていない場合は黙って RIM だけの
+   * plugin になる (scene 無しの selftest 経路と同じ扱い)。
+   *
+   * `rim` は RIM.strength に掛かる **倍率**。既定 1。ガラスだけ 0.5 に落とす
+   * (glass() のコメント参照)。
    *
    * `roughness`/`metallic` は Babylon PBR ではテクスチャ値に掛かる係数なので、
    * Three 版の roughness/metalness 乗数と同じ意味になる。
    */
   get(setName, opts = {}) {
     const d = opts.detail;
+    // rim をキーに入れる: 同じ set/tint でも RIM 倍率が違えば別マテリアル。
+    // 入れ忘れると先に作られた方が使い回され、**エラー無しで**輪郭の減光量だけが
+    // 間違う (Three 版で customProgramCacheKey が担っていた役割の半分)。
     const key = `${setName}|${opts.key ?? ''}|${(opts.tint ?? []).join(',')}|${opts.rough ?? ''}|${
       opts.metal ?? ''
-    }|${d ? `${d.set},${d.scale},${d.normal},${d.rough}` : ''}`;
+    }|${d ? `${d.set},${d.scale},${d.normal},${d.rough}` : ''}|${opts.rim ?? 1}`;
     let m = this.materials.get(key);
     if (m) return m;
     const set = this.textures[setName];
@@ -912,8 +964,30 @@ export class SoldierMaterials {
      */
     m.forceIrradianceInFragment = true;
     m.metadata = { owSurface: 'fabric' };
+    this._attachPlugin(m, d, opts.rim);
     this.materials.set(key, m);
     return m;
+  }
+
+  /**
+   * 2 スケール系の高周波側と RIM を載せる。
+   *
+   * detail タイルが無いマテリアル (肌・ポリマー・鋼・ゴム・ガラス) にも plugin は
+   * 付ける — RIM は **全身に一様に掛からないと意味が無い**からで、顔と手だけ
+   * 減光されない実装は「輪郭のどこかだけが空に溶ける」という、素の状態より
+   * 目立つ不具合になる。plugin 側は `OW_DETAIL` define で分岐するので、
+   * detail 無しのマテリアルは detail のコードを 1 命令も含まない。
+   */
+  _attachPlugin(m, d, rimScale = 1) {
+    const mode = SURFACE_MODE;
+    if (mode === 'off') return null;
+    const tex = mode === 'rim' ? null : d ? this.detailTextures[d.set] : null;
+    const plugin = new SoldierSurfacePlugin(m, {
+      detail: tex ? { texture: tex, scale: d.scale, normal: d.normal, rough: d.rough } : null,
+      rim: { strength: RIM.strength * rimScale, edge: RIM.edge, power: RIM.power },
+    });
+    verifyInjection(m, !!tex, this.injection);
+    return plugin;
   }
 
   /** Flat material for goggle lenses / optic glass. */
@@ -927,6 +1001,12 @@ export class SoldierMaterials {
     m.environmentIntensity = 1.4;
     // 頂点カラー付きメッシュに載るので、上の get() と同じ varying 上限対策が要る
     m.forceIrradianceInFragment = true;
+    /**
+     * ゴーグルのレンズは **明るいグレージングハイライトが正しい** 唯一の部位なので、
+     * エッジ減光は半分の強さで掛ける。0 にするとレンズの縁が空にブルームで溶け、
+     * 1 にすると「ガラスに見える」つや自体が消える。
+     */
+    this._attachPlugin(m, null, 0.5);
     this.materials.set('glass', m);
     return m;
   }
