@@ -805,11 +805,19 @@ export class PhysicsSystem {
     const mask = opts.mask ?? MASK.BULLET;
     const rng = opts.rng ?? this.rng;
     /**
-     * true なら actor に当たっても damage:dealt を発行しない (bullet:impact は
-     * 出すので着弾 FX / デカールは通常どおり)。キャプチャ用 staged 敵の射撃
-     * (ai の staged.noDamage) が使う — これが無いと staged の実弾がプレイヤーの
-     * CC に当たって体力を削り、キャプチャが被弾フィルタ越しの絵になる (実測:
-     * combat ショットで HP 0 の赤ビネット)。
+     * true なら **アクターへの命中を丸ごと透明化する**: damage:dealt を発行せず、
+     * その actor 上の bullet:impact (入口/出口) も emit しない。地形への着弾
+     * (壁のデカール・土煙) は通常どおり。キャプチャ用 staged 敵の射撃
+     * (ai の staged.noDamage) が使う。
+     *
+     * 経緯 (両方実測):
+     *   1. damage:dealt を素通しすると staged の実弾がプレイヤーの体力を削り、
+     *      combat ショットが HP 0 の赤ビネット越しになる
+     *   2. bullet:impact を素通しすると、カメラ 0.3m のプレイヤーカプセルに
+     *      surface:'flesh' の着弾 FX (血しぶき) が発火し、**画面全体が均一な
+     *      赤い半透明レイヤーに覆われる** (combat の空領域 RGB が 146/158/164 →
+     *      203/84/71)。動力学の 0-dt 修正で CC の Havok 体が実位置に追従する
+     *      ようになり、staged の弾が初めて実際に「当たる」ようになって顕在化した
      */
     const noDamage = opts.noDamage ?? false;
     /** 貫通力。1.0 = 参照弾 (7.62x51 相当)。 */
@@ -839,14 +847,19 @@ export class PhysicsSystem {
 
       const props = SURFACE_PROPS[hit.surfaceIndex] ?? SURFACE_PROPS[SURFACE.concrete];
 
+      /** noDamage 弾のアクター命中は impact ごと透明化する (noDamage の doc 参照)。 */
+      const silent = noDamage && !!hit.actor;
+
       // 入口 impact。
-      this.emitImpact(
-        hit.point.x, hit.point.y, hit.point.z,
-        hit.normal.x, hit.normal.y, hit.normal.z,
-        dx, dy, dz,
-        hit.surfaceIndex, damage, false, hit, noDamage
-      );
-      res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
+      if (!silent) {
+        this.emitImpact(
+          hit.point.x, hit.point.y, hit.point.z,
+          hit.normal.x, hit.normal.y, hit.normal.z,
+          dx, dy, dz,
+          hit.surfaceIndex, damage, false, hit, noDamage
+        );
+        res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
+      }
 
       const advanced = hit.distance + 0.001;
 
@@ -877,13 +890,15 @@ export class PhysicsSystem {
       power -= consumed;
 
       // 出口 impact。
-      this.emitImpact(
-        back.point.x, back.point.y, back.point.z,
-        back.normal.x, back.normal.y, back.normal.z,
-        dx, dy, dz,
-        hit.surfaceIndex, damage, true, hit, noDamage
-      );
-      res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
+      if (!silent) {
+        this.emitImpact(
+          back.point.x, back.point.y, back.point.z,
+          back.normal.x, back.normal.y, back.normal.z,
+          dx, dy, dz,
+          hit.surfaceIndex, damage, true, hit, noDamage
+        );
+        res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
+      }
 
       if (power <= 0 || damage < 1) break;
 

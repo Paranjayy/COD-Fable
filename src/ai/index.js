@@ -589,10 +589,11 @@ export class AiSystem {
         maxDist: 200,
         mask: phys.MASK.BULLET,
         rng: this.rng,
-        // staged (キャプチャ用タブロー) の実弾はプレイヤーの CC に当たっても
-        // ダメージを流さない。noDamage は下の _testPlayerHit だけでなく Havok
-        // レイ経由の damage:dealt (physics.emitImpact) も黙らせる必要がある —
-        // ここを欠くとキャプチャがプレイヤー瀕死の赤ビネット越しになる (実測)。
+        // staged (キャプチャ用タブロー) の実弾はアクター命中を丸ごと透明化する
+        // (damage:dealt も bullet:impact も出さない — physics.fireBullet の
+        // noDamage doc 参照)。ここを欠くと (1) プレイヤーが削られて赤ビネット、
+        // (2) カメラ 0.3m のプレイヤーカプセルに flesh 着弾 FX が発火して画面が
+        // 赤い半透明レイヤーに覆われる (どちらも実測)。壁への着弾 FX は出る。
         noDamage: !!agent.staged?.noDamage,
       });
       if (impacts.length) end = impacts[0].point;

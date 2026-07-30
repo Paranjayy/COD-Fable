@@ -478,14 +478,27 @@ y=3 指定のカプセルが Havok 内で原点に居た)。ノードを作っ�
   死体は演算ゼロコストで撃てるまま残る。dispose は AiSystem 側が
   `agent.deathFall.dispose()` で行う (agent.dispose はラグドールを知らない)。
 
-### staged の射撃は `fireBullet({noDamage})` でダメージ経路ごと黙らせる
+### staged の射撃は `fireBullet({noDamage})` でアクター命中を丸ごと透明化する
 
-CC メタ登録 (上記) でプレイヤーに弾が当たるようになった副作用として、
-**キャプチャ用 staged 敵の実弾が Havok レイ経由でプレイヤーを削っていた**
-(ai の `staged.noDamage` は `_testPlayerHit` しか黙らせていなかった)。実測:
-combat ショットが HP 0 の赤ビネット越しに撮れていた。`fireBullet` の
-`noDamage: true` は bullet:impact (FX/デカール) は出しつつ damage:dealt だけを
-抑止する。staged の射撃を触るときはこの 2 経路があることを忘れないこと。
+CC メタ登録 (上記) と動力学の 0-dt 修正が重なった副作用で、**キャプチャ用
+staged 敵の実弾が「実際にプレイヤーに当たる」ようになり**、2 段階で combat
+ショットを壊した (どちらも実測):
+
+1. damage:dealt がプレイヤーを削り、HP 0 の赤ビネット越しの絵になる
+2. それを止めても、**カメラ 0.3m のプレイヤーカプセルに `surface:'flesh'` の
+   bullet:impact が発火し、血しぶき FX で画面全体が均一な赤い半透明レイヤーに
+   覆われる** (空領域 RGB 146/158/164 → 203/84/71)。粒子レイヤーを個別に消す
+   切り分けでは捕まらず、原因ボディも `phys.rigidBodies` には載っていない
+   (CC の内部 body なので) — 「動力学が生き返って初めて顕在化した」典型
+
+なお 0-dt 時代は **CC の内部 body の Havok 内位置がスポーン地点に取り残されて
+いて**、弾はゴースト位置を素通りしていた (プレイヤー被弾が動作して見えたのは
+テスト時にプレイヤーがスポーンから動いていなかっただけ)。
+
+`fireBullet({noDamage: true})` は actor に当たった impact を **emit ごとスキップ**
+し (入口/出口とも)、地形への着弾 FX とデカールだけを残す。staged の射撃を
+触るときは「ダメージ」と「アクター上の着弾 FX」の 2 経路があることを忘れない
+こと。
 
 ### WebGPU の fragment 入力は 16 変数まで
 
