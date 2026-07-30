@@ -1,20 +1,29 @@
 /**
- * AI — 手続き的な死亡モーション (ラグドールの代替)。
+ * AI — 死亡演出のファサード + 手続き倒れ込み (ラグドールのフォールバック)。
  *
- * ## なぜラグドールではないのか
+ * ## 構図 (2026-07 のラグドール導入後)
  *
- * Three 版は physics の自前ラグドールソルバ (particle + constraint) に生きた
- * スケルトンを渡していたが、Havok 移植でラグドールは physics から落ちた
- * (physics/index.js 冒頭コメント)。Babylon の `Physics/v2/ragdoll.js` や
- * PhysicsAggregate + 6DoF 拘束で再構築する選択肢もあったが、
- *   - 22 本の拘束チェーンのチューニング (質量比・コーン角・初期貫通) は
- *     それ自体が数日規模の仕事で、破綻すると「体が通りを飛んでいく」
- *   - Havok の剛体はフィルタを誤ると弾・視線・CC 掃引の全部に干渉する
- * ため、この移植ラウンドでは**決定的で絶対に破綻しない手続きモーション**を
- * 選んだ。被弾方向へ膝から崩れて倒れ、地面に沿って静止する。将来ラグドールを
- * 入れる場合はこのクラスを置き換えるだけでよい (呼び出し面: begin/update/finish)。
+ * agent.js は従来どおり `new DeathFall(rig, bones)` を持ち、begin / update /
+ * finish だけを呼ぶ。この DeathFall がファサードで、死亡時に
  *
- * ## 動き
+ *   - **Havok 実ラグドール** (src/ai/ragdoll.js の RagdollFall) — 既定
+ *   - **手続き倒れ込み** (このファイル下半分) — フォールバック
+ *
+ * のどちらかへ委譲する。手続き側へ落ちる条件:
+ *
+ *   1. `?ragdoll=0` (config.ragdoll === false) — 切り分け・決定性の逃げ道
+ *   2. staged エージェント (キャプチャ用タブロー) — 下記 finish() の事情
+ *   3. RagdollFall.begin() が throw した場合 (物理未初期化など)
+ *
+ * ## finish() とキャプチャの決定性
+ *
+ * staged の死体 (ai/index.js debugStage) は「撮影フレームまでに静止済み」で
+ * ある必要があり finish() で一気に完了姿勢まで進める。ラグドールは Havok を
+ * 実時間で回すしかなく finish できないため、**finish() が呼ばれたらラグドールを
+ * 破棄して手続きモーションに切り替える**。これにより 11 ショットの pixel gate
+ * (bit-identical) はラグドール導入前と同じ絵のまま保たれる。
+ *
+ * ## 手続きモーションの動き (フォールバック時)
  *
  *   0.00-0.35  膝が抜ける: 腰が沈み、脚が折れ、上体が前に落ちる
  *   0.15-1.00  倒れ込み: 足元を支点に被弾方向へ 90° 回転 (二次で加速)、
@@ -23,10 +32,12 @@
  *
  * ルートの回転は**アクターのルートノード**に掛ける (ボーンではなく)。倒れる
  * 軸はワールド水平の「被弾方向 × up」で、支点がアクター原点 (足元, y=0) に
- * あるため、90° 回した時点で体は地面の高さに寝る。
+ * あるため、90° 回した時点で体は地面の高さに寝る。ラグドール側はルート回転を
+ * 使わず (out.rootAngle = 0)、ボーンローカルへ直接書く — ragdoll.js 参照。
  */
 
 import { Vector3, Quaternion, Euler } from './math3.js';
+import { RagdollFall } from './ragdoll.js';
 
 const DEG = Math.PI / 180;
 
@@ -63,7 +74,7 @@ export class DeathFall {
   constructor(rig, bones) {
     this.rig = rig;
     this.bones = bones;
-    this.t = -1; // 負 = 非アクティブ
+    this.t = -1; // 負 = 非アクティブ (agent.updateDead がこの符号で回す/止める)
     this.fallDir = new Vector3(0, 0, -1);
     this.axis = new Vector3(1, 0, 0);
     /** 死亡瞬間の各ボーンのローカル回転 (ここから脱力ポーズへブレンド)。 */
@@ -78,6 +89,13 @@ export class DeathFall {
     this._groundY = 0;
     this._twist = 0;
 
+    /** 委譲先のラグドール。null なら手続きモーションが動く。 */
+    this._ragdoll = null;
+    /** finish() での手続き切り替え用に begin の引数を保存 (dir はコピー)。 */
+    this._savedAgent = null;
+    this._savedDir = new Vector3();
+    this._savedHasDir = false;
+
     // 脱力ポーズのローカル回転を一度だけ焼いておく
     for (let i = 0; i < rig.count; i++) {
       const d = LIMP[rig.names[i]];
@@ -90,6 +108,7 @@ export class DeathFall {
     }
   }
 
+  /** 手続きモーション専用の進捗 (ラグドール委譲中は意味を持たない)。 */
   get active() {
     return this.t >= 0 && this.t < DURATION;
   }
@@ -99,11 +118,42 @@ export class DeathFall {
   }
 
   /**
-   * @param agent  倒すエージェント (yaw / position / rng を読む)
+   * @param agent  倒すエージェント (yaw / position / rng / phys / ctx を読む)
    * @param dir    被弾の入射方向 (省略時は正面から撃たれた扱い = 後ろへ倒れる)
    * @param groundY 支点の床高さ
    */
   begin(agent, dir, groundY) {
+    if (this._useRagdoll(agent)) {
+      let r = null;
+      try {
+        r = new RagdollFall(this.rig, this.bones);
+        r.begin(agent, dir, groundY);
+        this._ragdoll = r;
+        this._savedAgent = agent;
+        this._savedHasDir = !!dir;
+        if (dir) this._savedDir.copy(dir); // dir はプール由来のことがあるためコピー
+        this.t = 0;
+        return;
+      } catch (err) {
+        // 物理未初期化・Babylon 更新での API 変化など。死亡演出が消えるよりは
+        // 手続きモーションで確実に倒す。
+        console.warn('[ai] ragdoll begin failed — 手続きモーションへ:', err?.message ?? err);
+        r?.dispose();
+        this._ragdoll = null;
+      }
+    }
+    this._beginProcedural(agent, dir, groundY);
+  }
+
+  /** ラグドールを使うか。判断根拠は冒頭コメントの 3 条件。 */
+  _useRagdoll(agent) {
+    if (agent.ctx?.config?.ragdoll === false) return false; // ?ragdoll=0
+    if (agent.staged) return false; // タブローは finish() 前提 (冒頭コメント)
+    return !!agent.phys?.plugin;
+  }
+
+  /** 手続き倒れ込みの開始 (従来の DeathFall.begin と同一)。 */
+  _beginProcedural(agent, dir, groundY) {
     this.t = 0;
     this._groundY = groundY;
     // 倒れる方向 = 入射方向の水平成分 (弾に押される向き)
@@ -126,6 +176,11 @@ export class DeathFall {
    * @returns true = まだ動いている / false = 静止済み (以後呼ばなくてよい)
    */
   update(dt, out) {
+    if (this._ragdoll) {
+      if (this.t < 0) return false;
+      this.t += dt; // 参考値。ラグドールの静止は RagdollFall が自分で判定する
+      return this._ragdoll.update(dt, out);
+    }
     if (this.t < 0) return false;
     const wasDone = this.done;
     this.t = Math.min(DURATION, this.t + dt);
@@ -157,11 +212,37 @@ export class DeathFall {
     return !wasDone;
   }
 
-  /** キャプチャ演出用: 一気に静止状態まで進める。 */
+  /**
+   * キャプチャ演出用: 一気に静止状態まで進める。
+   *
+   * ラグドール委譲中に呼ばれたら (staged 死体がここに来る)、ラグドールを破棄
+   * して手続きモーションへ切り替えてから完了させる — Havok は「一気に進める」
+   * ことができないため。rng の消費 (twist 1 回) は従来の begin と同じなので、
+   * キャプチャの決定性は保たれる。
+   */
   finish(out) {
+    if (this._ragdoll) {
+      this._ragdoll.dispose();
+      this._ragdoll = null;
+      this._beginProcedural(
+        this._savedAgent,
+        this._savedHasDir ? this._savedDir : null,
+        this._savedAgent?.position?.y ?? 0
+      );
+    }
     if (this.t < 0) return;
     this.t = DURATION - 1e-4;
     this.update(1, out);
+  }
+
+  /**
+   * ラグドールのボディ/拘束を Havok から回収する。AiSystem.dispose と
+   * _clearStage が呼ぶ (agent.dispose はこのクラスを知らない — agent.js を
+   * 触らないための設計)。手続きモーションのみなら no-op。
+   */
+  dispose() {
+    this._ragdoll?.dispose();
+    this._ragdoll = null;
   }
 }
 

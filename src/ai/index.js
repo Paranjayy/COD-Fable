@@ -19,7 +19,8 @@
  *   math3.js      Three 互換 math shim (上記の大半を無改変で通すための要)
  *   mesh.js       Babylon Mesh/Skeleton 化と CPU 姿勢の書き写し
  *   hitbox.js     部位ヒットボックス (Havok キネマティックカプセル + フィルタ設計)
- *   deathfall.js  手続き死亡モーション (ラグドール不採用の理由もここ)
+ *   deathfall.js  死亡演出ファサード + 手続き倒れ込み (フォールバック)
+ *   ragdoll.js    Havok 実ラグドール (既定の死亡演出。フィルタ設計もここ)
  *
  * PUBLIC API — `const ai = ctx.get('ai')`
  *   ai.spawn(variant, position, yaw, opts) -> Agent
@@ -588,6 +589,11 @@ export class AiSystem {
         maxDist: 200,
         mask: phys.MASK.BULLET,
         rng: this.rng,
+        // staged (キャプチャ用タブロー) の実弾はプレイヤーの CC に当たっても
+        // ダメージを流さない。noDamage は下の _testPlayerHit だけでなく Havok
+        // レイ経由の damage:dealt (physics.emitImpact) も黙らせる必要がある —
+        // ここを欠くとキャプチャがプレイヤー瀕死の赤ビネット越しになる (実測)。
+        noDamage: !!agent.staged?.noDamage,
       });
       if (impacts.length) end = impacts[0].point;
     }
@@ -998,6 +1004,9 @@ export class AiSystem {
       const i = this.agents.indexOf(a);
       if (i >= 0) this.agents.splice(i, 1);
       this.cover?.release(a.id);
+      // ラグドールのボディ/拘束は agent.dispose が知らない (deathfall.js の
+      // ファサード設計) ので、ここで先に回収する。
+      a.deathFall?.dispose?.();
       a.dispose();
     }
     this._stagedAgents.length = 0;
@@ -1085,8 +1094,9 @@ export class AiSystem {
       }
     }
 
-    // One man already down — 手続き倒れ込みを完了状態まで進めて死体として置く
-    // (ラグドール不採用の経緯は deathfall.js)。death path の実行も兼ねる。
+    // One man already down — 死体として置く。finish() は手続き倒れ込みの完了
+    // 姿勢に切り替わる (ラグドールは一気に静止まで進められない — deathfall.js
+    // のファサード参照) ので、この死体はキャプチャ間で bit-identical のまま。
     const dPos = this._stageSlot(cam, -0.58, 9.4, placedPositions);
     const casualty = this.spawn('breacher', dPos, Math.atan2(camPos.x - dPos.x, camPos.z - dPos.z));
     squad.add(casualty);
@@ -1142,6 +1152,8 @@ export class AiSystem {
 
   dispose() {
     for (const off of this._off ?? []) off();
+    // ラグドールの Havok ボディ/拘束を先に回収 (_clearStage と同じ理由)
+    for (const a of this.agents) a.deathFall?.dispose?.();
     for (const a of this.agents) a.dispose();
     this.agents.length = 0;
     this.squads.length = 0;

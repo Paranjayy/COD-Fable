@@ -73,6 +73,14 @@ for (const [key, flag] of [
  */
 config.fxParticles = params.get('fxparticles') !== '0';
 
+/**
+ * `?ragdoll=0` で敵の死亡演出を Havok ラグドールから手続き倒れ込み
+ * (src/ai/deathfall.js の DeathFall) にフォールバックできる。既定は有効。
+ * DeathFall は完全決定的なので、ラグドール起因の揺れを疑うときの切り分けと、
+ * 決定性キャプチャの逃げ道として残してある (経緯は deathfall.js 冒頭)。
+ */
+config.ragdoll = params.get('ragdoll') !== '0';
+
 config.forcePost = {
   gtao: params.get('gtao') === '1' ? true : undefined,
   mblur: params.get('mblur') === '1' ? true : undefined,
