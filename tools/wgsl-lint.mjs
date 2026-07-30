@@ -53,7 +53,23 @@ const RESERVED = new Set(
 );
 
 const ROOT = resolve(import.meta.dirname, '..');
-const WGSL_DIRS = [join(ROOT, 'src/materials/wgsl'), join(ROOT, 'src/sky/wgsl'), join(ROOT, 'src/fx/wgsl')];
+/**
+ * 走査対象。
+ *
+ * **サブシステム配下に wgsl ディレクトリを新設したら必ずここに足すこと。** 足し忘れると lint は
+ * `findings: 0` を返し続けるが、それは「問題が無い」ではなく「見ていない」の意味に
+ * なる。予約語 (`macro` で実際に踏んだ) は `isReady()` も `render()` も通り抜けて
+ * テクスチャだけが黙って真っ黒に焼き上がるので、リンタが唯一の防波堤になる。
+ *
+ * `src/ai/wgsl` は兵士の MaterialPlugin 移植で追加された。追加当初は走査対象から
+ * 漏れており、担当エージェントが予約語リストを手で照合して代替していた。
+ */
+const WGSL_DIRS = [
+  join(ROOT, 'src/materials/wgsl'),
+  join(ROOT, 'src/sky/wgsl'),
+  join(ROOT, 'src/fx/wgsl'),
+  join(ROOT, 'src/ai/wgsl'),
+];
 
 /** `let x` / `var x` / `fn x(` の宣言名を拾う。 */
 const DECL = /\b(?:let|var|fn)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
