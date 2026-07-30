@@ -429,6 +429,64 @@ Babylon を上げたときに名前が変わっていないか確認すること
 ヒットボックスは毎フレーム `RemoveBody` → `AddBody` で回避している
 (`src/ai/hitbox.js`)。**kinematic を動かす実装を足すときは同じ罠を踏む。**
 
+### `setTimeStep(0)` のまま `engine._step(h)` しても動力学は 1mm も進まない
+
+`HavokPlugin(useDeltaForWorldStep=false)` は **`executeStep` の引数 delta を捨てて
+`_fixedTimeStep` を使う** (havokPlugin.js の `deltaTime = ... : this._fixedTimeStep`)。
+init の `setTimeStep(0)` は自動ステップ (scene.render 内) を殺す一方で、fixedUpdate
+からの手動 `engine._step(h)` も **HP_World_Step(world, 0)** にしてしまう。
+
+- 症状: DYNAMIC ボディが初速を保持したまま**永遠に動かない** (速度は残るのに
+  位置が変わらない)。エラーは一切出ない。CC・レイキャストは物理ステップに
+  依存しないため全部正常に見える — **この移植ではラグドール実装まで、デブリも
+  グレネードも一度も落下していなかった**が誰も気づかなかった。
+- 対処: `physics/index.js fixedUpdate` が `setTimeStep(h)` → `_step(h)` →
+  `setTimeStep(0)` と挟む。**戻し忘れると自動ステップが実フレーム時間で走り、
+  決定性が壊れる。**
+
+### PhysicsBody は生成時に stale な `absolutePosition` を読む
+
+`PhysicsBody` コンストラクタは `transformNode.absolutePosition` で Havok 内の初期
+位置を決めるが、**親なしの新規ノードでは world matrix を強制計算しない** (親付き
+だけ `computeWorldMatrix(true)` する分岐がある)。作りたての TransformNode に
+position を入れて即 body を作ると、**body は (0,0,0) に生成される** (実測:
+y=3 指定のカプセルが Havok 内で原点に居た)。ノードを作ったら
+`node.computeWorldMatrix(true)` を呼んでから body を作ること
+(`physics/index.js addRigidBody` / `ai/ragdoll.js` 参照)。
+
+### 敵の死亡は Havok 実ラグドール (`src/ai/ragdoll.js`) — 2026-07 導入
+
+- **Babylon 標準の `Physics/v2/ragdoll.js` (Ragdoll) は使えない**。9.18.1 実査:
+  config の min/max が `_initJoints()` で**拘束に一切渡されない dead code** で、
+  既定 HINGE は無制限回転 = タコ死体になる。フィルタ制御も無い。よって
+  PhysicsBody + カプセル 11 個 + `Physics6DoFConstraint` 10 本 (関節ごとの角度
+  リミット付き) の自前構築。肘/膝の屈曲符号は LIMP (deathfall.js) と同じ規約。
+- **フィルタ**: membership = `LAYER.RAGDOLL`, collide = STATIC|PROP|CLIP。
+  弾 (MASK.BULLET) には当たり **surface:'flesh' / actor:null** (死体撃ちで
+  damage:dealt・ヒットマーカーを出さない意図的判断)。視線 (MASK.SIGHT) は
+  遮らない。プレイヤー CC は collide 側から RAGDOLL ビットを落として双方向
+  無干渉 (createCharacter 参照)。**ラグドール自己衝突は意図的に無効** — 死亡
+  姿勢では前腕と胸のカプセルが重なっており、初期貫通の解決で体が吹き飛ぶ。
+- **切り替え**: `?ragdoll=0` で手続き倒れ込み (DeathFall) にフォールバック。
+  agent.js は無改変 — deathfall.js がファサードで、begin() で委譲先を選ぶ。
+  **staged (キャプチャ用) の死体は finish() で必ず手続き経路に切り替わる**ので
+  11 ショットの pixel gate はラグドール導入前と bit-identical のまま。
+- **決定性 (実測)**: lockstep キャプチャで同一手順のキルを別ページロードで
+  2 回実行し、全 11 ボディの最終 float 変換が **bit-identical** だった
+  (同一マシン)。クロスマシンは Havok の既知の限界どおり保証なし。
+- 静止判定 (全ボディ低速 0.45s or 8s 経過) で全ボディを STATIC に落とし、以後の
+  死体は演算ゼロコストで撃てるまま残る。dispose は AiSystem 側が
+  `agent.deathFall.dispose()` で行う (agent.dispose はラグドールを知らない)。
+
+### staged の射撃は `fireBullet({noDamage})` でダメージ経路ごと黙らせる
+
+CC メタ登録 (上記) でプレイヤーに弾が当たるようになった副作用として、
+**キャプチャ用 staged 敵の実弾が Havok レイ経由でプレイヤーを削っていた**
+(ai の `staged.noDamage` は `_testPlayerHit` しか黙らせていなかった)。実測:
+combat ショットが HP 0 の赤ビネット越しに撮れていた。`fireBullet` の
+`noDamage: true` は bullet:impact (FX/デカール) は出しつつ damage:dealt だけを
+抑止する。staged の射撃を触るときはこの 2 経路があることを忘れないこと。
+
 ### WebGPU の fragment 入力は 16 変数まで
 
 頂点カラー + CSM 4 カスケードで 17 になり、**画面全体が黒くなる**。ai は
