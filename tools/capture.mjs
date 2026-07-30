@@ -41,6 +41,24 @@ const SETTLE = Number(args.settle ?? 90);
  * 起きたので揃えた。
  */
 const QUERY = typeof args.query === 'string' ? `&${args.query}` : '';
+/**
+ * **ロックステップで撮る (`--lockstep=0` で切れる)。**
+ *
+ * ## なぜ既定で有効なのか — 「マズルフラッシュが写らない」の半分はこれだった
+ *
+ * ロックステップでない場合、engine は自分の rAF ループを回し続ける。ドライバが往復して
+ * いる間 (`__READY__` の待ち、ショット適用の evaluate、スクリーンショットの RPC) にも
+ * フレームが進むので、`settle` フレームを送っても**シャッターが切られた瞬間の
+ * engine.time.frame は run ごとに 10〜20 ずれる**。
+ *
+ * ふだんはそれでも絵は同じだが、`__APPLY_SHOT__` に渡す `grabFrame` を見て
+ * 「撮られるフレームに一過性イベントを載せる」ショット (muzzle) では致命的で、
+ * 発射の拍とシャッターがまるで合わない。実測で frame 209 / 255 のように毎回違った。
+ *
+ * baseline.mjs は元からロックステップだったが capture.mjs は違っており、その差が
+ * 「baseline では写るのに capture では写らない」という切り分けを難しくしていた。
+ */
+const LOCKSTEP = args.lockstep !== '0' && args.lockstep !== false;
 
 /**
  * **最初の GPU 検証エラーだけを抜き出して先頭に出す。**
@@ -125,7 +143,7 @@ page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}\n${e.stack ?? ''
 
 let failed = null;
 try {
-  await page.goto(`http://127.0.0.1:${PORT}/?capture=1&backend=webgpu&shot=${encodeURIComponent(SHOT)}${QUERY}`, {
+  await page.goto(`http://127.0.0.1:${PORT}/?capture=1${LOCKSTEP ? '&lockstep=1' : ''}&backend=webgpu&shot=${encodeURIComponent(SHOT)}${QUERY}`, {
     waitUntil: 'domcontentloaded',
     timeout: TIMEOUT,
   });
@@ -145,16 +163,30 @@ try {
     );
     logs.push(`[shot] ${JSON.stringify(applied)}`);
 
-    // Pump deterministic frames so temporal effects converge.
-    await page.evaluate(
-      (n) =>
-        new Promise((done) => {
-          let i = 0;
-          const tick = () => (++i >= n ? done() : requestAnimationFrame(tick));
-          requestAnimationFrame(tick);
-        }),
-      SETTLE
-    );
+    if (LOCKSTEP) {
+      // 時間的な蓄積を既知の位相から始めるため、履歴を捨てる (baseline.mjs と同じ)。
+      await page.evaluate(() => {
+        const r = window.__ENGINE__?.ctx?.peek?.('render');
+        r?.resetTemporal?.();
+      });
+      // engine のフレームを正確に SETTLE 回だけ進める。ページは自前のループを持たない
+      // ので、上下の RPC 往復中には 1 フレームも進まない。
+      await page.evaluate((n) => window.__PUMP__(n), SETTLE);
+      // シミュレーションを止めたまま 2 rAF 譲り、コンポジタが最終フレームを確実に
+      // 拾ってからシャッターを切る。
+      await page.evaluate(() => window.__PRESENT__?.(2));
+    } else {
+      // Pump deterministic frames so temporal effects converge.
+      await page.evaluate(
+        (n) =>
+          new Promise((done) => {
+            let i = 0;
+            const tick = () => (++i >= n ? done() : requestAnimationFrame(tick));
+            requestAnimationFrame(tick);
+          }),
+        SETTLE
+      );
+    }
 
     mkdirSync(dirname(OUT), { recursive: true });
     await page.screenshot({ path: OUT, type: 'png' });
