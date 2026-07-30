@@ -378,6 +378,31 @@ min/max にクランプする neighborhood clamping) が **既定 false**。こ�
 
 ## Havok / Babylon の罠 (実測で踏んだもの)
 
+### CC の `acceleration` は既定 0.05 — 呼び出し側の加速度を上書きする
+
+`PhysicsCharacterController.acceleration` は `calculateMovement` が希望速度へ
+「その割合だけ」近づける補間係数で、**既定は 0.05 = 1 ステップで 5% しか近づかない**。
+Babylon 本体のコメント自身が "A value of 1 means reaching max velocity immediately"
+と書いている。
+
+この係数は **呼び出し側が計算した速度を無条件に上書きする**。`player/movement.js` は
+`MOVE.groundAccel = 92 m/s^2` (50 ms で最高速。CoD の「タイト」な操作感の正体) で
+希望速度を作っているのに、CC 側で二重に鈍らされていた。
+
+実測 (W キー押しっぱなし、目標 4.57 m/s):
+
+| | 既定 0.05 | 修正後 1 |
+|---|---|---|
+| 最高速到達 | 0.95 s 経っても 2.51 m/s | **1 フレーム** |
+| 速度の増分 | 0.11 → 0.035 m/s と減衰 (指数漸近) | 一定 |
+| playtest の `metresMoved` | 0.43 | 1.37 |
+
+**加速カーブの所有者は 1 つでなければならない**。それは `player/movement.js` 側であって
+CC ではない。`maxAcceleration` (既定 50 m/s^2) は安全弁として残してよい。
+
+「動いてはいる」ので playtest は通ってしまい、移植中ずっと気付かなかった。**ゲートが
+「0 か 1 か」しか見ていないと、こういう「動くが仕様の 1/15」は素通りする。**
+
 ### PhysicsCharacterController の内部 body はフィルタ全ビット
 
 `PhysicsCharacterController` は内部で `PhysicsBody` を作り、**フィルタが全ビット立った
