@@ -75,6 +75,8 @@
  *   addRigidBody({shape, halfExtents|radius, mass, position, velocity, mesh}) -> RigidBody
  *   spawnDebris(position, velocity, {size, surface, lifetime, mesh})
  *   removeRigidBody(b) / b.applyImpulse(ix,iy,iz, px,py,pz)
+ *   registerBodyMeta(body, {surface, actor, part, layer, mesh})   自前 body を
+ *   unregisterBodyMeta(body)                                      Hit 語彙に載せる
  *
  * CONSTANTS
  *   phys.LAYER / phys.MASK / phys.SURFACE / phys.SURFACE_NAMES / phys.SURFACE_PROPS
@@ -194,6 +196,27 @@ class Character {
     );
     this.ctrl.maxSlopeCosine = Math.cos((Math.PI * this.slopeLimit) / 180);
     this.ctrl.maxStepHeight = this.stepHeight;
+    /**
+     * **`acceleration` は 1 にすること。Babylon の既定 0.05 は罠。**
+     *
+     * `calculateMovement` は希望速度へ「`acceleration` の割合だけ」近づける補間係数を
+     * 持っており、既定は 0.05 = 1 ステップで 5% しか近づかない (Babylon 本体のコメントも
+     * "A value of 1 means reaching max velocity immediately" と書いている)。
+     *
+     * この係数は **呼び出し側が計算した速度を無条件に上書きする**。
+     * `player/movement.js` は `MOVE.groundAccel = 92 m/s^2` (50 ms で最高速。CoD の
+     * 「タイト」な操作感の正体) で希望速度を作っているのに、CC 側で二重に鈍らされて
+     * いた。加速カーブの所有者は 1 つでなければならず、それは movement.js 側。
+     *
+     * 実測 (W キー押しっぱなし、目標 4.57 m/s、既定値のとき):
+     *   57 フレーム (0.95 s) 経っても 2.51 m/s、45 フレームで 0.4 m しか進まない
+     *   速度の増分がフレームごとに 0.11 → 0.035 m/s と減っていく (指数漸近の形)
+     *
+     * 「動いてはいる」ので playtest は通ってしまい、移植中ずっと気付かなかった。
+     * `maxAcceleration` (既定 50 m/s^2) は安全弁として残す — groundAccel 92 は
+     * 1 ステップぶん (h=1/120) に直せば 0.77 m/s で、この上限には当たらない。
+     */
+    this.ctrl.acceleration = 1;
 
     /** 読み取り専用として扱うこと。書き換えたい時は teleport() を使う。 */
     this.position = pos.clone();
@@ -469,6 +492,37 @@ export class PhysicsSystem {
   }
 
   /**
+   * 外部サブシステムが自前で作った PhysicsBody をメタデータ表に載せる公開 API。
+   *
+   * Hit / bullet:impact に surface / actor / part を載せるのはこの表で、載って
+   * いない body は `surface:'concrete' / actor:null` になる (CC 内部 body で実際に
+   * 踏んだ罠 — createCharacter のコメント参照)。ai のヒットボックスやラグドールの
+   * ように body のライフサイクルを自分で管理する呼び出し側はこれを使うこと。
+   * `_meta` に直接 set しない (private を触る箇所を増やさない)。
+   *
+   * NOTE: `actor` を null にすると弾が当たっても damage:dealt が発行されない。
+   * 死体 (ラグドール) は意図的に actor:null で登録する — ヒットマーカーや
+   * キルフィードが死体撃ちで再発火しないようにするため。
+   */
+  registerBodyMeta(body, opts = {}) {
+    if (!body) return;
+    const si = surfaceIndex(opts.surface ?? 'concrete');
+    this._meta.set(body, {
+      surfaceIndex: si,
+      surface: surfaceName(si),
+      layer: opts.layer ?? LAYER.DEBRIS,
+      mesh: opts.mesh ?? null,
+      actor: opts.actor ?? null,
+      part: opts.part ?? null,
+    });
+  }
+
+  /** registerBodyMeta の対。body を消す側が必ず呼ぶこと (Map リーク防止)。 */
+  unregisterBodyMeta(body) {
+    if (body) this._meta.delete(body);
+  }
+
+  /**
    * Havok は静的ボディの追加/削除を増分で処理するため、Three 版のような明示的な
    * BVH 再構築は不要。API 互換のために残してある no-op。
    */
@@ -704,6 +758,20 @@ export class PhysicsSystem {
           actor: opts.actor ?? null,
           part: opts.part ?? 'torso',
         });
+        /**
+         * 掃引対象から RAGDOLL 層だけを外す。
+         *
+         * Havok のフィルタは対称 ((A.mem & B.col) && (B.mem & A.col)) なので、
+         * こちら側の collide から RAGDOLL ビットを落とすだけで「プレイヤーの CC が
+         * 死体を蹴飛ばす / 死体に足止めされる」の両方向が消える (ラグドール側の
+         * membership は LAYER.RAGDOLL のみ — ai/ragdoll.js 参照)。
+         *
+         * membership は全ビットのまま残す — ここを絞ると敵弾のレイ (MASK.BULLET)
+         * や AI の視線がプレイヤーに当たらなくなる方向の事故になるため、変更は
+         * collide 側だけに留める。
+         */
+        const shape = c.ctrl._shape;
+        if (shape) shape.filterCollideMask = MASK.ALL & ~LAYER.RAGDOLL;
       }
     }
     return c;
@@ -736,6 +804,14 @@ export class PhysicsSystem {
     const maxDist = opts.maxDist ?? 300;
     const mask = opts.mask ?? MASK.BULLET;
     const rng = opts.rng ?? this.rng;
+    /**
+     * true なら actor に当たっても damage:dealt を発行しない (bullet:impact は
+     * 出すので着弾 FX / デカールは通常どおり)。キャプチャ用 staged 敵の射撃
+     * (ai の staged.noDamage) が使う — これが無いと staged の実弾がプレイヤーの
+     * CC に当たって体力を削り、キャプチャが被弾フィルタ越しの絵になる (実測:
+     * combat ショットで HP 0 の赤ビネット)。
+     */
+    const noDamage = opts.noDamage ?? false;
     /** 貫通力。1.0 = 参照弾 (7.62x51 相当)。 */
     let power = opts.penetration ?? 1;
     let damage = opts.damage ?? 30;
@@ -768,7 +844,7 @@ export class PhysicsSystem {
         hit.point.x, hit.point.y, hit.point.z,
         hit.normal.x, hit.normal.y, hit.normal.z,
         dx, dy, dz,
-        hit.surfaceIndex, damage, false, hit
+        hit.surfaceIndex, damage, false, hit, noDamage
       );
       res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
 
@@ -805,7 +881,7 @@ export class PhysicsSystem {
         back.point.x, back.point.y, back.point.z,
         back.normal.x, back.normal.y, back.normal.z,
         dx, dy, dz,
-        hit.surfaceIndex, damage, true, hit
+        hit.surfaceIndex, damage, true, hit, noDamage
       );
       res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
 
@@ -832,7 +908,7 @@ export class PhysicsSystem {
     return res;
   }
 
-  emitImpact(px, py, pz, nx, ny, nz, dx, dy, dz, si, damage, exit, hit) {
+  emitImpact(px, py, pz, nx, ny, nz, dx, dy, dz, si, damage, exit, hit, noDamage = false) {
     const p = this._impactPool[this._impactCursor];
     this._impactCursor = (this._impactCursor + 1) % IMPACT_POOL;
     p.point.set(px, py, pz);
@@ -849,7 +925,8 @@ export class PhysicsSystem {
     this.ctx.events.emit('bullet:impact', p);
 
     // ダメージは「入口」でのみ与える。出口でも与えると 1 発で 2 回当たる。
-    if (p.actor && !exit) {
+    // noDamage (staged 射撃) は FX だけ出してダメージ経路を全部黙らせる。
+    if (p.actor && !exit && !noDamage) {
       this.ctx.events.emit('damage:dealt', {
         target: p.actor,
         amount: damage,
@@ -894,6 +971,16 @@ export class PhysicsSystem {
     const node = opts.mesh ?? new TransformNode('rb', this.scene);
     if (opts.position) node.position.copyFrom(opts.position);
     node.rotationQuaternion ??= Quaternion.Identity();
+    /**
+     * **ワールド行列を明示的に確定させてから PhysicsBody を作る。**
+     *
+     * PhysicsBody のコンストラクタは `transformNode.absolutePosition` を読むが、
+     * 親なしの新規ノードでは world matrix を強制計算しない (親付きのみ計算する
+     * 分岐がある)。作りたてのノードの absolutePosition はゼロのままなので、
+     * これが無いと **body が (0,0,0) に生成される** (実測: 指定位置 y=3 のはず
+     * のカプセルが Havok 内で原点に居た)。
+     */
+    node.computeWorldMatrix(true);
 
     let shape;
     const kind = opts.shape ?? 'box';
@@ -976,9 +1063,26 @@ export class PhysicsSystem {
   /* ================================================================== */
 
   fixedUpdate(h) {
-    // Havok を固定ステップで 1 回進める。engine が MAX_SUBSTEPS で回数を制限
-    // しているので、ここでは 1 ステップだけ進めればよい。
+    /**
+     * Havok を固定ステップで 1 回進める。engine が MAX_SUBSTEPS で回数を制限
+     * しているので、ここでは 1 ステップだけ進めればよい。
+     *
+     * ## setTimeStep をステップの前後で切り替える理由 (実測で踏んだ罠)
+     *
+     * `HavokPlugin(useDeltaForWorldStep=false)` は **executeStep の引数 delta を
+     * 捨てて `_fixedTimeStep` を使う** (havokPlugin.js L590)。init() の
+     * `setTimeStep(0)` は自動ステップ (scene.render 内) を殺すが、その状態で
+     * `engine._step(h)` を呼んでも HP_World_Step(world, **0**) になり、
+     * **動力学が一切積分されない**。実測: DYNAMIC ボディが初速を保持したまま
+     * 永遠に静止し (速度は残るが位置が動かない)、デブリ・グレネード・
+     * ラグドールが全く落ちなかった。CC は自前積分なので気づけない。
+     *
+     * ここで h を設定 → 1 ステップ → 0 に戻す。戻し忘れると自動ステップが
+     * 実フレーム時間で走り出し、決定性 (bit-identical キャプチャ) が壊れる。
+     */
+    this.engine.setTimeStep(h);
     this.engine._step(h);
+    this.engine.setTimeStep(0);
 
     // 寿命切れのデブリを回収する。splice 中のインデックスずれを避けるため逆順。
     for (let i = this.rigidBodies.length - 1; i >= 0; i--) {
