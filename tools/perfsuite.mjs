@@ -50,9 +50,19 @@ const LOAD_LIMIT = Number(args.loadLimit ?? 0.5);
 const RIQR_LIMIT = Number(args.riqrLimit ?? 0.15);
 
 const ROOT = resolve(import.meta.dirname, '..');
-const passthrough = ['w', 'h', 'dpr', 'frames', 'warmup', 'query', 'nofire', 'noai']
+const passthrough = ['w', 'h', 'dpr', 'frames', 'warmup', 'query', 'nofire', 'noai', 'novsync']
   .filter((k) => args[k] !== undefined)
   .map((k) => (args[k] === true ? `--${k}` : `--${k}=${args[k]}`));
+
+/**
+ * run と run の間に挟む冷却秒数。
+ *
+ * **測定そのものが負荷源になる。** 5 回連続で Chromium を起動して 900 フレーム回すと、
+ * 実測で load average / CPU が 0.42 → 1.40 まで上がった。開始時だけ load を見て
+ * 「アイドルだから測れる」と判断すると、後半の run は自分が作った負荷を測ることになる。
+ */
+const COOLDOWN = Number(args.cooldown ?? 0);
+const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
 const runOnce = () =>
   new Promise((done, fail) => {
@@ -92,6 +102,10 @@ const riqr = (a) => {
 const loadBefore = loadavg()[0] / NCPU;
 const runs = [];
 for (let i = 0; i < RUNS; i++) {
+  if (i > 0 && COOLDOWN > 0) {
+    process.stderr.write(`cooldown ${COOLDOWN}s (load ${(loadavg()[0] / NCPU).toFixed(2)})\n`);
+    await sleep(COOLDOWN);
+  }
   const load = loadavg()[0] / NCPU;
   const r = await runOnce();
   runs.push({

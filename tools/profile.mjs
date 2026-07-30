@@ -37,12 +37,40 @@ const FRAMES = Number(args.frames ?? 900);
 const NOFIRE = !!args.nofire;
 /** `--noai` で AI の交戦ステージを起動しない。AI 起因のヒッチを切り分けるため。 */
 const NOAI = !!args.noai;
+/**
+ * **`--novsync` で vsync を切る。ヒッチ率を測るときは必須。**
+ *
+ * ## なぜ必要か — 「ヒッチ 2%〜33%」の正体だった
+ *
+ * ヒッチの判定は `dt > max(2 * median, median + 8)` で、**中央値からの相対**で決まる。
+ * vsync が効いていると中央値が 16.6 ms (60 Hz) に張り付き、閾値は 33.2 ms まで上がる
+ * ので、ヒッチはほとんど検出されない。vsync が効かない run では中央値が 7 ms 前後に
+ * なり、閾値は 15 ms に下がるため、**vsync 由来の 16.6 ms フレームが 1 枚混じるだけで
+ * ヒッチと判定される**。
+ *
+ * 実測 (同一ビルド・同一マシン・load 0.42〜0.49 で 5 回):
+ *
+ *   run 1  p50  7.2ms (139fps)  ヒッチ 34.3%
+ *   run 2  p50  7.1ms (141fps)  ヒッチ 34.4%
+ *   run 3  p50  9.6ms (104fps)  ヒッチ 13.0%
+ *   run 4  p50 16.6ms ( 60fps)  ヒッチ  4.4%   ← vsync に張り付いた run
+ *   run 5  p50  7.5ms (133fps)  ヒッチ 31.8%
+ *
+ * **p50 とヒッチ率が逆相関している** のが決め手。「速い run ほどヒッチが多い」のは
+ * 実装の性質ではありえず、閾値が中央値に連動しているせい。README に長く
+ * 「ヒッチが 2% と 33% の間で振れる、環境由来か実装由来か切り分けられていない」と
+ * 書いていたが、その振れの主因はマシンの負荷ではなくこれだった。
+ *
+ * `tools/perf.mjs` は元から `--disable-gpu-vsync` を渡していたが、**ヒッチを測る側の
+ * このツールが渡していなかった**。
+ */
+const NOVSYNC = !!args.novsync;
 
 const browser = await chromium.launch({
   headless: true,
   // WebGPU を掴むには軽量な headless-shell ではなく full Chrome binary が要る。
   channel: CHROMIUM_CHANNEL,
-  args: WEBGPU_FLAGS,
+  args: NOVSYNC ? [...WEBGPU_FLAGS, '--disable-gpu-vsync'] : WEBGPU_FLAGS,
 });
 const page = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: DPR });
 const errs = [];
