@@ -1,9 +1,26 @@
 import { chromium } from 'playwright';
 import { WEBGPU_FLAGS, CHROMIUM_CHANNEL } from './chromium-flags.mjs';
+
+/**
+ * **`--port` はここで読むこと。以前はポート 5173 が埋め込まれていた。**
+ *
+ * 他のツール (capture / baseline / profile) はすべて `--port` を受けるので、
+ * このツールも受けているつもりで `--port=5190` のように呼んでいた。実際には無視され、
+ * **毎回 5173 の別サーバーを測っていた**。「変更前と変更後」を比べたつもりが、
+ * どちらも同じ第三のサーバーの数字だったことになる。
+ *
+ * ゲートが黙って別のものを測るのは、ゲートが無いより悪い。
+ */
+const args = Object.fromEntries(process.argv.slice(2).map((a)=>{
+  const m=a.match(/^--([^=]+)(?:=(.*))?$/); return m?[m[1],m[2]??true]:[a,true];
+}));
+const PORT = Number(args.port ?? 5173);
+const QUERY = typeof args.query === 'string' ? `&${args.query}` : '';
+
 const b = await chromium.launch({ headless: true, channel: CHROMIUM_CHANNEL, args: WEBGPU_FLAGS });
 const p = await b.newPage({ viewport:{width:1280,height:720} });
 const errs=[]; p.on('pageerror',e=>errs.push(e.message)); p.on('console',m=>m.type()==='error'&&errs.push(m.text()));
-await p.goto('http://127.0.0.1:5173/?backend=webgpu', {waitUntil:'domcontentloaded'});
+await p.goto(`http://127.0.0.1:${PORT}/?backend=webgpu${QUERY}`, {waitUntil:'domcontentloaded'});
 await p.waitForFunction('window.__READY__===true',null,{timeout:60000});
 const snap = () => p.evaluate(()=>{const e=window.__ENGINE__,c=e.camera.position;return{
   pos:[+c.x.toFixed(2),+c.y.toFixed(2),+c.z.toFixed(2)],
