@@ -949,6 +949,7 @@ export class SoldierMaterials {
     // 法線は bake() が OpenGL 規約 (+Y 上) で書いている。materials/index.js と同じく反転しない。
     m.invertNormalMapX = false;
     m.invertNormalMapY = false;
+    this._setNormalScale(set.normal, setName, opts.normalScale ?? 1);
     /**
      * **WebGPU の inter-stage 変数上限 (16) 対策。消すと画面全体が黒くなる。**
      *
@@ -967,6 +968,44 @@ export class SoldierMaterials {
     this._attachPlugin(m, d, opts.rim);
     this.materials.set(key, m);
     return m;
+  }
+
+  /**
+   * ベース法線マップの強さ (Three の `material.normalScale` 相当) を設定する。
+   *
+   * ## 移植で落ちていた値
+   *
+   * `resolveMaterials` は昔から部位ごとに normalScale を渡していた
+   * (布 1.15 / 装備 1.1 / 肌 0.8 / ゴム 1.2 …)。Three では
+   * `m.normalScale.set(s, s)` がマテリアル単位のパラメータだったが、Babylon の
+   * PBR では **テクスチャ単位** (`bumpTexture.level` -> `vBumpInfos.y`) なので
+   * 素直な移し替え先が無く、移植時に **黙って捨てられていた**。結果、全部位が
+   * 1.0 で焼かれ、布の 1〜2 cm の折り目は 13 % 浅く、ゴムのラグは 17 % 浅かった。
+   * 2 スケール系にとってこれは致命的で、ベースとディテールの傾きの比 —
+   * 「どちらの周波数が主役か」を決める唯一の数字 — がずれる。
+   *
+   * ## テクスチャ単位であることの罠
+   *
+   * 法線マップは set 単位で共有されている。今は set と normalScale が 1:1 に
+   * 対応している (nylon を使う gear と boot はどちらも 1.1) ので `level` に
+   * 入れて問題ないが、**将来 1 つの set に別々の normalScale を要求する
+   * マテリアルが増えると、後勝ちで静かに壊れる**。絵にしか出ず、しかも
+   * 「なぜか装備だけ法線が弱い」という形でしか現れない。
+   * だからここで衝突を検出して即座に投げる。踏んだら
+   * 「その set の法線テクスチャを normalScale ごとに複製する」か
+   * 「plugin の uniform に移す」かの二択になる。
+   */
+  _setNormalScale(normalTex, setName, scale) {
+    const prev = normalTex.metadata?.owNormalScale;
+    if (prev !== undefined && prev !== scale) {
+      throw new Error(
+        `[ai] material set "${setName}" の法線マップに異なる normalScale が要求された ` +
+          `(${prev} と ${scale})。bumpTexture.level はテクスチャ単位なので共有できない — ` +
+          `textures.js の _setNormalScale のコメントを読むこと。`
+      );
+    }
+    normalTex.level = scale;
+    normalTex.metadata = { ...(normalTex.metadata ?? {}), owNormalScale: scale };
   }
 
   /**
