@@ -225,8 +225,42 @@ WebGPU のバインドグループが食い違い、**両方を有効にした�
 現在は大気モデルを CPU 側で 64 方向サンプリングして SH を直接構築している
 (`src/sky/index.js` の `_bakeEnv` / `_skyColorFor`)。読み戻しも非同期待ちも不要で確実。
 
-**限界**: これは GGX 事前フィルタではない。README の「Indirect light — an
-approximation, not real GI」という自己評価はこの構成でも引き続き当てはまる。
+**SH は `scene.environmentTexture` になっているその テクスチャに載せること。**
+鏡面側を事前フィルタ済みキューブに差し替えた際、SH をプローブのキューブにだけ
+載せていると PBR は差し替え後のテクスチャから SH を読もうとして拡散が死ぬ
+(エラーは出ない)。
+
+## IBL の鏡面は GGX 事前フィルタ済み — HDRFiltering を直接使わないこと
+
+鏡面 IBL は `src/sky/prefilter.js` がプローブのキューブを GGX importance sampling
+で mip ごとにフィルタし、その出力を `scene.environmentTexture` にしている。
+検証: roughness 0.25 の金属球に映る地平線のエッジ勾配 78.0 → 10.4、0.75 で
+15.7 → 0.9 (`sky.debugIblLadder()` で再現可能)。コスト実測: boot +150〜300ms
+(シェーダコンパイル込み)、時刻変更時の再フィルタ発行 ~1ms。
+
+踏んだ/回避した罠:
+
+1. **Babylon 標準の `HDRFiltering.prefilter()` は破壊的**。フィルタ後に
+   `_releaseTexture` + `_swapAndDie` で入力の内部テクスチャを破棄して差し替える。
+   入力が ReflectionProbe の RTT だとプローブの描画先が死に、**2 回目以降の
+   焼き直しができなくなる**。時刻変化のたびに再フィルタするこのゲームでは使えない。
+   シェーダと lod→alphaG の数式だけを借用し、ループは prefilter.js が持つ。
+2. **入力プローブは mip 付きで作ること** (`new ReflectionProbe(.., true, true, true)`)。
+   フィルタシェーダの `radiance()` はサンプルの solid angle に応じて**入力の mip を
+   選んで読む**。mip 無しだと高 roughness 側がノイズだらけになる。
+3. **`linearSpace=true` で焼く**。空シェーダの出力は線形放射輝度なのに、既定の
+   `gammaSpace=true` のままだと PBR が sRGB→linear を重ね掛けして反射だけ暗くなる
+   (旧構成はこの誤りを抱えていた。修正で sunset の日向壁 66/53/42 → 84/69/53)。
+4. `lodGenerationScale/Offset` は**フィルタ時と描画時で同じ値にすること**
+   (HDRFiltering の既定 0.8/0)。PBR は `vReflectionMicrosurfaceInfos.yz` で
+   mip を逆引きするので、食い違うと roughness に対する系統誤差になる。
+
+半球光 (`skyAmbient`) の位置づけも更新した: 日中の寄与は全量でも日陰 +2 /
+路面 +4 (8bit) しかない。事前フィルタ導入で鏡面が +1〜2 明るくなったぶん
+0.35 → 0.25 に下げて旧基準に露出を揃えた。完全撤去は日陰が僅かに沈むので残す。
+
+なお README の「Indirect light — an approximation, not real GI」という自己評価は、
+鏡面が正しくなった今も **GI の意味では**当てはまる (遮蔽もローカルバウンスも無い)。
 
 ## clustered lighting — 旧契約の警告は「もう該当しない」
 
