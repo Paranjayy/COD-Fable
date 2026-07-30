@@ -1,5 +1,6 @@
 import { ShaderMaterial } from '@babylonjs/core/Materials/shaderMaterial.js';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js';
+import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 import { ShaderStore } from '@babylonjs/core/Engines/shaderStore.js';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage.js';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
@@ -28,6 +29,7 @@ import '@babylonjs/core/Materials/Textures/baseTexture.polynomial.js';
 
 import { WGSL_ATMOSPHERE } from './wgsl/atmosphere.js';
 import { Celestial } from './celestial.js';
+import { SkyGgxPrefilter } from './prefilter.js';
 
 /**
  * SKY — 物理ベースの大気、太陽/月、時刻、IBL、フォグ。
@@ -41,15 +43,16 @@ import { Celestial } from './celestial.js';
  *
  * ## IBL の作り方と、その限界
  *
- * 空ドームを ReflectionProbe (キューブ RTT) に焼き、それを
- * `scene.environmentTexture` にする。さらに球面調和 (SH) を計算して拡散環境光に
- * 使う。**時刻が変わったときだけ**焼き直す — 毎フレーム焼くと 6 面ぶんの描画が
- * 乗るうえ、TAA の収束を壊す。
+ * 空ドームを ReflectionProbe (キューブ RTT) に焼き、それを GGX 事前フィルタ
+ * (prefilter.js) して `scene.environmentTexture` にする。鏡面反射は roughness に
+ * 対応した mip を正しく引く。拡散環境光の球面調和 (SH) は空モデルから解析的に
+ * 構築する (_bakeEnv)。**時刻が変わったときだけ**焼き直す — 毎フレーム焼くと
+ * 6 面 + 事前フィルタの描画が乗るうえ、TAA の収束を壊す。
  *
- * **限界**: これは GGX 事前フィルタではない。粗いマテリアルの反射はキューブの
- * ミップで近似しているだけで、正しい重要度サンプリングをしていない。README の
- * 「Indirect light — An approximation, not real GI」という自己評価はこの構成でも
- * 引き続き当てはまる。改善するなら render 側に IblShadowsRenderPipeline を足す。
+ * **残る限界**: これは静的な空の IBL であり、遮蔽もローカルバウンスも持たない
+ * (建物の中でも空がそのまま映る)。README の「Indirect light — An approximation,
+ * not real GI」という自己評価は、鏡面が正しくなった今も GI の意味では当てはまる。
+ * 改善するなら render 側に IblShadowsRenderPipeline を足す。
  */
 
 /** 気象の既定値。setWeather で上書きできる。 */
@@ -144,12 +147,17 @@ export class SkySystem {
     /**
      * 空からの半球光。
      *
-     * IBL があるのになぜ半球光も要るのか: ReflectionProbe 由来の環境マップは GGX
-     * 事前フィルタではないため拡散成分が実際より暗く出る。空色/地面色を持つ弱い
+     * IBL があるのになぜ半球光も要るのか: 拡散環境光の SH は 64 方向サンプルの
+     * 2 次近似 (_bakeEnv) なので、地面バウンスの成分が粗い。空色/地面色を持つ弱い
      * HemisphericLight で底上げする。**強くしすぎると影が浮く**ので、あくまで補助。
+     *
+     * 実測 (hero, 16:30): 日中の寄与は全量でも日陰の壁 +2、路面 +4 (8bit)。
+     * GGX 事前フィルタ導入時に gammaSpace の二重変換が直って鏡面がわずかに
+     * 明るくなったぶん (+1〜2)、0.35 → 0.25 に下げて全体の露出を旧基準に揃えた。
+     * 完全撤去 (0.0) は日陰 -2 / 路面 -4 の暗化になるので残している。
      */
     this.ambient = new HemisphericLight('skyAmbient', new Vector3(0, 1, 0), this.scene);
-    this.ambient.intensity = 0.35;
+    this.ambient.intensity = 0.25;
     this.ambient.diffuse = new Color3(0.55, 0.68, 0.9);
     this.ambient.groundColor = new Color3(0.28, 0.24, 0.19);
 
@@ -158,13 +166,48 @@ export class SkySystem {
      *
      * 解像度 128 は「拡散 IBL と粗い反射には十分、焼き直しが速い」の折衷。
      * 上げても鏡面の解像感は SSR 側の問題なのでここでは効かない。
+     *
+     * 引数 (順に generateMipMaps / useFloat / linearSpace) は GGX 事前フィルタの
+     * 入力要件で、**3 つとも変えると絵が壊れる**:
+     *
+     * - `generateMipMaps=true`: フィルタシェーダ (hdrFilteringFunctions の
+     *   `radiance()`) はサンプルの solid angle に応じて **入力の mip を選んで読む**。
+     *   mip 無しだと高 roughness 側がノイズだらけになる。
+     * - `useFloat=true`: half float で焼く。byte だと空の放射輝度 (太陽近傍で 1 を
+     *   大きく超える) がクランプされ、金属に映る空が濁る。
+     * - `linearSpace=true`: `cubeTexture.gammaSpace` が false になる。空シェーダの
+     *   出力は線形放射輝度なので、これが無いと PBR とフィルタが sRGB→linear 変換を
+     *   **重ね掛け**して反射だけ暗くなる (旧構成はこの誤りを抱えていた)。
      */
-    this.probe = new ReflectionProbe('skyProbe', 128, this.scene, false);
+    this.probe = new ReflectionProbe('skyProbe', 128, this.scene, true, true, true);
     this.probe.renderList.push(dome);
     // 手動で焼く。自動更新すると毎フレーム 6 面ぶんの描画が乗る。
     this.probe.cubeTexture.refreshRate = 0;
-    this.scene.environmentTexture = this.probe.cubeTexture;
     this.scene.environmentIntensity = 1.0;
+
+    /**
+     * 空キューブの GGX 事前フィルタ (prefilter.js)。
+     *
+     * プローブの生キューブではなく、roughness ごとに mip を焼いたキューブを
+     * `scene.environmentTexture` にする。これで PBR の
+     * `getLodFromAlphaG` による mip 選択が実際のボケ量と一致する。
+     *
+     * `?ibl=raw` はフィルタを外してプローブを直接 env にするデバッグ用の
+     * 逃がし弁 — 事前フィルタ有無の A/B 比較キャプチャに使う。
+     */
+    this._iblRaw = new URLSearchParams(location.search).get('ibl') === 'raw';
+    if (this._iblRaw || !this.webgpu) {
+      // WebGL2 フォールバックでも raw を使う (空が単色なのでフィルタの意味が薄く、
+      // GLSL 経路の検証コストに見合わない)。
+      this.scene.environmentTexture = this.probe.cubeTexture;
+    } else {
+      this._ggx = new SkyGgxPrefilter(this.scene.getEngine(), this.scene, 128);
+      this.scene.environmentTexture = this._ggx.texture;
+      // effect のコンパイルを 1 度だけ待つ。以後 run() は同期で走る。
+      await this._ggx.whenReady();
+    }
+    /** 直近の事前フィルタ所要時間 (ms)。計測用 — 絵にも決定性にも影響しない。 */
+    this.prefilterMs = 0;
 
     this.scene.fogMode = Constants.FOGMODE_EXP2;
     this.scene.fogDensity = this.weather.fogDensity;
@@ -315,7 +358,7 @@ export class SkySystem {
     this.moon.diffuse = new Color3(0.55, 0.62, 0.85);
 
     // 半球光も昼夜で振る。夜に昼の空色が残ると「暗いのに青い」不自然さが出る。
-    this.ambient.intensity = 0.35 * day + 0.06 * night;
+    this.ambient.intensity = 0.25 * day + 0.06 * night;
     this.ambient.diffuse = new Color3(
       0.55 * day + 0.1 * night,
       0.68 * day + 0.13 * night,
@@ -348,9 +391,10 @@ export class SkySystem {
   /* ================================================================== */
 
   /**
-   * 空をキューブに焼いて IBL にする。
+   * 空をキューブに焼き、GGX 事前フィルタと SH 構築まで行って IBL にする。
    *
-   * SH の計算はキューブを CPU に読み戻すため **重い**。時刻が変わったときだけ呼ぶ。
+   * 6 面の描画 + 事前フィルタ (6 面 × 8 mip) が乗るので、時刻が変わったときだけ
+   * 呼ぶ (実測: フィルタの発行は 1ms 未満だがプローブ 6 面の再描画が主コスト)。
    */
   _bakeEnv() {
     if (!this.probe) return;
@@ -395,7 +439,23 @@ export class SkySystem {
     }
     // レンダリング用のスケーリング (Babylon の規約に合わせる)。
     sh.preScaleForRendering();
-    cube.sphericalPolynomial = SphericalPolynomial.FromHarmonics(sh);
+    /**
+     * SH は **`scene.environmentTexture` になっているテクスチャ**に載せること。
+     * PBR は「反射テクスチャがキューブなら SH を使う」と決め打ち、その SH を
+     * 反射テクスチャ自身から読む。事前フィルタ有効時の env は `_ggx.texture`
+     * なので、プローブのキューブにだけ載せても拡散環境光は真っ黒になる。
+     * 両方に載せておく (raw モードとの切り替えを安全にするため)。
+     */
+    const poly = SphericalPolynomial.FromHarmonics(sh);
+    cube.sphericalPolynomial = poly;
+
+    if (this._ggx) {
+      this._ggx.texture.sphericalPolynomial = poly;
+      const t0 = performance.now();
+      // effect 未コンパイルなら false — dirty を維持して次フレームに再試行する。
+      if (!this._ggx.run(cube)) return;
+      this.prefilterMs = performance.now() - t0;
+    }
 
     this._envDirty = false;
   }
@@ -499,7 +559,46 @@ export class SkySystem {
     return this.sunDir;
   }
 
+  /**
+   * デバッグ専用: roughness 0 → 1 の金属球を 5 個、hero ショットの視界に並べる。
+   *
+   * GGX 事前フィルタの検証装置。事前フィルタが効いていれば roughness に応じて
+   * 反射のボケ量が段階的に変わる。効いていなければ (mip が焼かれていなければ)
+   * 全球が同じシャープさで空を映す。キャプチャハーネスが
+   * `__ENGINE__.ctx.get('sky').debugIblLadder()` で呼ぶ。ゲームプレイからは
+   * 呼ばれないので、マテリアルはここで作り捨ててよい (dispose で回収する)。
+   */
+  debugIblLadder(enabled = true) {
+    if (!enabled) {
+      for (const m of this._ladder ?? []) {
+        m.material?.dispose();
+        m.dispose();
+      }
+      this._ladder = null;
+      return;
+    }
+    if (this._ladder) return;
+    this._ladder = [];
+    // hero カメラ (12,1.75,18 → -4,2.2,-6) の 5m 先、視線と直交に 0.5m 間隔。
+    const centre = new Vector3(9.2, 1.8, 13.8);
+    const right = new Vector3(0.833, 0, -0.555);
+    for (let i = 0; i < 5; i++) {
+      const s = MeshBuilder.CreateSphere(`iblLadder${i}`, { diameter: 0.44, segments: 24 }, this.scene);
+      s.position.copyFrom(centre).addInPlace(right.scale((i - 2) * 0.5));
+      const mat = new PBRMaterial(`iblLadderMat${i}`, this.scene);
+      mat.metallic = 1;
+      mat.roughness = i / 4;
+      mat.albedoColor = new Color3(0.95, 0.95, 0.95);
+      s.material = mat;
+      s.isPickable = false;
+      s.metadata = { owNoCollision: true, owNoShadow: true };
+      this._ladder.push(s);
+    }
+  }
+
   dispose() {
+    this.debugIblLadder(false);
+    this._ggx?.dispose();
     this.probe?.dispose();
     this.dome?.dispose();
     this.sun?.dispose();
