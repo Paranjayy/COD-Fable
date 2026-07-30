@@ -447,10 +447,43 @@ export class FxSystem {
   /* イベントハンドラ                                                    */
   /* ================================================================== */
 
+  /**
+   * 着弾 FX。
+   *
+   * **自分が撃たれたときは血しぶきを出さない。** 一人称視点では自分の身体は
+   * カメラの 0.3〜0.65 m 手前にあるので、そこに血の粒子を撒くと **画面全体が赤い
+   * 半透明の膜で覆われる**。実機の FPS が自分の被弾を画面周縁の被弾方向
+   * インジケータ (ui の damage arcs) で表現し、血しぶきを出さないのはこのため。
+   *
+   * ## これは実際に踏んだ事故
+   *
+   * 物理の 0-dt バグ (`HavokPlugin` が world step を進めていなかった) を直した
+   * 途端、`combat` ショットが真っ赤になった。原因は「CC の内部 body が初めて実位置に
+   * 追従するようになり、敵の弾がカメラ至近のプレイヤーカプセルに `surface:'flesh'`
+   * で当たるようになった」こと。キャプチャ側は staged 射撃を `noDamage` で黙らせて
+   * 対処したが、**実プレイでは同じことが起きる** (0-dt 時代は当たり判定がゴースト
+   * 位置にあったので偶然起きていなかっただけ)。
+   *
+   * 実測: 空の領域の平均 RGB が 146/158/164 → 202/83/70。
+   *
+   * 判定は ARCHITECTURE.md の `damage:dealt` の項と同じ語彙を使う
+   * (`'player'` / player システム自身 / `isPlayer === true`)。**ここを変えるときは
+   * あちらも見ること** — 片方だけ直すと「ヒットマーカーは出ないのに血は出る」の
+   * ような半端な状態になる。
+   */
   onImpact(e) {
     if (this.disabled) return;
+    if (this._isLocalPlayer(e.actor)) return;
     const inc = e.incident ?? this._defaultIncident(e);
     spawnImpact(this, e.point, e.normal, inc, e.surface, e.damage / 30);
+  }
+
+  /** 対象がローカルプレイヤーか。語彙は ARCHITECTURE.md の damage:dealt に揃える。 */
+  _isLocalPlayer(actor) {
+    if (!actor) return false;
+    if (actor === 'player') return true;
+    if (actor.isPlayer === true) return true;
+    return actor === this.ctx?.peek?.('player');
   }
 
   _defaultIncident(e) {
