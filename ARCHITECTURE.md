@@ -521,6 +521,91 @@ combat ショットが HP 0 の赤ビネット越しに撮れていた。`fireBu
    焼き上がりの分散・平均・法線の向きまで見て合否を出す。この統計ゲートが無ければ
    予約語の事故はゲーム起動後まで発見できなかった。
 
+## MaterialPluginBase で WGSL を注入する (ai の 2 スケール布 / RIM で踏んだもの)
+
+Three 版の `onBeforeCompile` に相当するのが `MaterialPluginBase`。
+`src/ai/shaderplugin.js` + `src/ai/wgsl/soldier.js` が唯一の実例。
+
+### 1. `isCompatible()` を上書きしないと WebGPU で丸ごと無効になる
+
+既定の実装は **GLSL のときだけ true** を返す。上書きを忘れると plugin は
+`_activePlugins` に入らず、**例外も警告も出ないまま何も起きない**。
+
+### 2. 注入は「include 展開後・`#ifdef` 評価前・WGSL プロセッサ前」に走る
+
+plugin のコードは `processCodeAfterIncludes` として渡る。この順序から:
+
+- 注入コードに **`#ifdef` を書いてよい** (むしろ書かないと分岐できない)
+- **テクスチャ宣言を注入してよい** (`var owDetailSampler: texture_2d<f32>;`)。
+  あとから WGSL プロセッサが `@group/@binding` を付ける。もしこれが
+  `processFinalCode` だったら binding が付かずコンパイルエラーになっていた
+- 正規表現の注入点 (`!` 始まり) がマッチする対象は **Babylon 純正ソースそのもの**。
+  Babylon を上げて 1 文字変われば **静かにマッチしなくなる**
+
+### 3. 分岐は必ず define で表す — さもないと別マテリアルに混線する
+
+effect のキャッシュキーは defines 文字列。「detail 有り」と「detail 無し」が同じ
+defines なら **同じプログラムを共有する**。`getCustomCode()` の中を JS の if で
+分岐させると、先にコンパイルされた方がもう一方にも配られる。エラーは出ず、
+**肌に布の織り目が乗る / 布から織り目が消える**という形でしか現れない。
+Three 版の `customProgramCacheKey` はこれを防ぐためにあった。
+
+### 4. 純正の `DetailMapConfiguration` は使えない — varying が 1 本増える
+
+Babylon 標準の DETAIL は `vDetailUV` という varying を足す。ai のマテリアルは
+`forceIrradianceInFragment` で **ちょうど 16 本**に収めてあるので、これを使うと
+17 本になり「WebGPU の fragment 入力は 16 変数まで」に当たって画面が黒くなる。
+自前 plugin にして `vBumpUV`(= `vMainUV1`) にスケールを掛けて使い回している。
+
+### 5. `onEffectCreatedObservable` の時点では `fragmentSourceCode` が空
+
+Effect オブジェクトが作られた瞬間に発火するが、シェーダの処理は非同期。
+そのまま読むと **全マテリアルが「注入失敗」に見える**。実際には全部入っていた。
+`effect.executeWhenCompiled()` を挟むこと。
+
+### 6. 注入されたかは機械的に確かめる
+
+上のどれが外れても **例外も警告も出ず、絵は「それらしく」出る**。
+`src/ai/wgsl/soldier.js` の各断片は `OW_MARK_*` というマーカーコメントを含み、
+`verifyInjection()` がコンパイル済み本文を grep して失敗を console.error で
+名指しする。結果は `ai.materials.injection` から読める。**これを消さないこと。**
+
+### 7. `bumpTexture.level` は **テクスチャ単位**
+
+Three の `material.normalScale` はマテリアル単位だった。Babylon PBR では
+`bumpTexture.level` → `vBumpInfos.y` なので、法線マップを共有する複数マテリアルは
+同じ値しか持てない。移植時にこれが原因で `normalScale` が **黙って捨てられて
+いた** (全部位 1.0 で焼かれていた)。`SoldierMaterials._setNormalScale()` が
+衝突したら投げる。
+
+**未整備**: `tools/wgsl-lint.mjs` の走査対象は
+`src/materials/wgsl` / `src/sky/wgsl` / `src/fx/wgsl` の 3 つで、
+**`src/ai/wgsl` が入っていない**。リード所有ファイルなので追加していない。
+
+## 絵の変化を「実測」するときのハーネスの罠
+
+ai の 2 スケール布を検証したときに踏んだもの。ショットを自作する人は全部踏む。
+
+1. **`?capture=1` だけでは足りない。`lockstep=1` が要る。** 自走モードだと撮影
+   フレーム番号が run ごとに 10〜20 ぶれ、TAA のジッタ位相が変わって **画面の
+   7 割の画素が変わる**。before/after の差分が測定不能になる。lockstep なら
+   run 間で bit-identical (実測: 全ショット changedPct 0.00)。
+2. **`camera.fov` に直接書いても効かない。** `src/player/camera.js` が毎フレーム
+   `config.fov * fovScale * adsFov` で上書きする。元栓は `config.fov`。
+3. **`camera.position` に直接書いても効かない。** player がカプセルからカメラを
+   駆動する。`player.teleport(pos, rot)` を併用するか player の update を止める。
+4. **`node.getAbsolutePosition()` はワールド行列が未計算だと古い値を返す。**
+   「存在しない場所」を指すので、寄ったつもりで壁を撮ることになる。
+   `getHierarchyBoundingVectors(true)` は行列を強制計算するので安全。
+5. **カメラを被写体に寄せない。望遠にする。** `debugStage('firefight')` の配置は
+   全員が遮蔽物の陰にいるため、寄せたカメラはほぼ必ず壁の内側に入る。ミップ選択は
+   画面空間の UV 微分で決まるので、9 m を fov 4deg で見た絵は 0.9 m まで寄った絵と
+   **同じミップ**を引く。壁に埋まる危険なしに同じ結論が出る。
+6. **staged の敵は `noDamage` 指定でもプレイヤーを殺す。** 死亡時の減光と被弾
+   ビネットで画面が真っ赤・真っ暗になる。撮る前に `staged.fire = false` にする。
+7. `scene.pick` はこのシーンでは常に null を返す (兵士のメッシュは pickable でなく、
+   述語を渡しても拾えない)。可視判定には使えない。
+
 ## Vite の設定
 
 Babylon はシェーダのチャンクを **動的 import** で遅延ロードする。esbuild の
