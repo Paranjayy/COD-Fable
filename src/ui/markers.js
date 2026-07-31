@@ -1,46 +1,21 @@
-import * as THREE from 'three';
-import { el, svg, setText, setStyle, setClass, Pool, ease, clamp, clamp01, metres } from './util.js';
-
-const _v = new THREE.Vector3();
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { el, svg, setText, setStyle, setClass, Pool, ease, clamp01, metres } from './util.js';
 
 /**
- * Projects a world point into HUD pixels.
- * Returns the shared scratch object — never held past the call site.
+ * ワールド座標に紐づく HUD 要素: 距離付きオブジェクティブマーカー、手榴弾の危険
+ * 表示、飛び上がるダメージ数値。
+ *
+ * 画面外のターゲットは安全域の内側の矩形リングにクランプされ、グリフがそちらを
+ * 指すシェブロンに差し替わる — 背を向けた CoD のオブジェクティブと同じ挙動。
+ *
+ * ---------------------------------------------------------------------------
+ * Babylon 移植メモ
+ * ---------------------------------------------------------------------------
+ * 射影は自前で持たず `CameraView` (src/ui/camera-view.js) に委譲する。理由は
+ * そちらのコメント参照 (要点: lateUpdate では scene.getTransformMatrix() が
+ * 1 フレーム古い / NDC z の範囲が backend 依存)。このモジュールが受け取る `view`
+ * は毎フレーム index.js が更新済みのものなので、ここでは読むだけでよい。
  */
-const _proj = { x: 0, y: 0, dist: 0, behind: false, offscreen: false, angle: 0 };
-function project(pos, camera, w, h, margin) {
-  _v.copy(pos);
-  const dist = _v.distanceTo(camera.position);
-  _v.project(camera);
-  const behind = _v.z > 1;
-  let x = (_v.x * 0.5 + 0.5) * w;
-  let y = (-_v.y * 0.5 + 0.5) * h;
-  if (behind) {
-    // mirror through the centre so the edge arrow points the correct way
-    x = w - x;
-    y = h - y;
-  }
-  const cx = w * 0.5;
-  const cy = h * 0.5;
-  let dx = x - cx;
-  let dy = y - cy;
-  const mx = w * 0.5 - margin;
-  const my = h * 0.5 - margin;
-  let off = behind;
-  if (Math.abs(dx) > mx || Math.abs(dy) > my) {
-    off = true;
-    const s = Math.min(mx / (Math.abs(dx) || 1e-4), my / (Math.abs(dy) || 1e-4));
-    dx *= s;
-    dy *= s;
-  }
-  _proj.x = cx + dx;
-  _proj.y = cy + dy;
-  _proj.dist = dist;
-  _proj.behind = behind;
-  _proj.offscreen = off;
-  _proj.angle = (Math.atan2(dy, dx) * 180) / Math.PI + 90;
-  return _proj;
-}
 
 function diamond(parent) {
   const s = svg('svg', { viewBox: '0 0 16 16' }, parent);
@@ -74,14 +49,6 @@ function nadeGlyph(parent) {
   return s;
 }
 
-/**
- * Everything anchored to a world position: objective markers with distance,
- * grenade danger indicators, and floating damage numbers.
- *
- * Off-screen targets are clamped to a rectangular ring inside the safe area and
- * their glyph swaps to a chevron pointing at the target — the same behaviour as
- * a CoD objective you have turned away from.
- */
 export class WorldMarkers {
   constructor(parent, rng) {
     this.rng = rng;
@@ -117,7 +84,7 @@ export class WorldMarkers {
         const label = el('div', 'ow-nade-label', node, 'GRENADE');
         node._ring = ring;
         node._label = label;
-        node._pos = new THREE.Vector3();
+        node._pos = new Vector3();
         return node;
       },
       this.objRoot
@@ -127,15 +94,19 @@ export class WorldMarkers {
       16,
       () => {
         const node = el('div', 'ow-dn');
-        node._pos = new THREE.Vector3();
+        node._pos = new Vector3();
         return node;
       },
       this.objRoot
     );
   }
 
-  /** @param {Array} list [{ position:Vector3, label:'A', name:'CAPTURE', color }] */
-  updateObjectives(list, camera, w, h, k) {
+  /**
+   * @param {Array} list [{ position:{x,y,z}, label:'A', name:'CAPTURE', color }]
+   * @param {import('./camera-view.js').CameraView} view
+   * @param {number} k HUD スケール
+   */
+  updateObjectives(list, view, k) {
     const items = this.objPool.items;
     let n = 0;
     const margin = 74 * k;
@@ -143,7 +114,7 @@ export class WorldMarkers {
       for (let i = 0; i < list.length && n < items.length; i++) {
         const o = list[i];
         if (!o?.position) continue;
-        const p = project(o.position, camera, w, h, margin);
+        const p = view.projectPoint(o.position, margin);
         const it = items[n++];
         if (!it.alive) {
           it.alive = true;
@@ -173,15 +144,20 @@ export class WorldMarkers {
     }
   }
 
-  /** @param {number} fuse seconds until detonation */
+  /**
+   * @param {{x:number,y:number,z:number}} position
+   * @param {number} fuse 起爆までの秒数
+   */
   spawnGrenade(position, fuse = 2.4) {
     const it = this.nadePool.acquire();
     it.life = fuse;
-    it.node._pos.copy(position);
+    // copy() ではなく copyFromFloats(): Babylon の Vector3.copyFrom は source._x を
+    // 読むため、イベント由来のプレーンな {x,y,z} を渡すと黙って NaN になる。
+    it.node._pos.copyFromFloats(position.x, position.y, position.z);
     return it;
   }
 
-  updateGrenades(dt, camera, w, h, k) {
+  updateGrenades(dt, view, k) {
     const items = this.nadePool.items;
     const margin = 56 * k;
     for (let i = 0; i < items.length; i++) {
@@ -193,7 +169,7 @@ export class WorldMarkers {
         continue;
       }
       const node = it.node;
-      const p = project(node._pos, camera, w, h, margin);
+      const p = view.projectPoint(node._pos, margin);
       setStyle(node, 'transform', `translate(${p.x.toFixed(1)}px,${p.y.toFixed(1)}px)`);
       const close = p.dist < 9;
       setText(node._label, close ? 'DANGER CLOSE' : 'GRENADE');
@@ -212,7 +188,8 @@ export class WorldMarkers {
   spawnDamage(position, amount, kind = 'hit') {
     const it = this.dnPool.acquire();
     it.life = kind === 'kill' ? 1.25 : 0.95;
-    it.node._pos.copy(position);
+    // spawnGrenade と同じ理由で copyFromFloats を使う。
+    it.node._pos.copyFromFloats(position.x, position.y, position.z);
     it.a = this.rng.signed() * 16; // lateral drift
     it.b = 0.9 + this.rng.float() * 0.25;
     setText(it.node, Math.round(amount));
@@ -222,7 +199,7 @@ export class WorldMarkers {
     return it;
   }
 
-  updateDamage(dt, camera, w, h, k) {
+  updateDamage(dt, view, k) {
     const items = this.dnPool.items;
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
@@ -234,7 +211,7 @@ export class WorldMarkers {
         continue;
       }
       const node = it.node;
-      const p = project(node._pos, camera, w, h, 0);
+      const p = view.projectPoint(node._pos, 0);
       if (p.behind) {
         setStyle(node, 'opacity', '0');
         continue;

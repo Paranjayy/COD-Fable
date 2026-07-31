@@ -1,4 +1,3 @@
-import * as THREE from 'three';
 import {
   box,
   blob,
@@ -14,6 +13,8 @@ import {
   picatinny,
   mlokSlot,
   mergeAll,
+  disk,
+  diskRing,
 } from './geometry.js';
 
 /**
@@ -1403,7 +1404,8 @@ export function buildOptic(asm, o) {
   // was 0.9-0.965 at intensity 0.55 and rendered as a 12 px blown-white band
   // right around the sight picture: a worse artefact than the one it replaced.
   {
-    const edge = new THREE.RingGeometry(lensR * 0.965, lensR * 0.99, SEG_IN, 1);
+    // Babylon 移植: THREE.RingGeometry → geometry.js の diskRing (同じ XY 平板)。
+    const edge = diskRing(lensR * 0.965, lensR * 0.99, SEG_IN);
     asm.add(edge, 'lens_ring', { y, z: z + zOc - 0.0066 });
     edge.dispose();
   }
@@ -1414,7 +1416,8 @@ export function buildOptic(asm, o) {
    * radial alpha ramp (see WeaponMaterials.lensVignette) sitting just inside the
    * ocular glass, so it darkens the sight picture and nothing else.
    */
-  const vig = new THREE.CircleGeometry(lensR * 0.995, SEG_IN);
+  // Babylon 移植: THREE.CircleGeometry → geometry.js の disk (同じ XY 平板)。
+  const vig = disk(lensR * 0.995, SEG_IN);
   asm.add(vig, 'lens_vig', { y, z: z + zOc - 0.0085 });
   vig.dispose();
 

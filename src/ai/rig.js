@@ -17,7 +17,8 @@
  * have to survive a 90 degree shoulder rotation.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: Three 互換の自前 math shim (経緯は math3.js 冒頭コメント参照)
+import * as THREE from './math3.js';
 
 const H = 1.8; // reference height the proportions are authored at (8 heads)
 
@@ -239,7 +240,14 @@ export class Rig {
     return Math.hypot(x - (a.x + dx * t), y - (a.y + dy * t), z - (a.z + dz * t));
   }
 
-  /** Fresh THREE.Bone hierarchy + Skeleton for one actor instance. */
+  /**
+   * このアクター 1 体ぶんの CPU 側ボーン階層 (math3.Bone) を作る。
+   *
+   * Babylon 移植後の役割分担: animator/IK はこの CPU 階層に対して姿勢を書き、
+   * agent.js が毎フレームこのローカル行列を Babylon の Skeleton へ写す。
+   * Three 版が返していた `skeleton` (THREE.Skeleton) は Babylon 側で作るため
+   * ここでは返さない。
+   */
   createSkeleton() {
     const bones = [];
     for (let i = 0; i < this.count; i++) {
@@ -247,7 +255,6 @@ export class Rig {
       b.name = this.names[i];
       b.position.copy(this.localPos[i]);
       b.quaternion.copy(this.localQuat[i]);
-      b.matrixAutoUpdate = false;
       b.updateMatrix();
       bones.push(b);
     }
@@ -255,9 +262,8 @@ export class Rig {
       const pi = this.parent[i];
       if (pi >= 0) bones[pi].add(bones[i]);
     }
-    bones[0].updateMatrixWorld(true);
-    const skeleton = new THREE.Skeleton(bones);
-    return { bones, skeleton, root: bones[0] };
+    bones[0].updateMatrixWorld();
+    return { bones, root: bones[0] };
   }
 }
 

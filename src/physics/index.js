@@ -1,388 +1,532 @@
 /**
- * PHYSICS — broadphase, raycasts, character collision, rigid bodies, ragdolls,
- * bullet penetration.
+ * PHYSICS — Havok (WASM) backed.
  *
- * No physics library: a binned-SAH BVH over the level's triangle soup, a swept
- * capsule character controller, an impulse rigid-body solver and a PBD ragdoll
- * solver, all stepped at 120 Hz from `fixedUpdate` and all deterministic off
- * `ctx.rng`.
+ * ────────────────────────────────────────────────────────────────────────────
+ * このファイルは Three.js 版の自前実装 (bvh.js / character.js / rigidbody.js /
+ * ragdoll.js / debug.js = 約 5.6k 行) を置き換えるものです。
+ *
+ * 置き換えの理由は「短く書けるから」ではなく、**自前実装が抱えていた問題が
+ * Havok では構造的に発生しないから**:
+ *
+ *   - binned-SAH BVH の再構築 (29k tris → 14k nodes / 22 ms) を自分で管理する
+ *     必要がなくなる。Havok は静的ボディの追加/削除を内部で増分処理する。
+ *   - swept-capsule の 5-plane crease stack を自分で解く必要がなくなる。
+ *     Babylon の PhysicsCharacterController が simplex solver + step-up sweep を
+ *     持っており、階段・傾斜・薄壁の扱いが実装済み。
+ *   - CCD、拘束ソルバが実績のある実装になる。
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * 決定性について — このリポジトリで最も重要な性質
+ * ────────────────────────────────────────────────────────────────────────────
+ * README にある通り、このプロジェクトの中核資産は「キャプチャが bit-identical
+ * であること」で、それにより imagediff.mjs が pixel gate として機能している。
+ * 物理が非決定的だとその土台が崩れるため、以下を守る:
+ *
+ *   1. **Havok の自動ステップを止める** (`setTimeStep(0)`)。Babylon は既定で
+ *      scene.render() の中で実フレーム時間を使って物理を進めてしまう。それでは
+ *      フレームレートが変われば結果が変わる。ここでは engine の fixedUpdate から
+ *      固定 1/120 s で明示的に `_step()` を呼ぶ。
+ *   2. **乱数は必ず ctx.rng 経由**。弾道の偏向やデブリの初速に Math.random() を
+ *      使うと ARCHITECTURE.md Hard rule 4 に違反し、キャプチャが揺れる。
+ *   3. **サブステップ数は engine 側で MAX_SUBSTEPS に制限済み**。積み残しは
+ *      捨てられるので、重いフレームがあっても物理が「まとめて進む」ことはない。
+ *
+ * 注意: Havok 自体はクロスプラットフォームでの bit-identical を保証しない
+ * (浮動小数の丸めが CPU 命令セットに依存しうる)。**同一マシン・同一ブラウザでの
+ * run-to-run 再現性**は上記で担保できるが、CI のマシンを変えたらベースラインは
+ * 撮り直しが必要。これは Three 版の自前実装でも同じだったが、あちらは全演算が
+ * JS だったぶん移植性は高かった — 移行による明確なトレードオフとして記録する。
  *
  * ────────────────────────────────────────────────────────────────────────────
  * PUBLIC API  —  const phys = ctx.get('physics')
  * ────────────────────────────────────────────────────────────────────────────
  * STATIC WORLD
- *   addStatic(mesh, surfaceType?, opts?)   -> handle   (world: call me!)
- *   addStaticGroup(object3D, surfaceType?) -> handle[]  traverses children
- *   removeStatic(handleOrMesh)
- *   rebuildStatic()                        force an immediate BVH rebuild
+ *   addStatic(mesh, surfaceType?, opts?)   -> handle
+ *   addStaticGroup(root, surfaceType?)     -> handle[]   子孫を走査
+ *   removeStatic(handle)
  *
- * QUERIES  (world space, metres; `dir` need not be normalised)
- *   raycast(origin, dir, maxDist, mask?)   -> Hit   (always an object; check .hit)
- *   raycastAny(origin, dir, maxDist, mask?)-> bool  cheap visibility test
+ * QUERIES  (world 空間, メートル。dir は正規化されていなくてよい)
+ *   raycast(origin, dir, maxDist, mask?)   -> Hit  (常にオブジェクト。.hit を見る)
+ *   raycastAny(origin, dir, maxDist, mask?)-> bool
  *   lineOfSight(from, to, mask?)           -> bool
  *   sphereCast(origin, dir, radius, maxDist, mask?)  -> Hit
  *   capsuleCast(p0, p1, radius, dir, maxDist, mask?) -> Hit
- *   overlapCapsule(p0, p1, radius, mask?)  -> contact count
- *   checkCapsule(p0, p1, radius, mask?)    -> bool, true when clear
- *   groundHeight(x, z, fromY?, mask?)      -> y of the floor, or -Infinity
+ *   overlapSphere(center, radius, mask?)   -> 接触数
+ *   checkCapsule(p0, p1, radius, mask?)    -> bool (true = 空いている)
+ *   groundHeight(x, z, fromY?, mask?)      -> 床の y、無ければ -Infinity
  *
- *   Hit = { hit, point:Vector3, normal:Vector3, distance, surface:string,
- *           surfaceIndex, object, collider, body, ragdoll, actor, part,
- *           triangle, frontFace, fraction }
- *   Records come from a 64-deep ring pool: read or copy now, never stash.
+ *   Hit = { hit, point, normal, distance, fraction, surface, surfaceIndex,
+ *           object, body, actor, part }
+ *   レコードは 64 深のリングプール。**今すぐ読むかコピーする**こと。溜め込まない。
  *
- * CHARACTER  (player / ai)
- *   createCharacter({radius, height, position, stepHeight, slopeLimit}) -> CharacterController
+ * CHARACTER
+ *   createCharacter({radius, height, position, stepHeight, slopeLimit}) -> Character
  *   removeCharacter(c)
- *   c.move(dx,dy,dz)  c.position  c.velocity  c.grounded  c.groundNormal
- *   c.groundSurfaceName  c.touchingCeiling  c.setHeight(h)  c.canFit(h)
- *   c.teleport(x,y,z)  c.landingSpeed  c.steppedUp  c.lastMoveBlocked
+ *   c.move(dx,dy,dz) / c.position / c.velocity / c.grounded / c.groundNormal
+ *   c.groundSurfaceName / c.touchingCeiling / c.setHeight(h) / c.canFit(h)
+ *   c.teleport(x,y,z) / c.landingSpeed / c.lastMoveBlocked
  *
- * BALLISTICS  (weapons)
+ * BALLISTICS
  *   fireBullet({origin, dir, damage, penetration, maxDist, mask, rng}) -> impacts[]
- *   emits `bullet:impact` on entry AND exit of every layer.
+ *   貫通した層の **入口と出口の両方** で `bullet:impact` を emit する。
  *   explode({position, radius, damage, impulse})
  *
- * DYNAMICS  (fx, weapons)
- *   addRigidBody({shape, halfExtents|radius, mass, position, velocity, ...}) -> RigidBody
- *   spawnDebris(position, velocity, {size, surface, lifetime, object3D})
- *   removeRigidBody(b)   b.applyImpulse(ix,iy,iz, px,py,pz)   b.sleeping
- *
- * RAGDOLLS  (ai)
- *   createRagdoll({bones?, transform, height, mass, velocity, impulse, point}) -> Ragdoll
- *   createRagdollFromSkeleton(skinnedMesh, {impulse, point, actor}) -> Ragdoll
- *   removeRagdoll(r)     set `physics.ignoreDeathEvents = true` to own this yourself
- *
- * HITBOXES / DYNAMIC COLLIDERS  (ai)
- *   addCollider({shape:'capsule'|'sphere'|'box', layer, surface, owner, part}) -> collider
- *   collider.setSegment(ax,ay,az,bx,by,bz)  collider.setSphere(x,y,z,r)
- *   collider.setFromObject(object3D, hx,hy,hz)   removeCollider(c)
- *
- * DEBUG
- *   setDebugDraw(bool, {triangles, nodes, rays, radius})   toggleDebugDraw()
- *   stats -> { triangles, nodes, buildMs, bodies, awake, ragdolls, ... }
+ * DYNAMICS
+ *   addRigidBody({shape, halfExtents|radius, mass, position, velocity, mesh}) -> RigidBody
+ *   spawnDebris(position, velocity, {size, surface, lifetime, mesh})
+ *   removeRigidBody(b) / b.applyImpulse(ix,iy,iz, px,py,pz)
+ *   registerBodyMeta(body, {surface, actor, part, layer, mesh})   自前 body を
+ *   unregisterBodyMeta(body)                                      Hit 語彙に載せる
  *
  * CONSTANTS
- *   phys.LAYER, phys.MASK, phys.SURFACE, phys.SURFACE_NAMES, phys.SURFACE_PROPS
+ *   phys.LAYER / phys.MASK / phys.SURFACE / phys.SURFACE_NAMES / phys.SURFACE_PROPS
  */
 
-import * as THREE from 'three';
-import { UNITS } from '../core/config.js';
-import { StaticWorld } from './bvh.js';
-import { CharacterController } from './character.js';
-import { RigidBody, RigidBodyWorld } from './rigidbody.js';
-import { Ragdoll, humanoidSpec, specFromSkeleton } from './ragdoll.js';
-import { Ballistics } from './penetration.js';
-import { PhysicsDebugView } from './debug.js';
+import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector.js';
+import { HavokPlugin } from '@babylonjs/core/Physics/v2/Plugins/havokPlugin.js';
+import { PhysicsBody } from '@babylonjs/core/Physics/v2/physicsBody.js';
 import {
-  LAYER, MASK, SURFACE, SURFACE_NAMES, SURFACE_PROPS,
-  surfaceIndex, surfaceName,
-} from './surfaces.js';
+  PhysicsShapeMesh,
+  PhysicsShapeBox,
+  PhysicsShapeSphere,
+  PhysicsShapeCapsule,
+} from '@babylonjs/core/Physics/v2/physicsShape.js';
+import { PhysicsMotionType } from '@babylonjs/core/Physics/v2/IPhysicsEnginePlugin.js';
+import { PhysicsRaycastResult } from '@babylonjs/core/Physics/physicsRaycastResult.js';
+import { ShapeCastResult } from '@babylonjs/core/Physics/shapeCastResult.js';
 import {
-  makeHitRecord, raySphere, rayCapsule, rayObb, closestPtSegSeg, makeClosest,
-} from './math.js';
+  PhysicsCharacterController,
+  CharacterSupportedState,
+} from '@babylonjs/core/Physics/v2/characterController.js';
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+/**
+ * **副作用 import。消さないこと。**
+ *
+ * Babylon はツリーシェイキング前提の構成で、`scene.enablePhysics()` /
+ * `scene.getPhysicsEngine()` は Scene のプロトタイプに **このモジュールが拡張として
+ * 生やす**。import しないと `enablePhysics` が存在せず、しかも
+ * 「Cannot read properties of undefined (reading 'setTimeStep')」のように
+ * 一段先で落ちるため原因が分かりにくい。
+ *
+ * 「使っていない import」に見えるので、lint やエディタの自動整理で消されやすい。
+ */
+import '@babylonjs/core/Physics/joinedPhysicsEngineComponent.js';
 
+import { UNITS } from '../core/config.js';
+import { loadHavok } from './havok.js';
+import {
+  LAYER,
+  MASK,
+  SURFACE,
+  SURFACE_NAMES,
+  SURFACE_PROPS,
+  surfaceIndex,
+  surfaceName,
+  guessSurface,
+} from './surfaces.js';
+
+/** Hit レコードのリングプール深さ。1 フレームで同時に生きうる Hit の上限。 */
 const HIT_POOL = 64;
+/** bullet:impact のペイロードプール。貫通は 1 発で最大 8 層 = 16 impact。 */
 const IMPACT_POOL = 48;
 
-function makePublicHit() {
+const _v0 = new Vector3();
+const _v1 = new Vector3();
+const _v2 = new Vector3();
+const _q0 = Quaternion.Identity();
+
+function makeHit() {
   return {
     hit: false,
-    point: new THREE.Vector3(),
-    normal: new THREE.Vector3(0, 1, 0),
+    point: new Vector3(),
+    normal: new Vector3(0, 1, 0),
     distance: Infinity,
     fraction: 1,
     surface: 'concrete',
-    surfaceIndex: 0,
-    object: null,
-    collider: null,
-    body: null,
-    ragdoll: null,
-    actor: null,
-    part: null,
-    triangle: -1,
-    frontFace: true,
+    surfaceIndex: SURFACE.concrete,
+    /** ヒットした Babylon のメッシュ (あれば)。 */ object: null,
+    /** ヒットした PhysicsBody。 */ body: null,
+    /** AI エージェント等の所有者 (あれば)。 */ actor: null,
+    /** 'head' | 'torso' | ... ヒットボックス部位 (あれば)。 */ part: null,
   };
 }
 
-let _colliderId = 1;
+function makeImpact() {
+  return {
+    point: new Vector3(),
+    normal: new Vector3(0, 1, 0),
+    incident: new Vector3(0, 0, -1),
+    surface: 'concrete',
+    surfaceIndex: SURFACE.concrete,
+    damage: 0,
+    /** true なら貫通後の「出口」。fx は出口で別の演出を出す。 */ exit: false,
+    object: null,
+    body: null,
+    actor: null,
+    part: null,
+  };
+}
 
-/** A moving convex proxy — AI hitboxes, doors, dropped weapons, elevators. */
-class Collider {
-  constructor(opts) {
-    this.id = _colliderId++;
-    this.shape = opts.shape ?? 'capsule';
-    this.ax = 0; this.ay = 0; this.az = 0;
-    this.bx = 0; this.by = 0; this.bz = 0;
-    this.radius = opts.radius ?? 0.2;
-    this.hx = opts.hx ?? 0.2; this.hy = opts.hy ?? 0.2; this.hz = opts.hz ?? 0.2;
-    this.matrix = new THREE.Matrix4();
-    this.inverse = new THREE.Matrix4();
-    this.layer = opts.layer ?? LAYER.ACTOR;
-    this.surfaceIndex = surfaceIndex(opts.surface ?? 'flesh');
-    this.owner = opts.owner ?? null;
-    this.part = opts.part ?? null;
-    this.damageScale = opts.damageScale ?? 1;
-    this.enabled = opts.enabled !== false;
-    this.onHit = opts.onHit ?? null;
-    this.userData = opts.userData ?? null;
-    if (opts.p0 && opts.p1) {
-      this.setSegment(opts.p0.x, opts.p0.y, opts.p0.z, opts.p1.x, opts.p1.y, opts.p1.z);
+/**
+ * キャラクタコントローラのラッパ。
+ *
+ * Babylon の PhysicsCharacterController をそのまま公開せず薄く包むのは、
+ * Three 版の `CharacterController` と **同じ公開 API** を保つため。player と ai は
+ * どちらもこの API に対して書かれており、ここを合わせておけば両サブシステムの
+ * 移植が実質「import の差し替え」で済む。
+ */
+class Character {
+  constructor(system, opts) {
+    this.system = system;
+    this.radius = opts.radius ?? UNITS.playerRadius;
+    this.height = opts.height ?? UNITS.playerHeight;
+    /** 登れる段差の上限。これを超える段差は壁として扱われる。 */
+    this.stepHeight = opts.stepHeight ?? 0.45;
+    /** 歩ける最大傾斜 (度)。 */
+    this.slopeLimit = opts.slopeLimit ?? 52;
+
+    const pos = opts.position
+      ? new Vector3(opts.position.x, opts.position.y, opts.position.z)
+      : new Vector3(0, 2, 0);
+
+    this.ctrl = new PhysicsCharacterController(
+      pos,
+      { capsuleHeight: this.height, capsuleRadius: this.radius },
+      system.scene
+    );
+    this.ctrl.maxSlopeCosine = Math.cos((Math.PI * this.slopeLimit) / 180);
+    this.ctrl.maxStepHeight = this.stepHeight;
+    /**
+     * **`acceleration` は 1 にすること。Babylon の既定 0.05 は罠。**
+     *
+     * `calculateMovement` は希望速度へ「`acceleration` の割合だけ」近づける補間係数を
+     * 持っており、既定は 0.05 = 1 ステップで 5% しか近づかない (Babylon 本体のコメントも
+     * "A value of 1 means reaching max velocity immediately" と書いている)。
+     *
+     * この係数は **呼び出し側が計算した速度を無条件に上書きする**。
+     * `player/movement.js` は `MOVE.groundAccel = 92 m/s^2` (50 ms で最高速。CoD の
+     * 「タイト」な操作感の正体) で希望速度を作っているのに、CC 側で二重に鈍らされて
+     * いた。加速カーブの所有者は 1 つでなければならず、それは movement.js 側。
+     *
+     * 実測 (W キー押しっぱなし、目標 4.57 m/s、既定値のとき):
+     *   57 フレーム (0.95 s) 経っても 2.51 m/s、45 フレームで 0.4 m しか進まない
+     *   速度の増分がフレームごとに 0.11 → 0.035 m/s と減っていく (指数漸近の形)
+     *
+     * 「動いてはいる」ので playtest は通ってしまい、移植中ずっと気付かなかった。
+     * `maxAcceleration` (既定 50 m/s^2) は安全弁として残す — groundAccel 92 は
+     * 1 ステップぶん (h=1/120) に直せば 0.77 m/s で、この上限には当たらない。
+     */
+    this.ctrl.acceleration = 1;
+
+    /** 読み取り専用として扱うこと。書き換えたい時は teleport() を使う。 */
+    this.position = pos.clone();
+    this.velocity = new Vector3();
+    this.grounded = false;
+    this.groundNormal = new Vector3(0, 1, 0);
+    this.groundSurfaceName = 'concrete';
+    this.touchingCeiling = false;
+    /** 接地した瞬間の落下速度 (m/s, 正値)。着地 FX / 落下ダメージ用。 */
+    this.landingSpeed = 0;
+    /** 直前の move() が壁で止められたか。 */
+    this.lastMoveBlocked = false;
+
+    this._wasGrounded = false;
+  }
+
+  /**
+   * 希望速度を与えて 1 物理ステップ進める。
+   *
+   * 引数は「速度」であって「変位」ではない (Three 版と同じ)。呼び出し側は
+   * fixedUpdate から毎ステップ呼ぶ。
+   */
+  move(dx, dy, dz) {
+    const dt = this.system.fixedDt;
+    const ctrl = this.ctrl;
+
+    // 接地判定は重力方向へのプローブ。checkSupport は step-up や傾斜スライドの
+    // 判定まで含めた状態を返す。
+    const info = ctrl.checkSupport(dt, this.system.gravityDir);
+
+    const supported = info.supportedState === CharacterSupportedState.SUPPORTED;
+    this.groundNormal.copyFrom(info.averageSurfaceNormal);
+
+    // 着地の瞬間だけ landingSpeed を立てる。player はこれを見て着地 FX と
+    // 落下ダメージを出す。次の move() で 0 に戻る (エッジ的な値)。
+    const vy = ctrl.getVelocity().y;
+    this.landingSpeed = !this._wasGrounded && supported ? Math.max(0, -vy) : 0;
+    this._wasGrounded = supported;
+    this.grounded = supported;
+
+    _v0.set(dx, dy, dz);
+    const bx = ctrl.getPosition().x;
+    const bz = ctrl.getPosition().z;
+
+    /**
+     * 速度の決め方 — **接地時と空中で経路を分ける**。
+     *
+     * `calculateMovement` は「動く床の速度・現在速度・希望速度」から適用速度を作り、
+     * 傾斜を滑り落ちる挙動まで含めてくれる。接地しているときはこれが正しい。
+     *
+     * だが **空中では使わない**。この関数は面の法線を前提にしており、支持面が無い
+     * ときに渡すと落下速度 (y) を潰してしまう。結果としてキャラクタが空中で
+     * 静止し、永久に接地しない。呼び出し側 (player/movement.js) が重力を積んで
+     * いるので、空中ではその速度をそのまま使うのが正しい。
+     */
+    if (supported) {
+      const desired = ctrl.calculateMovement(
+        dt,
+        this.system.forwardHint,
+        info.averageSurfaceNormal,
+        ctrl.getVelocity(),
+        info.averageSurfaceVelocity,
+        _v0,
+        this.system.upDir
+      );
+      ctrl.setVelocity(desired);
+    } else {
+      ctrl.setVelocity(_v0);
     }
-    if (opts.center) this.setSphere(opts.center.x, opts.center.y, opts.center.z, this.radius);
-  }
+    ctrl.integrate(dt, info, this.system.gravity);
 
-  setSegment(ax, ay, az, bx, by, bz, r) {
-    this.ax = ax; this.ay = ay; this.az = az;
-    this.bx = bx; this.by = by; this.bz = bz;
-    if (r !== undefined) this.radius = r;
+    const after = ctrl.getPosition();
+    this.position.copyFrom(after);
+    this.velocity.copyFrom(ctrl.getVelocity());
+
+    // 「押し込んだのにほとんど動いていない」= 壁で止められた。落下中は常に
+    // 動いているので、水平成分だけで判定する。
+    const wantHoriz = Math.hypot(dx, dz) * dt;
+    const gotHoriz = Math.hypot(after.x - bx, after.z - bz);
+    this.lastMoveBlocked = wantHoriz > 1e-4 && gotHoriz < wantHoriz * 0.35;
+
+    // 天井接触。しゃがみ解除の可否に使う。
+    this.touchingCeiling = !this.canFit(this.height);
+
+    // 立っている面の surface 名。足音・着地音・decal がこれを見る。
+    this.groundSurfaceName = supported ? this.system.surfaceUnder(after, this.radius) : 'concrete';
+
     return this;
   }
 
-  setSphere(x, y, z, r) {
-    this.ax = this.bx = x;
-    this.ay = this.by = y;
-    this.az = this.bz = z;
-    if (r !== undefined) this.radius = r;
-    this.shape = 'sphere';
+  /** カプセル高さを変える (しゃがみ/伏せ)。足位置を保つので沈み込まない。 */
+  setHeight(h) {
+    if (Math.abs(h - this.height) < 1e-4) return;
+    this.height = h;
+    this.ctrl.setShapeOptions({ capsuleHeight: h, capsuleRadius: this.radius }, true);
+  }
+
+  /** 高さ h のカプセルが今の位置に収まるか。しゃがみ解除の可否判定。 */
+  canFit(h) {
+    const headroom = h - this.height;
+    if (headroom <= 0) return true;
+    const p = this.ctrl.getPosition();
+    _v0.set(p.x, p.y, p.z);
+    _v1.set(0, 1, 0);
+    return !this.system.raycast(_v0, _v1, headroom + this.height * 0.5, MASK.CHARACTER).hit;
+  }
+
+  teleport(x, y, z) {
+    _v0.set(x, y, z);
+    this.ctrl.setPosition(_v0);
+    this.ctrl.setVelocity(Vector3.ZeroReadOnly);
+    this.position.copyFrom(_v0);
+    this.velocity.setAll(0);
+    this._wasGrounded = false;
     return this;
   }
 
-  /** Box proxy driven by an Object3D's world matrix. */
-  setFromObject(obj, hx, hy, hz) {
-    obj.updateWorldMatrix(true, false);
-    this.matrix.copy(obj.matrixWorld);
-    this.inverse.copy(this.matrix).invert();
-    if (hx !== undefined) { this.hx = hx; this.hy = hy; this.hz = hz; }
-    this.shape = 'box';
-    return this;
-  }
-
-  setMatrix(m) {
-    this.matrix.copy(m);
-    this.inverse.copy(m).invert();
-    return this;
+  dispose() {
+    this.ctrl.dispose();
   }
 }
 
-const _v = new THREE.Vector3();
-const _m4 = new THREE.Matrix4();
-const _m4i = new THREE.Matrix4();
-const _one = new THREE.Vector3(1, 1, 1);
+/** 剛体のラッパ。Three 版の RigidBody と同じ公開 API を保つ。 */
+class RigidBody {
+  constructor(system, body, node, opts) {
+    this.system = system;
+    this.body = body;
+    this.node = node;
+    this.surface = opts.surface ?? 'metal';
+    /** 秒。0 以下なら寿命なし。 */
+    this.lifetime = opts.lifetime ?? 0;
+    this.age = 0;
+  }
 
-const SKIP_NAME =
-  /(sky|skybox|light|helper|gizmo|particle|decal|tracer|muzzle|viewmodel|hud|billboard|sprite|volumetric|godray|impostor)/i;
+  get position() {
+    return this.node.position;
+  }
+
+  applyImpulse(ix, iy, iz, px, py, pz) {
+    _v0.set(ix, iy, iz);
+    _v1.set(px ?? this.node.position.x, py ?? this.node.position.y, pz ?? this.node.position.z);
+    this.body.applyImpulse(_v0, _v1);
+  }
+
+  get sleeping() {
+    // Havok はスリープ状態を直接公開しないので速度で近似する。デブリの更新を
+    // 省いてよいかの判定にしか使わないため、この精度で十分。
+    return this.body.getLinearVelocity().lengthSquared() < 1e-4;
+  }
+}
 
 export class PhysicsSystem {
   static id = 'physics';
   static deps = [];
 
   constructor() {
-    this.staticWorld = new StaticWorld();
-    this.bodies = new RigidBodyWorld(this.staticWorld, UNITS.gravity);
-    this.characters = [];
-    this.ragdolls = [];
-    this.colliders = [];
-    this.ballistics = new Ballistics(this);
-
+    /** 定数を公開 — 他サブシステムは phys.MASK などで参照する。 */
     this.LAYER = LAYER;
     this.MASK = MASK;
     this.SURFACE = SURFACE;
     this.SURFACE_NAMES = SURFACE_NAMES;
     this.SURFACE_PROPS = SURFACE_PROPS;
 
-    this.gravity = UNITS.gravity;
-    /** Set true by `ai` if it wants to own ragdoll creation itself. */
-    this.ignoreDeathEvents = false;
-    this.maxRagdolls = 8;
+    this.characters = [];
+    this.rigidBodies = [];
 
-    this._hitPool = [];
-    for (let i = 0; i < HIT_POOL; i++) this._hitPool.push(makePublicHit());
+    this._hitPool = Array.from({ length: HIT_POOL }, makeHit);
     this._hitCursor = 0;
-
-    this._impactPool = [];
-    for (let i = 0; i < IMPACT_POOL; i++) {
-      this._impactPool.push({
-        point: new THREE.Vector3(),
-        normal: new THREE.Vector3(),
-        incident: new THREE.Vector3(),
-        surface: 'concrete',
-        surfaceIndex: 0,
-        damage: 0,
-        exit: false,
-        object: null,
-        body: null,
-        actor: null,
-        part: null,
-      });
-    }
+    this._impactPool = Array.from({ length: IMPACT_POOL }, makeImpact);
     this._impactCursor = 0;
     this._impactResult = [];
 
-    this._raw = makeHitRecord();
-    this._raw2 = makeHitRecord();
-    this._cl = makeClosest();
-    this._explicitStatics = 0;
-    this._autoIds = [];
-    this._autoScanTimer = 0;
-    this._fallbackId = -1;
-    this._lastMeshCount = -1;
-    this._pendingDemo = false;
+    /** PhysicsBody -> { surface, surfaceIndex, layer, mesh, actor, part } */
+    this._meta = new Map();
 
-    this.debug = null;
-    this._loggedTris = -1;
-    this.stats = {
-      triangles: 0, nodes: 0, objects: 0, buildMs: 0,
-      bodies: 0, awake: 0, ragdolls: 0, characters: 0, colliders: 0,
-      raycasts: 0, stepMs: 0,
-    };
-    this._rayCount = 0;
+    this._ray = new PhysicsRaycastResult();
+    this._shapeStart = new ShapeCastResult();
+    this._shapeHit = new ShapeCastResult();
+    this._sphereCache = new Map();
+    this._capsuleCache = new Map();
+
+    this.upDir = new Vector3(0, 1, 0);
+    this.gravityDir = new Vector3(0, -1, 0);
+    /**
+     * calculateMovement に渡す「前方ヒント」。傾斜での速度合成にしか使われず、
+     * 実際の移動方向は desiredVelocity が決めるので固定値でよい。
+     */
+    this.forwardHint = new Vector3(0, 0, -1);
   }
 
   async init(ctx) {
     this.ctx = ctx;
+    this.scene = ctx.scene;
     this.rng = ctx.rng.fork();
-    this.ballistics.rng = this.rng;
-    this.debug = new PhysicsDebugView(ctx.scene);
+    this.fixedDt = ctx.time.fixed;
 
-    this._onExplosion = (e) => this.explode(e);
-    this._onDeath = (e) => this._handleDeath(e);
-    ctx.events.on('explosion', this._onExplosion);
-    ctx.events.on('actor:death', this._onDeath);
+    const havok = await loadHavok();
+    // useDeltaForWorldStep = false。実フレーム時間ではなく、こちらが渡す固定
+    // ステップで進めさせる。決定性の要。
+    this.plugin = new HavokPlugin(false, havok);
 
-    // The level may not exist yet — `world` builds during its own init and can
-    // stream more in later. We rescan until something shows up; any explicit
-    // addStatic() call takes over completely.
-    this._ensureStatics(true);
+    this.gravity = new Vector3(0, UNITS.gravity, 0);
+    ctx.scene.enablePhysics(this.gravity, this.plugin);
+    this.engine = ctx.scene.getPhysicsEngine();
 
-    // Dev escape hatch: ?physdebug=1 turns the collision wireframe on from the
-    // URL, and ?physdemo=1 also drops a ragdoll and some debris. Neither is
-    // reachable in normal play.
-    if (typeof location !== 'undefined') {
-      const q = new URLSearchParams(location.search);
-      if (q.get('physdebug') === '1') this.setDebugDraw(true, { triangles: true, radius: 30 });
-      if (q.get('physdemo') === '1') {
-        this._pendingDemo = true;
-        // Shots re-pose the camera after boot; respawn in front of the new view.
-        ctx.events.on('shot:applied', () => {
-          this.bodies.clear();
-          for (const rd of this.ragdolls) rd.dispose();
-          this.ragdolls.length = 0;
-          this._pendingDemo = true;
-        });
-      }
-    }
+    /**
+     * **自動ステップを止める。**
+     *
+     * Babylon は既定で scene.render() の中から実フレーム時間で物理を進める。
+     * それではフレームレートが変わるだけで結果が変わり、キャプチャの
+     * bit-identical が成立しない。0 を渡すと自動ステップが無効になるので、
+     * 以降は fixedUpdate から明示的に _step() を呼ぶ。
+     */
+    this.engine.setTimeStep(0);
+
+    ctx.events.on('explosion', (e) => this.explode(e));
   }
 
   /* ================================================================== */
-  /* Static world registration                                          */
+  /* Static world                                                       */
   /* ================================================================== */
 
   /**
-   * Register a mesh as static collision. `surfaceType` is one of the twelve
-   * names in ARCHITECTURE.md; omit it and we infer per material group, so a
-   * multi-material mesh gets per-triangle surfaces.
-   * opts: { mask, layer, userData }
+   * 静的なレベルジオメトリを登録する。world サブシステムが必ず呼ぶこと。
+   *
+   * `surfaceType` を省略するとメッシュ名から推測する (guessSurface)。推測に頼ると
+   * 「なぜか木の壁がコンクリート音になる」類の事故が起きるので、world 側は明示的に
+   * 渡すのが望ましい。
    */
   addStatic(mesh, surfaceType, opts = {}) {
-    if (!mesh) return -1;
-    if (this._autoIds.length || this._fallbackId >= 0) this._dropAutoStatics();
-    const mask = opts.mask ?? opts.layer ?? LAYER.STATIC;
-    const id = this.staticWorld.addMesh(mesh, surfaceType, mask, opts);
-    if (id >= 0) this._explicitStatics++;
-    return id;
+    if (!mesh || !mesh.getTotalVertices?.()) return null;
+
+    const si = surfaceType === undefined ? guessSurface(mesh.name) : surfaceIndex(surfaceType);
+    const layer = opts.layer ?? LAYER.STATIC;
+
+    const shape = new PhysicsShapeMesh(mesh, this.scene);
+    shape.filterMembershipMask = layer;
+    shape.filterCollideMask = MASK.ALL;
+
+    const body = new PhysicsBody(mesh, PhysicsMotionType.STATIC, false, this.scene);
+    body.shape = shape;
+
+    this._meta.set(body, {
+      surfaceIndex: si,
+      surface: surfaceName(si),
+      layer,
+      mesh,
+      actor: opts.actor ?? null,
+      part: opts.part ?? null,
+    });
+
+    return body;
   }
 
-  /** Register every Mesh under an Object3D. Returns the handle list. */
+  /** メッシュツリーを丸ごと登録する。ジオメトリを持つ子孫だけが対象。 */
   addStaticGroup(root, surfaceType, opts = {}) {
-    const ids = [];
-    if (!root) return ids;
-    root.updateWorldMatrix(true, true);
-    root.traverse((o) => {
-      if (!o.isMesh && !o.isInstancedMesh) return;
-      if (o.userData?.collision === false || o.userData?.noCollision) return;
-      const id = this.addStatic(o, surfaceType ?? o.userData?.surface, opts);
-      if (id >= 0) ids.push(id);
-    });
-    return ids;
+    const out = [];
+    const visit = (node) => {
+      if (node.getTotalVertices?.() > 0 && !node.metadata?.owNoCollision) {
+        const h = this.addStatic(node, surfaceType, opts);
+        if (h) out.push(h);
+      }
+      for (const c of node.getChildren?.() ?? []) visit(c);
+    };
+    visit(root);
+    return out;
   }
 
   removeStatic(handle) {
-    if (typeof handle === 'number') return this.staticWorld.removeObject(handle);
-    const id = this.staticWorld.findByMesh(handle);
-    return id >= 0 ? this.staticWorld.removeObject(id) : false;
-  }
-
-  rebuildStatic() {
-    this.staticWorld.build();
-    this._syncStats();
-  }
-
-  get triangleCount() {
-    return this.staticWorld.triCount;
+    if (!handle) return;
+    this._meta.delete(handle);
+    handle.dispose();
   }
 
   /**
-   * Fallback path so the game is playable while `world` is still a stub, and so
-   * a world that never calls addStatic() still collides.
+   * 外部サブシステムが自前で作った PhysicsBody をメタデータ表に載せる公開 API。
+   *
+   * Hit / bullet:impact に surface / actor / part を載せるのはこの表で、載って
+   * いない body は `surface:'concrete' / actor:null` になる (CC 内部 body で実際に
+   * 踏んだ罠 — createCharacter のコメント参照)。ai のヒットボックスやラグドールの
+   * ように body のライフサイクルを自分で管理する呼び出し側はこれを使うこと。
+   * `_meta` に直接 set しない (private を触る箇所を増やさない)。
+   *
+   * NOTE: `actor` を null にすると弾が当たっても damage:dealt が発行されない。
+   * 死体 (ラグドール) は意図的に actor:null で登録する — ヒットマーカーや
+   * キルフィードが死体撃ちで再発火しないようにするため。
    */
-  _ensureStatics(force = false) {
-    if (this._explicitStatics > 0) return;
-    const scene = this.ctx?.scene;
-    if (!scene) return;
-    let meshCount = 0;
-    scene.traverse((o) => {
-      if (o.isMesh || o.isInstancedMesh) meshCount++;
+  registerBodyMeta(body, opts = {}) {
+    if (!body) return;
+    const si = surfaceIndex(opts.surface ?? 'concrete');
+    this._meta.set(body, {
+      surfaceIndex: si,
+      surface: surfaceName(si),
+      layer: opts.layer ?? LAYER.DEBRIS,
+      mesh: opts.mesh ?? null,
+      actor: opts.actor ?? null,
+      part: opts.part ?? null,
     });
-    if (!force && meshCount === this._lastMeshCount) return;
-    this._lastMeshCount = meshCount;
-
-    this._dropAutoStatics();
-    if (meshCount > 0) {
-      let tris = 0;
-      scene.traverse((o) => {
-        if (!(o.isMesh || o.isInstancedMesh)) return;
-        if (tris > 400000) return;
-        if (o.userData?.collision === false || o.userData?.noCollision) return;
-        // `render` seeds a throwaway blockout (userData.owProbe) before the real
-        // level exists and deletes it the moment anything else appears — never
-        // build collision for scaffolding.
-        if (o.userData?.owProbe) return;
-        if (o.name && SKIP_NAME.test(o.name)) return;
-        const m = o.material;
-        if (m && !Array.isArray(m) && (m.isSpriteMaterial || m.isPointsMaterial)) return;
-        const id = this.staticWorld.addMesh(o, undefined, LAYER.STATIC);
-        if (id >= 0) {
-          this._autoIds.push(id);
-          tris += this.staticWorld.objects[id].triCount;
-        }
-      });
-    }
-
-    // Last resort: a ground plane so characters have something to stand on and
-    // captures aren't taken of a player falling into the void.
-    if (this._autoIds.length === 0 && this._fallbackId < 0) {
-      this._fallbackId = this._addFallbackGround();
-    }
   }
 
-  _dropAutoStatics() {
-    for (const id of this._autoIds) this.staticWorld.removeObject(id);
-    this._autoIds.length = 0;
-    if (this._fallbackId >= 0) {
-      this.staticWorld.removeObject(this._fallbackId);
-      this._fallbackId = -1;
-    }
+  /** registerBodyMeta の対。body を消す側が必ず呼ぶこと (Map リーク防止)。 */
+  unregisterBodyMeta(body) {
+    if (body) this._meta.delete(body);
   }
 
-  _addFallbackGround() {
-    const S = 300;
-    const tris = new Float32Array([
-      -S, 0, -S, -S, 0, S, S, 0, S,
-      -S, 0, -S, S, 0, S, S, 0, -S,
-    ]);
-    return this.staticWorld.addTriangles(tris, 2, 'concrete', LAYER.STATIC, 'physics:fallback-ground');
-  }
+  /**
+   * Havok は静的ボディの追加/削除を増分で処理するため、Three 版のような明示的な
+   * BVH 再構築は不要。API 互換のために残してある no-op。
+   */
+  rebuildStatic() {}
 
   /* ================================================================== */
   /* Queries                                                            */
@@ -395,305 +539,249 @@ export class PhysicsSystem {
     h.distance = Infinity;
     h.fraction = 1;
     h.object = null;
-    h.collider = null;
     h.body = null;
-    h.ragdoll = null;
     h.actor = null;
     h.part = null;
-    h.triangle = -1;
-    h.frontFace = true;
-    h.surfaceIndex = 0;
+    h.surfaceIndex = SURFACE.concrete;
+    h.surface = 'concrete';
     return h;
   }
 
+  _applyMeta(h, body) {
+    h.body = body ?? null;
+    const m = body ? this._meta.get(body) : null;
+    if (m) {
+      h.surfaceIndex = m.surfaceIndex;
+      h.surface = m.surface;
+      h.object = m.mesh;
+      h.actor = m.actor;
+      h.part = m.part;
+    } else {
+      h.object = body?.transformNode ?? null;
+    }
+  }
+
   /**
-   * Closest-hit ray. Accepts vectors or raw scalars:
-   *   raycast(origin, dir, maxDist, mask)
-   *   raycast(ox, oy, oz, dx, dy, dz, maxDist, mask)
-   * Always returns a Hit record — test `.hit`.
+   * レイキャスト。`dir` は正規化されていなくてよい。
+   * 戻り値は常にオブジェクト (リングプール由来) なので `.hit` を確認すること。
    */
-  raycast(a, b, c, d, e, f, g, h) {
-    let ox, oy, oz, dx, dy, dz, maxDist, mask;
-    if (typeof a === 'number') {
-      ox = a; oy = b; oz = c; dx = d; dy = e; dz = f; maxDist = g; mask = h;
-    } else {
-      ox = a.x; oy = a.y; oz = a.z;
-      dx = b.x; dy = b.y; dz = b.z;
-      maxDist = c; mask = d;
-    }
-    if (maxDist === undefined) maxDist = 1000;
-    if (mask === undefined) mask = MASK.ALL;
-    const out = this._nextHit();
-    const l = Math.hypot(dx, dy, dz);
-    if (l < 1e-9) {
-      out.point.set(ox, oy, oz);
-      out.distance = 0;
-      return out;
-    }
-    dx /= l; dy /= l; dz /= l;
-    this._rayCount++;
-    let best = maxDist;
-
-    const raw = this._raw;
-    if (this.staticWorld.raycast(ox, oy, oz, dx, dy, dz, best, mask, raw)) {
-      best = raw.t;
-      out.hit = true;
-      out.distance = raw.t;
-      out.point.set(raw.px, raw.py, raw.pz);
-      out.normal.set(raw.nx, raw.ny, raw.nz);
-      out.surfaceIndex = raw.surface;
-      out.triangle = raw.tri;
-      out.frontFace = raw.frontFace;
-      out.object = this.staticWorld.objects[raw.object]?.mesh ?? null;
-    }
-
-    best = this._raycastColliders(ox, oy, oz, dx, dy, dz, best, mask, out);
-    best = this._raycastBodies(ox, oy, oz, dx, dy, dz, best, mask, out);
-    this._raycastRagdolls(ox, oy, oz, dx, dy, dz, best, mask, out);
-
-    if (out.hit) {
-      out.fraction = out.distance / maxDist;
-      out.surface = surfaceName(out.surfaceIndex);
-    } else {
-      out.point.set(ox + dx * maxDist, oy + dy * maxDist, oz + dz * maxDist);
-      out.normal.set(-dx, -dy, -dz);
-      out.distance = maxDist;
-      out.surface = 'concrete';
-    }
-    if (this.debug?.enabled) {
-      this.debug.logRay(ox, oy, oz, out.point.x, out.point.y, out.point.z);
-    }
-    return out;
-  }
-
-  _raycastColliders(ox, oy, oz, dx, dy, dz, best, mask, out) {
-    for (let i = 0; i < this.colliders.length; i++) {
-      const c = this.colliders[i];
-      if (!c.enabled || (c.layer & mask) === 0) continue;
-      const t = c.shape === 'box'
-        ? rayObb(ox, oy, oz, dx, dy, dz, c.inverse.elements, c.hx, c.hy, c.hz, best)
-        : rayCapsule(ox, oy, oz, dx, dy, dz, c.ax, c.ay, c.az, c.bx, c.by, c.bz, c.radius, best);
-      if (t < 0 || t >= best) continue;
-      best = t;
-      out.hit = true;
-      out.distance = t;
-      out.point.set(ox + dx * t, oy + dy * t, oz + dz * t);
-      this._colliderNormal(c, out.point, out.normal, dx, dy, dz);
-      out.surfaceIndex = c.surfaceIndex;
-      out.object = c.owner;
-      out.collider = c;
-      out.actor = c.owner;
-      out.part = c.part;
-      out.body = null;
-      out.ragdoll = null;
-      out.triangle = -1;
-      out.frontFace = true;
-    }
-    return best;
-  }
-
-  _colliderNormal(c, point, outN, dx, dy, dz) {
-    if (c.shape === 'box') {
-      _v.copy(point).applyMatrix4(c.inverse);
-      const ax = Math.abs(_v.x) / c.hx;
-      const ay = Math.abs(_v.y) / c.hy;
-      const az = Math.abs(_v.z) / c.hz;
-      if (ax >= ay && ax >= az) outN.set(Math.sign(_v.x) || 1, 0, 0);
-      else if (ay >= az) outN.set(0, Math.sign(_v.y) || 1, 0);
-      else outN.set(0, 0, Math.sign(_v.z) || 1);
-      outN.transformDirection(c.matrix);
-    } else {
-      closestPtSegSeg(
-        point.x, point.y, point.z, point.x, point.y, point.z,
-        c.ax, c.ay, c.az, c.bx, c.by, c.bz, this._cl
-      );
-      outN.set(point.x - this._cl.bx, point.y - this._cl.by, point.z - this._cl.bz);
-      if (outN.lengthSq() < 1e-12) outN.set(-dx, -dy, -dz);
-      else outN.normalize();
-    }
-    if (outN.x * dx + outN.y * dy + outN.z * dz > 0) outN.multiplyScalar(-1);
-  }
-
-  _raycastBodies(ox, oy, oz, dx, dy, dz, best, mask, out) {
-    if ((mask & LAYER.DEBRIS) === 0) return best;
-    const list = this.bodies.bodies;
-    for (let i = 0; i < list.length; i++) {
-      const b = list[i];
-      let t;
-      if (b.shape === 'sphere') {
-        t = raySphere(ox, oy, oz, dx, dy, dz, b.position.x, b.position.y, b.position.z, b.radius, best);
-      } else {
-        _m4.compose(b.position, b.quaternion, _one);
-        _m4i.copy(_m4).invert();
-        t = b.shape === 'capsule'
-          ? rayObb(ox, oy, oz, dx, dy, dz, _m4i.elements, b.radius, b.halfHeight + b.radius, b.radius, best)
-          : rayObb(ox, oy, oz, dx, dy, dz, _m4i.elements, b.hx, b.hy, b.hz, best);
-      }
-      if (t < 0 || t >= best) continue;
-      best = t;
-      out.hit = true;
-      out.distance = t;
-      out.point.set(ox + dx * t, oy + dy * t, oz + dz * t);
-      out.normal.set(
-        out.point.x - b.position.x,
-        out.point.y - b.position.y,
-        out.point.z - b.position.z
-      );
-      if (out.normal.lengthSq() < 1e-12) out.normal.set(-dx, -dy, -dz);
-      else out.normal.normalize();
-      out.surfaceIndex = b.surface;
-      out.object = b.object3D ?? null;
-      out.body = b;
-      out.collider = null;
-      out.ragdoll = null;
-      out.triangle = -1;
-    }
-    return best;
-  }
-
-  _raycastRagdolls(ox, oy, oz, dx, dy, dz, best, mask, out) {
-    if ((mask & LAYER.RAGDOLL) === 0) return best;
-    for (let r = 0; r < this.ragdolls.length; r++) {
-      const rd = this.ragdolls[r];
-      if (!segmentHitsAabb(ox, oy, oz, dx, dy, dz, best, rd.aabb, 0.2)) continue;
-      for (let i = 0; i < rd.boneCount; i++) {
-        const a = rd.boneHead[i], c = rd.boneTail[i];
-        const t = rayCapsule(
-          ox, oy, oz, dx, dy, dz,
-          rd.px[a], rd.py[a], rd.pz[a],
-          rd.px[c], rd.py[c], rd.pz[c],
-          rd.boneRadius[i], best
-        );
-        if (t < 0 || t >= best) continue;
-        best = t;
-        out.hit = true;
-        out.distance = t;
-        out.point.set(ox + dx * t, oy + dy * t, oz + dz * t);
-        closestPtSegSeg(
-          out.point.x, out.point.y, out.point.z, out.point.x, out.point.y, out.point.z,
-          rd.px[a], rd.py[a], rd.pz[a], rd.px[c], rd.py[c], rd.pz[c], this._cl
-        );
-        out.normal.set(
-          out.point.x - this._cl.bx,
-          out.point.y - this._cl.by,
-          out.point.z - this._cl.bz
-        );
-        if (out.normal.lengthSq() < 1e-12) out.normal.set(-dx, -dy, -dz);
-        else out.normal.normalize();
-        out.surfaceIndex = SURFACE.flesh;
-        out.ragdoll = rd;
-        out.object = rd.actor;
-        out.actor = rd.actor;
-        out.part = rd.spec[i]?.name ?? null;
-        out.collider = null;
-        out.body = null;
-        out.triangle = -1;
-      }
-    }
-    return best;
-  }
-
-  /** Cheap occlusion test — statics only, no ordering, no record. */
-  raycastAny(a, b, c, d, e, f, g, h) {
-    let ox, oy, oz, dx, dy, dz, maxDist, mask;
-    if (typeof a === 'number') {
-      ox = a; oy = b; oz = c; dx = d; dy = e; dz = f; maxDist = g; mask = h;
-    } else {
-      ox = a.x; oy = a.y; oz = a.z;
-      dx = b.x; dy = b.y; dz = b.z;
-      maxDist = c; mask = d;
-    }
-    const l = Math.hypot(dx, dy, dz);
-    if (l < 1e-9) return false;
-    this._rayCount++;
-    return this.staticWorld.raycastAny(
-      ox, oy, oz, dx / l, dy / l, dz / l,
-      maxDist ?? 1000, mask ?? MASK.SIGHT
+  raycast(origin, dir, maxDist = 1000, mask = MASK.WORLD) {
+    const h = this._nextHit();
+    const len = Math.hypot(dir.x, dir.y, dir.z) || 1;
+    _v0.set(origin.x, origin.y, origin.z);
+    _v1.set(
+      origin.x + (dir.x / len) * maxDist,
+      origin.y + (dir.y / len) * maxDist,
+      origin.z + (dir.z / len) * maxDist
     );
+
+    this._ray.reset(_v0, _v1);
+    this.plugin.raycast(_v0, _v1, this._ray, { collideWith: mask });
+    if (!this._ray.hasHit) return h;
+
+    h.hit = true;
+    h.point.copyFrom(this._ray.hitPointWorld);
+    h.normal.copyFrom(this._ray.hitNormalWorld);
+    h.distance = this._ray.hitDistance;
+    h.fraction = maxDist > 0 ? h.distance / maxDist : 0;
+    this._applyMeta(h, this._ray.body);
+    return h;
   }
 
-  /** True when nothing blocks the straight line between two points. */
+  raycastAny(origin, dir, maxDist = 1000, mask = MASK.SIGHT) {
+    return this.raycast(origin, dir, maxDist, mask).hit;
+  }
+
+  /** from から to が見通せるか。glass / foliage は既定で視線を遮らない。 */
   lineOfSight(from, to, mask = MASK.SIGHT) {
-    const dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
-    const d = Math.hypot(dx, dy, dz);
-    if (d < 1e-6) return true;
-    return !this.staticWorld.raycastAny(
-      from.x, from.y, from.z, dx / d, dy / d, dz / d, d - 1e-3, mask
-    );
+    _v2.set(to.x - from.x, to.y - from.y, to.z - from.z);
+    const d = _v2.length();
+    if (d < 1e-5) return true;
+    return !this.raycast(from, _v2, d, mask).hit;
   }
 
+  /** 球を掃引する。maxDist まで進めて最初の接触を返す。 */
   sphereCast(origin, dir, radius, maxDist = 100, mask = MASK.WORLD) {
-    return this.capsuleCast(origin, origin, radius, dir, maxDist, mask);
+    return this._shapeCast(this._scratchSphere(radius), origin, dir, maxDist, mask);
   }
 
+  /**
+   * カプセルを掃引する。p0/p1 はカプセルの両端 (world 空間)。
+   * キャラクタの移動先チェックや AI のカバー移動可否に使う。
+   */
   capsuleCast(p0, p1, radius, dir, maxDist = 100, mask = MASK.CHARACTER) {
-    const out = this._nextHit();
-    let dx = dir.x, dy = dir.y, dz = dir.z;
-    const l = Math.hypot(dx, dy, dz);
-    if (l < 1e-9) return out;
-    dx /= l; dy /= l; dz /= l;
-    this._rayCount++;
-    const raw = this._raw2;
-    if (this.staticWorld.sweepCapsule(
-      p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, radius, dx, dy, dz, maxDist, mask, raw
-    )) {
-      out.hit = true;
-      out.distance = raw.t;
-      out.fraction = raw.t / maxDist;
-      out.point.set(raw.px, raw.py, raw.pz);
-      out.normal.set(raw.nx, raw.ny, raw.nz);
-      out.surfaceIndex = raw.surface;
-      out.surface = surfaceName(raw.surface);
-      out.triangle = raw.tri;
-      out.object = this.staticWorld.objects[raw.object]?.mesh ?? null;
-    } else {
-      out.distance = maxDist;
-      out.point.set(p0.x + dx * maxDist, p0.y + dy * maxDist, p0.z + dz * maxDist);
-      out.normal.set(-dx, -dy, -dz);
-    }
-    return out;
+    const h = Vector3.Distance(p0, p1);
+    _v2.set((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5, (p0.z + p1.z) * 0.5);
+    return this._shapeCast(this._scratchCapsule(radius, h), _v2, dir, maxDist, mask);
   }
 
-  /** Contact count; details live in `physics.staticWorld.contacts`. */
-  overlapCapsule(p0, p1, radius, mask = MASK.CHARACTER) {
-    return this.staticWorld.overlapCapsule(
-      p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, radius, mask, 0
+  _shapeCast(shape, origin, dir, maxDist, mask) {
+    const hit = this._nextHit();
+    const len = Math.hypot(dir.x, dir.y, dir.z) || 1;
+    _v0.set(origin.x, origin.y, origin.z);
+    _v1.set(
+      origin.x + (dir.x / len) * maxDist,
+      origin.y + (dir.y / len) * maxDist,
+      origin.z + (dir.z / len) * maxDist
     );
+    shape.filterCollideMask = mask;
+
+    this._shapeStart.reset();
+    this._shapeHit.reset();
+    this.plugin.shapeCast(
+      { shape, rotation: _q0, startPosition: _v0, endPosition: _v1, shouldHitTriggers: false },
+      this._shapeStart,
+      this._shapeHit
+    );
+
+    if (!this._shapeHit.hasHit) return hit;
+    hit.hit = true;
+    hit.point.copyFrom(this._shapeHit.hitPoint);
+    hit.normal.copyFrom(this._shapeHit.hitNormal);
+    hit.fraction = this._shapeHit.hitFraction;
+    hit.distance = hit.fraction * maxDist;
+    this._applyMeta(hit, this._shapeHit.body);
+    return hit;
   }
 
-  checkCapsule(p0, p1, radius, mask = MASK.CHARACTER) {
-    return this.overlapCapsule(p0, p1, radius, mask) === 0;
-  }
-
+  /** 球の重なり数。0 なら空いている。 */
   overlapSphere(center, radius, mask = MASK.CHARACTER) {
-    return this.staticWorld.overlapCapsule(
-      center.x, center.y, center.z, center.x, center.y, center.z, radius, mask, 0
-    );
+    // Havok に直接の overlap クエリが無いので、ほぼゼロ長の shapeCast で代用する。
+    _v0.set(0, 1, 0);
+    return this._shapeCast(this._scratchSphere(radius), center, _v0, 1e-4, mask).hit ? 1 : 0;
   }
 
-  /** Floor height under (x, z). Returns -Infinity if there is no floor. */
+  /** カプセルが空いているか。true = 何にも当たらない。 */
+  checkCapsule(p0, p1, radius, mask = MASK.CHARACTER) {
+    _v0.set(0, 1, 0);
+    return !this.capsuleCast(p0, p1, radius, _v0, 1e-4, mask).hit;
+  }
+
+  /** (x, z) の真下の床の高さ。何も無ければ -Infinity。 */
   groundHeight(x, z, fromY = 200, mask = MASK.WORLD) {
-    const h = this.raycast(x, fromY, z, 0, -1, 0, 1000, mask);
+    _v0.set(x, fromY, z);
+    _v1.set(0, -1, 0);
+    const h = this.raycast(_v0, _v1, fromY + 400, mask);
     return h.hit ? h.point.y : -Infinity;
+  }
+
+  /** 足元の surface 名。足音・着地音・decal の選択に使う。 */
+  surfaceUnder(pos, radius = 0.3) {
+    _v0.set(pos.x, pos.y, pos.z);
+    _v1.set(0, -1, 0);
+    const h = this.raycast(_v0, _v1, radius + 1.4, MASK.WORLD);
+    return h.hit ? h.surface : 'concrete';
+  }
+
+  /**
+   * クエリ用の形状はキャッシュする。**毎フレーム new すると Havok 側に形状が
+   * 溜まり続けてリークする** (ARCHITECTURE.md Hard rule 5 の精神)。
+   */
+  _scratchSphere(r) {
+    const key = Math.round(r * 1000);
+    let s = this._sphereCache.get(key);
+    if (!s) {
+      s = new PhysicsShapeSphere(Vector3.Zero(), r, this.scene);
+      this._sphereCache.set(key, s);
+    }
+    return s;
+  }
+
+  _scratchCapsule(r, h) {
+    const key = `${Math.round(r * 1000)}:${Math.round(h * 1000)}`;
+    let s = this._capsuleCache.get(key);
+    if (!s) {
+      const half = Math.max(0.001, h * 0.5);
+      s = new PhysicsShapeCapsule(new Vector3(0, -half, 0), new Vector3(0, half, 0), r, this.scene);
+      this._capsuleCache.set(key, s);
+    }
+    return s;
   }
 
   /* ================================================================== */
   /* Characters                                                         */
   /* ================================================================== */
 
+  /**
+   * キャラクタコントローラを作る。
+   *
+   * ## `actor` / `surface` を必ず渡すこと (弾が当たる主体の場合)
+   *
+   * `PhysicsCharacterController` は **内部で PhysicsBody を作り、フィルタは全ビット
+   * 立った状態**になっている。つまり弾のレイに当たる。しかしその body は physics の
+   * メタデータ表に載っていないため:
+   *
+   *   - `hit.surface` が既定の 'concrete' になる (足元が肉でもコンクリ音・コンクリ片)
+   *   - `hit.actor` が null なので **damage:dealt が発行されず、ダメージが入らない**
+   *
+   * 実測 (修正前): 8m 手前からプレイヤーへ撃つと 7.75m で
+   * `{surface:'concrete', hasActor:false}` に当たっていた。**敵の弾が当たっても
+   * プレイヤーは一切ダメージを受けない**状態だった。
+   *
+   * ここで body をメタデータ表に登録することで、弾が当たれば正しく actor 付きの
+   * Hit になり damage:dealt が流れる。
+   *
+   * 逆に「弾に当たってほしくない」CC (別途ヒットボックスを持つ ai など) は
+   * `opts.bulletProof = true` を渡す。フィルタを CLIP に落として弾と視線から外す。
+   */
   createCharacter(opts = {}) {
-    const c = new CharacterController(this.staticWorld, {
+    const c = new Character(this, {
       radius: UNITS.playerRadius,
       height: UNITS.playerHeight,
       ...opts,
     });
     this.characters.push(c);
+
+    /**
+     * CC の内部 body は private (`ctrl._body`)。**public な取得手段が無い**ので
+     * 直接触っている。Babylon を上げたときに名前が変わっていないか確認すること。
+     * 名前が変われば静かに登録されなくなり、「弾が当たるのにダメージが入らない」
+     * 状態に戻る (エラーは出ない)。
+     */
+    const body = c.ctrl?._body;
+    if (body) {
+      c.body = body;
+      if (opts.bulletProof) {
+        // 弾と視線から外す。別途ヒットボックスを持つキャラクタ向け。
+        const shape = c.ctrl._shape;
+        if (shape) {
+          shape.filterMembershipMask = LAYER.CLIP;
+          shape.filterCollideMask = MASK.CHARACTER;
+        }
+      } else {
+        const si = surfaceIndex(opts.surface ?? 'flesh');
+        this._meta.set(body, {
+          surfaceIndex: si,
+          surface: surfaceName(si),
+          layer: LAYER.ACTOR,
+          mesh: null,
+          actor: opts.actor ?? null,
+          part: opts.part ?? 'torso',
+        });
+        /**
+         * 掃引対象から RAGDOLL 層だけを外す。
+         *
+         * Havok のフィルタは対称 ((A.mem & B.col) && (B.mem & A.col)) なので、
+         * こちら側の collide から RAGDOLL ビットを落とすだけで「プレイヤーの CC が
+         * 死体を蹴飛ばす / 死体に足止めされる」の両方向が消える (ラグドール側の
+         * membership は LAYER.RAGDOLL のみ — ai/ragdoll.js 参照)。
+         *
+         * membership は全ビットのまま残す — ここを絞ると敵弾のレイ (MASK.BULLET)
+         * や AI の視線がプレイヤーに当たらなくなる方向の事故になるため、変更は
+         * collide 側だけに留める。
+         */
+        const shape = c.ctrl._shape;
+        if (shape) shape.filterCollideMask = MASK.ALL & ~LAYER.RAGDOLL;
+      }
+    }
     return c;
   }
 
   removeCharacter(c) {
     const i = this.characters.indexOf(c);
     if (i >= 0) this.characters.splice(i, 1);
+    if (c.body) this._meta.delete(c.body);
+    c.dispose?.();
   }
 
   /* ================================================================== */
@@ -701,19 +789,141 @@ export class PhysicsSystem {
   /* ================================================================== */
 
   /**
-   * Trace a round through the world, penetrating what it can.
-   * Emits `bullet:impact` for every entry and every exit.
-   * Returns an array of impact records (reused; copy what you keep).
+   * 弾を 1 発ワールドに撃ち込み、貫通できるものを貫通させる。
+   *
+   * 入口と出口の両方で `bullet:impact` を emit するのが仕様 (ARCHITECTURE.md)。
+   * fx はこれを見て、入口には着弾 FX と decal、出口には裏抜けの土煙を出す。
+   *
+   * 貫通モデル: 各層で SURFACE_PROPS の penDepth と energyLoss を引き、残弾威力を
+   * 減衰させる。威力が尽きるか層数上限に達したら停止。偏向 (deflect) は必ず `rng`
+   * 経由 — Math.random() を使うとキャプチャが揺れる。
    */
   fireBullet(opts) {
-    const n = this.ballistics.fire({ rng: this.rng, ...opts });
+    const origin = opts.origin;
+    const dir = opts.dir;
+    const maxDist = opts.maxDist ?? 300;
+    const mask = opts.mask ?? MASK.BULLET;
+    const rng = opts.rng ?? this.rng;
+    /**
+     * true なら **アクターへの命中を丸ごと透明化する**: damage:dealt を発行せず、
+     * その actor 上の bullet:impact (入口/出口) も emit しない。地形への着弾
+     * (壁のデカール・土煙) は通常どおり。キャプチャ用 staged 敵の射撃
+     * (ai の staged.noDamage) が使う。
+     *
+     * 経緯 (両方実測):
+     *   1. damage:dealt を素通しすると staged の実弾がプレイヤーの体力を削り、
+     *      combat ショットが HP 0 の赤ビネット越しになる
+     *   2. bullet:impact を素通しすると、カメラ 0.3m のプレイヤーカプセルに
+     *      surface:'flesh' の着弾 FX (血しぶき) が発火し、**画面全体が均一な
+     *      赤い半透明レイヤーに覆われる** (combat の空領域 RGB が 146/158/164 →
+     *      203/84/71)。動力学の 0-dt 修正で CC の Havok 体が実位置に追従する
+     *      ようになり、staged の弾が初めて実際に「当たる」ようになって顕在化した
+     */
+    const noDamage = opts.noDamage ?? false;
+    /** 貫通力。1.0 = 参照弾 (7.62x51 相当)。 */
+    let power = opts.penetration ?? 1;
+    let damage = opts.damage ?? 30;
+
     const res = this._impactResult;
     res.length = 0;
-    for (let i = 0; i < n; i++) res.push(this.ballistics.impacts[i]);
+
+    const len = Math.hypot(dir.x, dir.y, dir.z) || 1;
+    let px = origin.x;
+    let py = origin.y;
+    let pz = origin.z;
+    let dx = dir.x / len;
+    let dy = dir.y / len;
+    let dz = dir.z / len;
+    let remaining = maxDist;
+
+    // 層数の上限。壁 → 家具 → 壁 のような多層を許しつつ無限ループを防ぐ。
+    const MAX_LAYERS = 8;
+
+    for (let layer = 0; layer < MAX_LAYERS && remaining > 0.01; layer++) {
+      _v0.set(px, py, pz);
+      _v1.set(dx, dy, dz);
+      const hit = this.raycast(_v0, _v1, remaining, mask);
+      if (!hit.hit) break;
+
+      const props = SURFACE_PROPS[hit.surfaceIndex] ?? SURFACE_PROPS[SURFACE.concrete];
+
+      /** noDamage 弾のアクター命中は impact ごと透明化する (noDamage の doc 参照)。 */
+      const silent = noDamage && !!hit.actor;
+
+      // 入口 impact。
+      if (!silent) {
+        this.emitImpact(
+          hit.point.x, hit.point.y, hit.point.z,
+          hit.normal.x, hit.normal.y, hit.normal.z,
+          dx, dy, dz,
+          hit.surfaceIndex, damage, false, hit, noDamage
+        );
+        res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
+      }
+
+      const advanced = hit.distance + 0.001;
+
+      // この層を貫通できるか。penDepth を超える厚みは抜けない。
+      const maxPen = props.penDepth * power;
+      if (maxPen <= 0.001) break;
+
+      // 出口を探す: 進行方向へ maxPen 進んだ先から逆向きにレイを撃ち裏面を拾う。
+      // 厚みが maxPen を超えるならヒットせず = 貫通失敗。
+      const probe = Math.min(maxPen, Math.max(0, remaining - advanced));
+      if (probe <= 0.001) break;
+      const entry = hit.point;
+      _v0.set(
+        entry.x + dx * (probe + 0.002),
+        entry.y + dy * (probe + 0.002),
+        entry.z + dz * (probe + 0.002)
+      );
+      _v1.set(-dx, -dy, -dz);
+      const back = this.raycast(_v0, _v1, probe + 0.004, mask);
+      if (!back.hit) {
+        // 抜けられなかった。ここで停止。
+        break;
+      }
+
+      const thickness = Math.max(0.001, probe + 0.002 - back.distance);
+      const consumed = thickness / props.penDepth;
+      damage *= Math.max(0, 1 - props.energyLoss * consumed);
+      power -= consumed;
+
+      // 出口 impact。
+      if (!silent) {
+        this.emitImpact(
+          back.point.x, back.point.y, back.point.z,
+          back.normal.x, back.normal.y, back.normal.z,
+          dx, dy, dz,
+          hit.surfaceIndex, damage, true, hit, noDamage
+        );
+        res.push(this._impactPool[(this._impactCursor - 1 + IMPACT_POOL) % IMPACT_POOL]);
+      }
+
+      if (power <= 0 || damage < 1) break;
+
+      // 偏向。決定的でなければならないので必ず rng 経由。
+      const scatter = props.deflect * consumed;
+      if (scatter > 0) {
+        dx += rng.signed() * scatter;
+        dy += rng.signed() * scatter;
+        dz += rng.signed() * scatter;
+        const l2 = Math.hypot(dx, dy, dz) || 1;
+        dx /= l2;
+        dy /= l2;
+        dz /= l2;
+      }
+
+      px = back.point.x + dx * 0.002;
+      py = back.point.y + dy * 0.002;
+      pz = back.point.z + dz * 0.002;
+      remaining -= advanced + thickness;
+    }
+
     return res;
   }
 
-  emitImpact(px, py, pz, nx, ny, nz, dx, dy, dz, si, damage, exit, hit) {
+  emitImpact(px, py, pz, nx, ny, nz, dx, dy, dz, si, damage, exit, hit, noDamage = false) {
     const p = this._impactPool[this._impactCursor];
     this._impactCursor = (this._impactCursor + 1) % IMPACT_POOL;
     p.point.set(px, py, pz);
@@ -729,10 +939,12 @@ export class PhysicsSystem {
     p.part = hit?.part ?? null;
     this.ctx.events.emit('bullet:impact', p);
 
-    if (p.actor && !exit) {
+    // ダメージは「入口」でのみ与える。出口でも与えると 1 発で 2 回当たる。
+    // noDamage (staged 射撃) は FX だけ出してダメージ経路を全部黙らせる。
+    if (p.actor && !exit && !noDamage) {
       this.ctx.events.emit('damage:dealt', {
         target: p.actor,
-        amount: damage * (hit?.collider?.damageScale ?? 1),
+        amount: damage,
         headshot: hit?.part === 'head',
         killed: false,
         point: p.point,
@@ -740,28 +952,25 @@ export class PhysicsSystem {
     }
   }
 
-  /**
-   * Radial blast: shoves rigid bodies and ragdolls, occluded by the world so a
-   * grenade behind a wall doesn't throw the crate in front of it.
-   */
+  /** 爆発。剛体を吹き飛ばす。壁で遮蔽されるので壁の裏の箱は飛ばない。 */
   explode(e) {
     if (!e) return;
     const pos = e.position ?? e;
     const radius = e.radius ?? 5;
     const strength = e.impulse ?? (e.damage ?? 100) * 0.9;
-    this.bodies.applyRadialImpulse(pos.x, pos.y, pos.z, radius, strength * 0.06);
-    for (const rd of this.ragdolls) {
-      const cx = (rd.aabb.minx + rd.aabb.maxx) * 0.5;
-      const cy = (rd.aabb.miny + rd.aabb.maxy) * 0.5;
-      const cz = (rd.aabb.minz + rd.aabb.maxz) * 0.5;
-      const dx = cx - pos.x, dy = cy - pos.y, dz = cz - pos.z;
+
+    for (const rb of this.rigidBodies) {
+      const p = rb.node.position;
+      const dx = p.x - pos.x;
+      const dy = p.y - pos.y;
+      const dz = p.z - pos.z;
       const d = Math.hypot(dx, dy, dz);
-      if (d > radius) continue;
-      _v.set(cx, cy, cz);
-      if (!this.lineOfSight(pos, _v, MASK.EXPLOSION)) continue;
-      const f = (1 - d / radius) * strength * 0.5;
-      const inv = 1 / (d || 1e-4);
-      rd.applyImpulse(pos.x, pos.y, pos.z, dx * inv * f, dy * inv * f + f * 0.4, dz * inv * f, radius);
+      if (d > radius || d < 1e-4) continue;
+      if (!this.lineOfSight(pos, p, MASK.EXPLOSION)) continue;
+
+      const falloff = 1 - d / radius;
+      const s = (strength * falloff * falloff) / d;
+      rb.applyImpulse(dx * s, dy * s + strength * falloff * 0.25, dz * s, p.x, p.y, p.z);
     }
   }
 
@@ -769,291 +978,143 @@ export class PhysicsSystem {
   /* Rigid bodies                                                       */
   /* ================================================================== */
 
+  /**
+   * 剛体を追加する。`mesh` を渡せばそれが物理に追従する。渡さない場合は不可視の
+   * TransformNode が作られ、呼び出し側が position を読んで描画する。
+   */
   addRigidBody(opts = {}) {
-    const b = new RigidBody(opts);
-    if (opts.surfaceType) b.surface = surfaceIndex(opts.surfaceType);
-    this.bodies.add(b);
-    return b;
+    const node = opts.mesh ?? new TransformNode('rb', this.scene);
+    if (opts.position) node.position.copyFrom(opts.position);
+    node.rotationQuaternion ??= Quaternion.Identity();
+    /**
+     * **ワールド行列を明示的に確定させてから PhysicsBody を作る。**
+     *
+     * PhysicsBody のコンストラクタは `transformNode.absolutePosition` を読むが、
+     * 親なしの新規ノードでは world matrix を強制計算しない (親付きのみ計算する
+     * 分岐がある)。作りたてのノードの absolutePosition はゼロのままなので、
+     * これが無いと **body が (0,0,0) に生成される** (実測: 指定位置 y=3 のはず
+     * のカプセルが Havok 内で原点に居た)。
+     */
+    node.computeWorldMatrix(true);
+
+    let shape;
+    const kind = opts.shape ?? 'box';
+    if (kind === 'sphere') {
+      shape = new PhysicsShapeSphere(Vector3.Zero(), opts.radius ?? 0.1, this.scene);
+    } else if (kind === 'capsule') {
+      const half = (opts.height ?? 0.3) * 0.5;
+      shape = new PhysicsShapeCapsule(
+        new Vector3(0, -half, 0),
+        new Vector3(0, half, 0),
+        opts.radius ?? 0.08,
+        this.scene
+      );
+    } else {
+      const he = opts.halfExtents ?? { x: 0.06, y: 0.06, z: 0.06 };
+      shape = new PhysicsShapeBox(
+        Vector3.Zero(),
+        Quaternion.Identity(),
+        new Vector3(he.x * 2, he.y * 2, he.z * 2),
+        this.scene
+      );
+    }
+    shape.filterMembershipMask = opts.layer ?? LAYER.DEBRIS;
+    shape.filterCollideMask = opts.mask ?? MASK.DEBRIS;
+
+    const body = new PhysicsBody(node, PhysicsMotionType.DYNAMIC, false, this.scene);
+    body.shape = shape;
+    body.setMassProperties({ mass: opts.mass ?? 1 });
+    if (opts.velocity) {
+      _v0.set(opts.velocity.x, opts.velocity.y, opts.velocity.z);
+      body.setLinearVelocity(_v0);
+    }
+    if (opts.angularVelocity) {
+      _v0.set(opts.angularVelocity.x, opts.angularVelocity.y, opts.angularVelocity.z);
+      body.setAngularVelocity(_v0);
+    }
+
+    const si = surfaceIndex(opts.surface ?? 'metal');
+    this._meta.set(body, {
+      surfaceIndex: si,
+      surface: surfaceName(si),
+      layer: opts.layer ?? LAYER.DEBRIS,
+      mesh: opts.mesh ?? null,
+      actor: opts.actor ?? null,
+      part: null,
+    });
+
+    const rb = new RigidBody(this, body, node, opts);
+    this.rigidBodies.push(rb);
+    return rb;
   }
 
   removeRigidBody(b) {
-    this.bodies.remove(b);
+    const i = this.rigidBodies.indexOf(b);
+    if (i >= 0) this.rigidBodies.splice(i, 1);
+    this._meta.delete(b.body);
+    b.body.dispose();
+    if (!b.node.metadata?.owKeep) b.node.dispose();
   }
 
-  /** Convenience for fx: a tumbling chunk with sensible defaults. */
+  /** 破片を 1 つ飛ばす。着弾 FX から呼ばれる。 */
   spawnDebris(position, velocity, opts = {}) {
-    const s = opts.size ?? 0.08;
-    const si = surfaceIndex(opts.surface ?? 'concrete');
-    const b = this.addRigidBody({
-      shape: opts.shape ?? 'box',
-      halfExtents: { x: s, y: s * 0.7, z: s * 0.85 },
-      radius: s,
-      mass: opts.mass ?? Math.max(0.01, s * s * s * 4 * (SURFACE_PROPS[si]?.density ?? 2000)),
+    const s = opts.size ?? 0.05;
+    return this.addRigidBody({
+      shape: 'box',
+      halfExtents: { x: s, y: s, z: s },
+      mass: opts.mass ?? 0.15,
       position,
       velocity,
-      restitution: opts.restitution ?? SURFACE_PROPS[si].restitution,
-      friction: opts.friction ?? SURFACE_PROPS[si].friction,
-      lifetime: opts.lifetime ?? 20,
-      surface: si,
-      object3D: opts.object3D ?? null,
-      onImpact: opts.onImpact ?? null,
+      surface: opts.surface ?? 'concrete',
+      lifetime: opts.lifetime ?? 6,
+      mesh: opts.mesh ?? null,
+      layer: LAYER.DEBRIS,
+      mask: MASK.DEBRIS,
     });
-    const r = this.rng;
-    b.angularVelocity.set(r.signed() * 14, r.signed() * 14, r.signed() * 14);
-    return b;
-  }
-
-  /* ================================================================== */
-  /* Ragdolls                                                           */
-  /* ================================================================== */
-
-  createRagdoll(opts = {}) {
-    while (this.ragdolls.length >= this.maxRagdolls) {
-      this.ragdolls.shift()?.dispose();
-    }
-    const rd = new Ragdoll(this.staticWorld, { gravity: this.gravity, ...opts });
-    if (opts.velocity) rd.setVelocity(opts.velocity.x, opts.velocity.y, opts.velocity.z);
-    if (opts.impulse && opts.point) {
-      rd.applyImpulse(
-        opts.point.x, opts.point.y, opts.point.z,
-        opts.impulse.x, opts.impulse.y, opts.impulse.z,
-        opts.impulseRadius ?? 0.45
-      );
-    }
-    this.ragdolls.push(rd);
-    return rd;
-  }
-
-  /**
-   * Take over a SkinnedMesh's skeleton. `ai` calls this on death and stops
-   * driving the animation; from then on we write bone transforms every frame.
-   */
-  createRagdollFromSkeleton(skinnedMesh, opts = {}) {
-    const skeleton = skinnedMesh?.skeleton ?? skinnedMesh;
-    if (!skeleton?.bones?.length) return null;
-    const { spec, boneMap } = specFromSkeleton(skeleton, opts);
-    if (!spec.length) return null;
-    const rd = this.createRagdoll({ ...opts, bones: spec, transform: null });
-    rd.adoptSkeleton(skeleton, boneMap);
-    rd.actor = opts.actor ?? skinnedMesh;
-    return rd;
-  }
-
-  removeRagdoll(rd) {
-    const i = this.ragdolls.indexOf(rd);
-    if (i >= 0) this.ragdolls.splice(i, 1);
-    rd.dispose();
-  }
-
-  _handleDeath(e) {
-    if (this.ignoreDeathEvents || !e) return;
-    const actor = e.actor;
-    if (!actor || actor.__ragdoll) return;
-    const skinned = actor.isSkinnedMesh ? actor : (actor.skinnedMesh ?? actor.mesh ?? null);
-    const skeleton = actor.skeleton ?? skinned?.skeleton ?? null;
-    if (!skeleton || actor.ragdoll === false) return;
-    const rd = this.createRagdollFromSkeleton(skinned ?? { skeleton }, {
-      actor,
-      mass: actor.mass ?? 82,
-    });
-    if (rd) {
-      actor.__ragdoll = rd;
-      if (e.impulse && e.point) {
-        rd.applyImpulse(e.point.x, e.point.y, e.point.z, e.impulse.x, e.impulse.y, e.impulse.z, 0.4);
-      }
-    }
-  }
-
-  /* ================================================================== */
-  /* Dynamic colliders / hitboxes                                       */
-  /* ================================================================== */
-
-  addCollider(opts = {}) {
-    const c = new Collider(opts);
-    this.colliders.push(c);
-    return c;
-  }
-
-  removeCollider(c) {
-    const i = this.colliders.indexOf(c);
-    if (i >= 0) this.colliders.splice(i, 1);
   }
 
   /* ================================================================== */
   /* Frame                                                              */
   /* ================================================================== */
 
-  fixedUpdate(h, ctx) {
-    const t0 = performance.now();
+  fixedUpdate(h) {
+    /**
+     * Havok を固定ステップで 1 回進める。engine が MAX_SUBSTEPS で回数を制限
+     * しているので、ここでは 1 ステップだけ進めればよい。
+     *
+     * ## setTimeStep をステップの前後で切り替える理由 (実測で踏んだ罠)
+     *
+     * `HavokPlugin(useDeltaForWorldStep=false)` は **executeStep の引数 delta を
+     * 捨てて `_fixedTimeStep` を使う** (havokPlugin.js L590)。init() の
+     * `setTimeStep(0)` は自動ステップ (scene.render 内) を殺すが、その状態で
+     * `engine._step(h)` を呼んでも HP_World_Step(world, **0**) になり、
+     * **動力学が一切積分されない**。実測: DYNAMIC ボディが初速を保持したまま
+     * 永遠に静止し (速度は残るが位置が動かない)、デブリ・グレネード・
+     * ラグドールが全く落ちなかった。CC は自前積分なので気づけない。
+     *
+     * ここで h を設定 → 1 ステップ → 0 に戻す。戻し忘れると自動ステップが
+     * 実フレーム時間で走り出し、決定性 (bit-identical キャプチャ) が壊れる。
+     */
+    this.engine.setTimeStep(h);
+    this.engine._step(h);
+    this.engine.setTimeStep(0);
 
-    if (this._explicitStatics === 0) {
-      this._autoScanTimer += h;
-      if (this._autoScanTimer > 0.4) {
-        this._autoScanTimer = 0;
-        this._ensureStatics(false);
-      }
+    // 寿命切れのデブリを回収する。splice 中のインデックスずれを避けるため逆順。
+    for (let i = this.rigidBodies.length - 1; i >= 0; i--) {
+      const rb = this.rigidBodies[i];
+      if (rb.lifetime <= 0) continue;
+      rb.age += h;
+      if (rb.age >= rb.lifetime) this.removeRigidBody(rb);
     }
-    if (this.staticWorld.dirty) {
-      this.staticWorld.build();
-      this._syncStats();
-    }
-
-    if (this._pendingDemo && this.staticWorld.triCount > 0) {
-      this._pendingDemo = false;
-      this._spawnDemo();
-    }
-
-    this.bodies.step(h);
-    for (let i = 0; i < this.ragdolls.length; i++) this.ragdolls[i].step(h);
-
-    this.stats.stepMs = performance.now() - t0;
-    this.stats.awake = this.bodies.awakeCount;
-    this.stats.raycasts = this._rayCount;
-    this._rayCount = 0;
-  }
-
-  update(dt, ctx) {
-    // Interpolate rigid bodies into their render transforms using the engine's
-    // physics alpha so debris never strobes when the frame rate dips.
-    const alpha = ctx.time.alpha;
-    const list = this.bodies.bodies;
-    for (let i = 0; i < list.length; i++) {
-      const b = list[i];
-      const o = b.object3D;
-      if (!o) continue;
-      if (b.sleeping) {
-        o.position.copy(b.position);
-        o.quaternion.copy(b.quaternion);
-      } else {
-        o.position.lerpVectors(b.prevPosition, b.position, alpha);
-        o.quaternion.copy(b.prevQuaternion).slerp(b.quaternion, alpha);
-      }
-    }
-  }
-
-  lateUpdate(dt, ctx) {
-    for (let i = 0; i < this.ragdolls.length; i++) {
-      const rd = this.ragdolls[i];
-      if (rd.bones3D) rd.writeToSkeleton();
-    }
-    if (this.debug?.enabled) this.debug.rebuild(this, ctx.camera, dt);
-    this.stats.bodies = this.bodies.bodies.length;
-    this.stats.ragdolls = this.ragdolls.length;
-    this.stats.characters = this.characters.length;
-    this.stats.colliders = this.colliders.length;
-  }
-
-  _syncStats() {
-    this.stats.triangles = this.staticWorld.triCount;
-    this.stats.nodes = this.staticWorld.nodeCount;
-    this.stats.buildMs = this.staticWorld.buildMs;
-    let n = 0;
-    for (const o of this.staticWorld.objects) if (o && o.alive) n++;
-    this.stats.objects = n;
-    // One line per meaningful rebuild so other agents can see, in the capture
-    // log, whether their geometry actually reached the collision world.
-    if (this.stats.triangles !== this._loggedTris) {
-      this._loggedTris = this.stats.triangles;
-      const src = this._explicitStatics > 0
-        ? `${this._explicitStatics} registered`
-        : this._autoIds.length
-          ? `${this._autoIds.length} auto-scanned`
-          : 'fallback ground';
-      console.info(
-        `[physics] ${this.stats.triangles} tris / ${this.stats.nodes} nodes · ` +
-        `${this.staticWorld.buildMs.toFixed(1)}ms · ${src}`
-      );
-    }
-  }
-
-  /* ================================================================== */
-  /* Debug                                                              */
-  /* ================================================================== */
-
-  /**
-   * Toggle the collision wireframe. Other agents: call this to see exactly what
-   * physics thinks your geometry is.
-   *   phys.setDebugDraw(true, { nodes: true, radius: 25 })
-   */
-  setDebugDraw(on, opts = {}) {
-    if (!this.debug) return;
-    if (opts.triangles !== undefined) this.debug.showTriangles = opts.triangles;
-    if (opts.nodes !== undefined) this.debug.showNodes = opts.nodes;
-    if (opts.rays !== undefined) this.debug.showRays = opts.rays;
-    if (opts.radius !== undefined) this.debug.radius = opts.radius;
-    this.debug.setEnabled(on);
-  }
-
-  toggleDebugDraw() {
-    this.setDebugDraw(!this.debug?.enabled);
-    return this.debug?.enabled ?? false;
-  }
-
-  /** Named states for dev overlays / the capture harness. */
-  debugState(name) {
-    if (name === 'collision') this.setDebugDraw(true, { triangles: true, nodes: false });
-    else if (name === 'bvh') this.setDebugDraw(true, { triangles: false, nodes: true });
-    else if (name === 'demo') this._spawnDemo();
-    else if (name === 'off') this.setDebugDraw(false);
-    return this.stats;
-  }
-
-  /**
-   * Drop a ragdoll and a pile of debris in front of the camera and turn the
-   * wireframe on. Purely a verification aid for whoever is looking at the
-   * collision system; nothing in the game calls it.
-   */
-  _spawnDemo() {
-    this.setDebugDraw(true, { triangles: true, radius: 30 });
-    const cam = this.ctx.camera;
-    const fwd = _v.set(0, 0, -1).applyQuaternion(cam.quaternion);
-    const cx = cam.position.x + fwd.x * 6;
-    const cz = cam.position.z + fwd.z * 6;
-    const floor = this.groundHeight(cx, cz, cam.position.y + 20);
-    const base = Number.isFinite(floor) ? floor : 0;
-    const r = this.rng;
-    for (let i = 0; i < 14; i++) {
-      this.spawnDebris(
-        { x: cx + r.signed() * 1.6, y: base + 1.2 + i * 0.22, z: cz + r.signed() * 1.6 },
-        { x: r.signed() * 2, y: 0, z: r.signed() * 2 },
-        { size: 0.09 + r.float() * 0.06, surface: r.pick(['concrete', 'wood', 'metal']), lifetime: 1e9 }
-      );
-    }
-    const m = _m4.makeTranslation(cx + 1.5, base + 1.15, cz);
-    const rd = this.createRagdoll({ transform: m, height: 1.82, mass: 84 });
-    rd.setVelocity(-1.2, 0.2, 0.4);
-    return this.stats;
   }
 
   dispose() {
-    this.ctx?.events.off('explosion', this._onExplosion);
-    this.ctx?.events.off('actor:death', this._onDeath);
-    this.debug?.dispose();
-    this.debug = null;
-    this.bodies.clear();
-    for (const rd of this.ragdolls) rd.dispose();
-    this.ragdolls.length = 0;
+    for (const c of this.characters) c.dispose?.();
     this.characters.length = 0;
-    this.colliders.length = 0;
-    this.staticWorld.dispose();
+    for (const rb of [...this.rigidBodies]) this.removeRigidBody(rb);
+    this._meta.clear();
+    this.scene?.disablePhysicsEngine?.();
   }
 }
 
-/* ------------------------------------------------------------------ */
-
-function segmentHitsAabb(ox, oy, oz, dx, dy, dz, len, ab, pad = 0) {
-  const ix = 1 / (dx !== 0 ? dx : 1e-30);
-  const iy = 1 / (dy !== 0 ? dy : 1e-30);
-  const iz = 1 / (dz !== 0 ? dz : 1e-30);
-  let t0 = (ab.minx - pad - ox) * ix, t1 = (ab.maxx + pad - ox) * ix;
-  let lo = Math.min(t0, t1), hi = Math.max(t0, t1);
-  t0 = (ab.miny - pad - oy) * iy; t1 = (ab.maxy + pad - oy) * iy;
-  lo = Math.max(lo, Math.min(t0, t1));
-  hi = Math.min(hi, Math.max(t0, t1));
-  t0 = (ab.minz - pad - oz) * iz; t1 = (ab.maxz + pad - oz) * iz;
-  lo = Math.max(lo, Math.min(t0, t1));
-  hi = Math.min(hi, Math.max(t0, t1));
-  return hi >= Math.max(0, lo) && lo <= len;
-}
-
-export { LAYER, MASK, SURFACE, SURFACE_NAMES, SURFACE_PROPS, humanoidSpec, CharacterController, RigidBody, Ragdoll };
+export { LAYER, MASK, SURFACE, SURFACE_NAMES, SURFACE_PROPS, surfaceName, surfaceIndex };

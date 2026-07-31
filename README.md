@@ -1,125 +1,434 @@
-# Claude of Duty
+# Claude of Duty — WebGPU port
 
-Get updates [here](https://shumer.dev/newsletter).
+> Fork of [mshumer/Claude-of-Duty](https://github.com/mshumer/Claude-of-Duty).
+> 本家は Three.js r180 + WebGL2。このフォークは **Babylon.js 9 + WebGPU + Havok** への
+> 全面移植です。移植前の実装は `git show main:<path>` で参照できます。
 
-A first-person shooter built in the browser with Three.js r180 and WebGL2. Roughly
-55k lines across 11 subsystems, written by a fleet of AI agents under orchestration.
+ブラウザで動く一人称シューター。11 サブシステム。AI エージェントの集団によって書かれ、
+このフォークでも同じ体制で移植されています。
 
-**There are no art assets.** Every texture, mesh, animation and sound is generated
-procedurally at load time from code. No models, no HDRIs, no image files, no audio
-files. The only runtime dependency is `three`.
+**アートアセットは 1 つもありません。** テクスチャ・メッシュ・アニメーション・音のすべてが
+ロード時にコードから手続き生成されます。モデルも HDRI も画像ファイルも音声ファイルも
+ありません。
 
 ```bash
 npm install
 npm run dev          # http://127.0.0.1:5173
 ```
 
-Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
-R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
+キャンバスをクリックしてカーソルをロック。WASD 移動、マウス照準、LMB 射撃、RMB ADS、
+R リロード、Shift スプリント、Ctrl しゃがみ、Space ジャンプ、Q/E リーン、Esc 解除。
 
-## What's in it
+**WebGPU が必要です。** 使えない環境では WebGL2 に自動フォールバックしますが、手続き
+テクスチャの生成と大気シェーダは WGSL のみで書かれているため、絵は平坦になります
+(黙って劣化させず `console.warn` を出します)。
 
-| subsystem | what it does |
+## なぜ移植したのか
+
+本家の README にある「Honest assessment」と、`ARCHITECTURE.md` に記録された既知の罠を
+読むと、Three.js 実装が抱えていた問題の多くが **描画 API の制約に由来する**ことが
+分かります。特に:
+
+| 本家で記録されていた問題 | このフォークでの扱い |
 |---|---|
-| `render` | HDR pipeline, cascaded shadow maps in a `sampler2DArray` with texel snapping and PCSS contact hardening, MRT depth/normal/velocity prepass, GTAO, TAA with YCoCg variance clipping, tile-dilated motion blur, Karis bloom pyramid, GPU EV100 metering, procedural 33³ grade LUT, AgX composite |
-| `materials` | GPU texture forge: 19 procedural surfaces (concrete, brick, plaster, asphalt, sand, rusted/painted/brushed metal, wood, fabric, burlap, glass…), periodic noise so everything tiles seamlessly, Sobel height→normal, parallax occlusion mapping, triplanar projection, curvature-driven edge wear |
-| `sky` | Atmospheric scattering, time of day, PMREM environment generation, volumetric fog and light shafts |
-| `world` | ~120×120 m market street: modular building kit with real wall thickness, enterable interiors, several hundred instanced props |
-| `physics` | Written from scratch, no library. Binned-SAH BVH (29k tris → 14k nodes in 22 ms, 0.25 µs/raycast), swept-capsule character controller with a 5-plane crease stack, impulse rigid bodies with CCD, PBD ragdolls, multi-layer bullet penetration |
-| `player` | Movement state machine, slide/mantle/lean, camera feel |
-| `weapons` | Procedural weapon geometry, viewmodel rig, ADS, spring recoil, procedural reloads, ballistics with travel time and drop |
-| `fx` | GPU particles, decals, tracers, muzzle flash, explosions |
-| `ai` | Skinned soldiers, navmesh pathing, perception, cover behaviour, ragdoll death |
-| `ui` | DOM/CSS HUD: crosshair, hitmarkers, minimap, compass, killfeed |
-| `audio` | Web Audio synthesis — no sound files. Layered weapon fire, convolution reverb, HRTF spatialisation, occlusion |
+| 可視 point light 数がシェーダの permutation key。ランプ 1 個で全マテリアル再コンパイル (+33〜36 programs / 640〜900ms) | **原理的に消滅**。Babylon の clustered lighting はシェーダから見たライト数が常に一定。バラストライトの仕掛けも不要に |
+| 自前の BVH / swept-capsule / 剛体 / ラグドール = 5.6k 行の保守 | **Havok に置換**。29k tris の BVH 再構築を自分で管理しなくてよくなった |
+| viewmodel のライトリグが world の 20 倍 irradiance。全武器 albedo を 1/3 に誤魔化していた | **構造的に再発不能**。1 カメラ + renderingGroupId にして照明環境を 1 本に統一 |
+| GLSL が 4 ファイルに分裂し、同じ fbm/voronoi が 4 箇所にコピー | WGSL の 1 本にパラメータ化して統合 |
 
-`ARCHITECTURE.md` is the contract the agents worked against: subsystem interface,
-directory ownership, the cross-subsystem event vocabulary, and shared surface types.
+## 移植の実測結果
 
-## Tooling
+```
+src の行数          65,000 → 38,373   (-41%)
+ファイル数             144 → 106
+差分 (vs main)   +12,451 / -38,469 行
+依存                three → @babylonjs/core + @babylonjs/havok
+```
 
-The interesting part of this repo is arguably the harness, not the game.
+サブシステム別:
+
+| subsystem | 変化 | 中身 |
+|---|---|---|
+| `physics` | 5,598 → 1,098 | 自前実装を Havok に。API 互換は維持 |
+| `render` | 5,827 → 523 | CSM/GTAO/TAA/bloom/motion blur を Babylon のパイプライン設定に |
+| `sky` | 3,285 → 818 | 大気散乱を WGSL 1 本に。IBL は空モデルから SH を直接構築 |
+| `materials` | 4,432 → 1,389 | 19 サーフェスを **1 本の**パラメータ化 WGSL シェーダに統合 |
+| `fx` | 6,660 → 3,818 | ステートレス GPU パーティクル。**レシピ 2,051 行は 6 行の変更で再利用** |
+| `audio` | 4,241 → 4,269 | Web Audio。**Three 非依存だったのでほぼ無改変** |
+
+### 「移植しなくてよかった」もの — この作業で最も効いた判断
+
+作業前に `grep -l "from 'three'"` を全ファイルに掛けたところ、**約 11,951 行が描画
+ライブラリに依存していない**ことが分かりました:
+
+| ファイル | 行数 | 中身 |
+|---|---|---|
+| `src/audio/*` | 4,241 | Web Audio による音響合成一式 |
+| `src/fx/{impacts,muzzle,explosions,tracers,util}.js` | 2,051 | surface 別の着弾レシピ |
+| `src/weapons/{defs,mathx,clips}.js` + `models/*` | 2,196 | 実銃の寸法と弾道データ |
+| `src/world/{layout,palette}.js` | 842 | 街のレイアウトと配色 |
+| `src/player/{tuning,springs}.js` | 478 | MW/MWII 実測の操作感パラメータ |
+| `src/physics/surfaces.js` | 143 | 12 種の surface 語彙と LAYER/MASK |
+
+これらは「移植の対象」ではなく **資産**でした。新しいコードを書く前にこれを確かめる
+かどうかで、作業量が倍違います。
+
+**ただし `import` を見るだけでは不十分**でした。`fx/muzzle.js` は import 上は Three
+非依存でしたが、`fx.ctx.camera` に Three の *API 形状*
+(`cam.matrixWorldInverse.elements`) を仮定していました。6 行の修正が必要でした。
+
+## 決定性 — このプロジェクトの中核資産
+
+本家の最大の成果は「キャプチャが bit-identical で、`tools/imagediff.mjs` が exit code
+による決定的な pixel gate として機能する」ことでした。最適化パスが「視覚的変化ゼロ」を
+*主張* ではなく *証明* できたのはこのためです。
+
+移植でこれを守るのが最優先課題でした。
+
+**まず本体より先にゲートを作りました** (`tools/webgpu-probe.mjs`)。WebGPU が headless で
+本物の GPU アダプタを掴み、2 回の実行が bit-identical になることを確認してから移植に
+着手しています。ここが赤なら移行しない方がよい、というだけの重みがある判定でした。
+
+```
+webgpu: true / adapter: apple metal-3 (フォールバックではない)
+2 runs bit-identical, maxDelta 0
+```
+
+### 実際に決定性を壊していたもの
+
+ゲームを組み上げた後、2 回の実行で **29% のピクセルが最大 21 ずれる**状態になりました。
+二分探索の結果:
+
+| 設定 | maxDelta | changed% |
+|---|---|---|
+| 全部有効 | 21 | 29.5 |
+| mblur=0 | 16 | 31.5 |
+| taa=0 & mblur=0 | 190 | 82.6 |
+| gtao=0 & mblur=0 | 1 | 0.1 |
+
+**TAA を切ると悪化する**のが決定的な手がかりでした。TAA は原因ではなく、SSAO のノイズを
+フレーム間で平均して隠していただけです。「時間的効果が怪しい」と決めつけていたら
+辿り着けませんでした。
+
+真犯人は Babylon 内部の `Math.random()` (`thinSSAO2PostProcess.js:205` が AO の
+サンプルカーネルを生成)。**規約はライブラリの中まで届きません。** キャプチャモードに
+限り `Math.random` 自体をシード付き実装に差し替えることで解決しました。
+
+### さらに 2 つの原因
+
+**prewarm が実時計で engine.step() を回していた。** キャプチャ用の固定時計パッチを
+当てる *前* に prewarm が 2 フレーム進めていたため、`time.elapsed` が run ごとにブレて
+いました。切り分けに時間を要したのは、CPU 側の指標 (乱数消費回数 76301・rng 状態・
+frame・三角形数) がすべて完全に一致していたためです。**time.elapsed も CPU 状態の
+一部**でした。
+
+**SSAO とモーションブラーには制御できない GPU 由来の非決定性が残ります。**
+`Math.random` をシードしても消えません。二分探索で、ベースシーン・影・
+clustered lighting・bloom・TAA はすべて決定的で、この 2 つだけが揺れることを確認
+しました。
+
+「許容誤差を緩める」ではなく **決定的キャプチャではこの 2 つを外す**判断をしました。
+maxDelta 71 を許容する gate は実際の退行をほぼ検出できず、gate として機能しないため
+です。代償として **AO とモーションブラーだけを変える修正は gate をすり抜けます**
+(絵の評価は製品と同じ設定で撮る `tools/shotset.mjs` 側で行います)。
+
+### 最終結果 — 全 11 ショット、2 回実行の差分
+
+```
+imagediff --tol=1 で withinEpsilon: true / exit 0   ← ゲートは通る
+完全に bit-identical (maxDelta 0) なショット数は 5〜9 / 11 で run ごとに変動
+差が出るショットの maxDelta は 1〜2 (最下位ビット 1〜2 段)
+```
+
+**出どころは clustered lighting** です。二分探索で `clustered=0` にすると完全な 0 に
+なることを確認しています。GPU 上でタイルごとにライトを積む順序が実行ごとに変わりうる
+ため、最下位ビットが揺れます。
+
+「どのショットが 0 になるか」が run ごとに変わるのはそのためで、**2 LSB を超える差は
+一度も観測していません**。実際の退行 (ジオメトリ・マテリアル・ライティング・空・露出・
+HUD の変更) は maxDelta が 2 桁以上になるので、この許容幅で十分検出できます。
+
+**既知の劣化**: Havok はクロスプラットフォームでの bit-identical を保証しません
+(浮動小数の丸めが CPU 命令セットに依存しうる)。同一マシンでの run-to-run 再現性は
+担保できますが、CI のマシンを変えたらベースラインは撮り直しが必要です。本家は全演算が
+JS だったぶん移植性が高く、これは移行による明確なトレードオフです。
+
+## ツール
+
+本家の「面白いのはゲームではなくハーネス」という指摘はこのフォークでも同じで、移植の
+成否はハーネスが握っていました。
 
 | tool | purpose |
 |---|---|
-| `tools/capture.mjs` | Screenshot one named shot via GPU-backed headless Chromium |
-| `tools/shotset.mjs` | All 11 shots in one session — fast review set |
-| `tools/baseline.mjs` | **Reproducible** capture: each shot in an isolated page, fixed frame budget. Bit-identical across runs |
-| `tools/imagediff.mjs` | Per-pixel gate. Exits non-zero if any pixel moved |
-| `tools/profile.mjs` | Gameplay profiler at real device pixel ratio. Frame-time *distribution* and hitch attribution via per-frame WebGL program counts |
-| `tools/playtest.mjs` | Scripted movement/fire smoke test |
+| `tools/webgpu-probe.mjs` | **移植より先に作った。** WebGPU が headless で決定的に動くかを判定 |
+| `tools/wgsl-lint.mjs` | WGSL の予約語と、テンプレートリテラル内のバッククォートを検出 |
+| `tools/matbake.mjs` | 19 サーフェスを焼いて **統計で**合否判定 |
+| `tools/capture.mjs` | 1 ショットを GPU-backed headless Chromium で撮影 |
+| `tools/baseline.mjs` | **再現可能な**キャプチャ。ショットごとにページを分離、固定フレーム予算 |
+| `tools/imagediff.mjs` | ピクセル単位のゲート。1 px でも動けば exit non-zero |
+| `tools/profile.mjs` | 実 DPR でのゲームプレイ計測。フレーム時間の *分布* と、`?systime=1` による**サブシステム別のヒッチ内訳** |
+| `tools/playtest.mjs` | スクリプト化された移動/射撃のスモークテスト |
 
-Two findings worth recording, because both invalidated earlier measurements:
+### 記録しておく価値のある発見
 
-**Median frame time hides the actual problem.** A static-camera benchmark reported
-94 fps while the game was unplayable. Real gameplay at Retina DPR (internal 3.34 MP,
-not 2.07) ran 12–17 fps with **728–1236 ms stalls** caused by 34+ WebGL programs
-compiling lazily mid-frame. `profile.mjs` reports p50/p95/p99 and attributes each
-hitch, which is what surfaced it.
+**「コンパイルが通った」を「動いた」と読み替えてはいけない。**
 
-**Captures were not reproducible.** `shotset.mjs` reuses one page across all 11
-shots, so particle age, decal buffers and exposure state leak forward — two identical
-runs differed on 10 of 11 shots. `baseline.mjs` isolates each shot in a fresh page,
-which is bit-identical and is what makes `imagediff.mjs` a usable gate.
+WGSL で `let macro = ...` と書きました。`macro` は予約語です。起きたことは:
 
-## Performance
+- Babylon の `ProceduralTexture.isReady()` は **true を返した**
+- `render()` も例外を投げず、テクスチャは **真っ黒のまま焼き上がった**
+- エラーは `GPUValidationError` としてブラウザ console にしか出ない
 
-Measured on an Apple silicon laptop at 1512×982, DPR 2 (3.34 MP internal), `ultra` preset,
-3 runs, gameplay in motion with AI and firing active:
+つまり「例外なし・isReady()=true・でも絵は真っ黒」。`matbake.mjs` が「焼き上がりの
+分散がゼロなら失敗」と統計で判定していたから捕まりました。この判定基準も一度直して
+います — 当初 albedo の 8bit 絶対分散で見ていて、暗いゴム (albedo 0.024) を誤検出
+しました。**暗い素材ほど 8bit 分散が小さくなる**ので、全分岐が必ず変調する height の
+分散で判定する方式に変えました。
 
-| | before optimization | after |
+**同じ罠は fps でも踏みました。** SSAO を prepass 経路に変えたら fps が 83 → 400 に
+跳ねました。成果だと思いかけましたが、画像を開いたら **3D が一切描かれておらず DOM の
+HUD だけ**でした。数値だけ見ていたら「6 倍速くなった」と報告していました。
+
+**ハーネスが原因を隠すこともあります。** パーティクルを 1 つ出すと画面全体が黒くなる
+不具合の調査に数時間を費やしました。真因は WebGPU の頂点バッファ上限 (8 スロット) の
+超過でしたが、`capture.mjs` が **末尾 60 行しかログを出していなかった**ため、
+原因を名指しする 1 次エラーが「invalid due to a previous error」の洪水に流されて
+見えていませんでした。表示されるのは巻き添えで倒れた *別のパス* の名前だけで、
+そのため誤った仮説を長く追いました。今は 1 次エラーを抽出して先頭に出します。
+
+加えて **Babylon は WebGPU の uncaptured error を `console.warn` で流します**
+(error ではない)。type で error だけを拾うフィルタでは捕まりません。
+
+**中央値のフレーム時間は実際の問題を隠す** (本家と同じ教訓)。p50 は 54fps で健全なのに
+p99 は 3fps でした。`?systime=1` でサブシステム別の内訳を取ると:
+
+```
+frame 208  555.1ms  render.draw=554.1ms  _fixed.total=0.2ms  weapons.late=0.1ms
+```
+
+フレーム時間のほぼ全部が `render.draw` の中で、ゲームロジックは 1ms 未満。これで
+探索範囲が一気に狭まりました。
+
+## 現状と積み残し
+
+**動いているもの**: 起動して市場通りが描画され、移動・射撃・リロード・ADS が動作し、
+HUD (ミニマップ / コンパス / キルフィード / 体力 / 弾数 / 被弾表示) が出て、時刻で
+空と照明が変わり、着弾で decal と土煙が出ます。全 11 ショットが pageerror 0 件で
+撮影できます。
+
+### 性能 — 測定できるようになりました
+
+以前ここには「同一設定の連続実行でヒッチが 2% と 33% の間で振れる。環境由来か実装
+由来か切り分けられていない」と書いていました。**振れの主因はマシンの負荷ではなく、
+測定ツールが vsync を切っていなかったことでした。**
+
+ヒッチの判定は `dt > max(2 × median, median + 8)` で、**中央値からの相対**で決まります。
+vsync が効いた run は中央値が 16.6 ms (60 Hz) に張り付いて閾値が 33.2 ms まで上がり、
+ヒッチがほぼ出ません。vsync が効かない run は中央値 7 ms・閾値 15 ms なので、
+**vsync 由来の 16.6 ms フレームが 1 枚混じるだけでヒッチと判定されます**。
+
+```
+同一ビルド・同一マシン・load 0.42〜0.49 で 5 回
+  run 1  p50  7.2ms (139fps)  ヒッチ 34.3%
+  run 4  p50 16.6ms ( 60fps)  ヒッチ  4.4%   ← vsync に張り付いた run
+```
+
+**p50 とヒッチ率が逆相関している**のが決め手でした。「速い run ほどヒッチが多い」のは
+実装の性質ではありえません。`tools/perf.mjs` は元から `--disable-gpu-vsync` を渡して
+いましたが、**ヒッチを測る側の `profile.mjs` が渡していませんでした**。
+
+`--novsync` を足した後の run 間ばらつき (相対四分位範囲):
+
+| 指標 | 修正前 | 修正後 |
 |---|---|---|
-| fps p50 | 12–17 | **28–30** |
-| fps p99 | 4–9 | **14–17** |
-| worst frame | 728–1236 ms | **66–82 ms** |
-| shader compiles during play | 34–35 | **0** |
-| boot | ~9–12 s | **3.7–4.6 s** |
+| ヒッチ率 | 0.67 | **0.033** |
+| p50 | 0.32 | **0.135** |
+| fps | 0.26 | 0.126 |
 
-The optimization pass was constrained to produce **zero visual change**, enforced by
-`imagediff.mjs` rather than by assertion — the shipped build is bit-identical to its
-pre-optimization reference across all 11 shots.
+#### 測定値 (1512x982 / DPR 2 = 3.34 MP、ultra、5 run の中央値)
 
-Shader pre-warm (`src/core/prewarm.js`) is what removed the stalls. Making it
-*provably* pixel-neutral required first fixing subsystems that animated off
-`performance.now()` instead of the engine clock, since any change to boot duration
-otherwise shifted output.
+| 指標 | 値 | 備考 |
+|---|---|---|
+| boot | 2290 ms | ばらつき 0.004。本家は 3.7〜4.6 s |
+| **実効 fps** | **57.6** | wallclock ベース。**報告に使うのはこれ** |
+| dt ベースの fps p50 | 79 | **CPU がどれだけ先行できたかであって、絵の更新レートではない** |
+| p99 / max | 192 / 198 ms | 下記の脈動 |
+| GPU 遅延 (gpuLag) | p50 **846 ms** / max 1146 ms | GPU が CPU からどれだけ遅れているか |
+| draw call | 532 /frame | |
+| 実行中のシェーダコンパイル | **0** | 何度測っても 0 |
 
-## Honest assessment
+**以前ここには「fps p50 135」と書いていましたが、誤解を招く数字でした。**
+`WEBGPU_FLAGS` に `--disable-frame-rate-limit` が入っているため rAF は GPU の完了を
+待たず、**フレーム時間 `dt` から出した fps は「CPU がどれだけ先行できたか」**にしか
+なりません。実際に絵が出た回数は wallclock で数えるしかなく、それが 57.6 fps です。
 
-The goal was to match a modern Call of Duty. **It does not.**
+#### 200 ms の脈動の正体 — GPU 飽和によるフロー制御
 
-Eleven independent adversarial critics scored the frames against that bar. Scores
-went 3.59 → 4.14 → 4.05 → **5.05** out of 10. Two shots reached "CLOSE"; the rest
-remain "AMATEUR". In a blind A/B, **every critic in every round picked the real Call
-of Duty frame.**
+「3 フレームに 1 回 199〜200 ms 止まる」を追ったところ、**実装バグではなく
+ペーシングの問題**でした。
 
-Where it falls short, specifically:
+`queue.onSubmittedWorkDone()` の解決レイテンシ (= GPU が CPU からどれだけ遅れているか)
+を測ると、**常時 0.85〜1.15 秒**あります。CPU が GPU の実スループットの ~2.5 倍で
+先行し続けるため GPU の待ち行列が溜まり、Chrome の renderer↔GPU プロセス間フロー制御が
+**その負債を ~200 ms 単位のブロックで清算**しています。
 
-- **Hands.** Blocky finger slabs that don't convincingly grip the weapon.
-- **Material richness.** Surfaces read as procedural noise rather than photographed
-  reality at close range — the ceiling of generating texture from code.
-- **Characters.** Enemies read as mannequins at distance.
-- **Indirect light.** An approximation, not real GI.
-- **Frame rate.** 28–30 fps at Retina. The art passes tripled geometry cost
-  (5.9M → 11.3M triangles) and optimization recovered about half.
+決定的だったのは解像度を落とした比較です:
 
-A known root cause remains unfixed: the viewmodel light rig in `render/index.js`
-delivers roughly 20× the irradiance per unit albedo that the world does — a plain
-*black* material in the view scene renders at L=110 against a background of 91,
-purely from F0=0.04. Every weapon albedo is cheated to a third of physical to
-compensate, which caps material separation on the most-looked-at object in the game.
+| | 3.34 MP (1512x982 DPR2) | 0.23 MP (640x360 DPR1) |
+|---|---|---|
+| 実効 fps | 57.6 | 128 |
+| gpuLag p50 / max | **846 / 1146 ms** | **9.9 / 18.4 ms** |
+| frame p99 / max | 192 / 198 ms | 13.8 / 15.5 ms |
+| ヒッチ率 | 6.1 % | 0.6 % |
 
-## Process note
+GPU 負荷を 1/14 にすると**負債もヒッチも消えます**。`?post=0` でブロックが ~100 ms に
+半減するのも、タイムアウト値ではなく「GPU 仕事が半分になって負債も半分になる」ためです。
 
-Sequential single-owner passes beat parallel fan-out decisively. Three rounds of six
-agents each owning one directory moved the score +0.46 and left frame-ruining defects
-*higher* than they started (60 → 47 → 66), because tonemapping, sky and indirect light
-are one coupled system and isolated agents kept breaking each other's assumptions.
-One sequential pass with a single owner per coupled concern moved it +1.00 and cut
-defects 66 → 26.
+- **readback は残っていません** (`readPixels` / `mapAsync` / `readTexturePixels` の
+  該当は dev 専用の `materials/bake-test.js` のみ)。sky の再ベイクも GGX 事前フィルタも
+  時刻変更時のみで、900 フレーム中 1 回しか走りません
+- **ヘッドフルでも同じ**なので headless 固有ではありません
 
-The most valuable single result came from an agent contradicting its own brief. Every
-critic for three rounds reported the weapon as "untextured". It wasn't — it was
-specular-dominated, with the diffuse term measured at L=26 against a shipped L=67.
-Prior rounds had been crushing albedos to fight bright-part complaints, which killed
-diffuse and made it worse. The fix was the opposite of what was asked for.
+つまり **GPU の実コストは ~18〜20 ms/frame (3.34 MP ultra)** で、ユーザーに見えるのは
+「~55 fps 相当の絵が、等速ではなく 8 ms × N + 200 ms の脈動で出る」状態です。
+
+**未着手の対策**: in-flight フレーム数に上限 (2 程度) を設けて、超えたらそのフレームの
+描画をスキップする (シミュレーションは継続)。負債が消えて等速になるはずですが、
+描画とシミュレーションを分離する設計変更なので手を付けていません。
+
+#### 参考: 脈動の内訳 (対策前)
+
+`?systime=1` で内訳を取ると、ヒッチの中身は**ほぼ全部 `render.draw`** です。
+
+```
+frame 492  199.9ms  render.draw=193.6ms  _fixed.total=5.1ms  ai.update=0.4ms  progΔ0
+frame 788  199.1ms  render.draw=192.8ms  _fixed.total=5.1ms  ai.update=0.3ms  progΔ0
+frame 717  199.0ms  render.draw=196.5ms  _fixed.total=1.3ms  ai.update=0.4ms  progΔ0
+```
+
+- **シェーダコンパイルではありません** (`progΔ0`、実行中の Effect 数は増えない)
+- 他のサブシステムは合計 5 ms 未満
+- p50 は 7.6 ms なので、**フレーム時間が二極化**しています (速いフレームと 200 ms)
+
+ブロックが `render.draw` に現れるのは、そこがコマンドリングを埋めた場所だからです。
+実際には `queue.submit` 自体は 0.02 ms/frame しかかからず一切ブロックしません
+(wrap して実測)。ブロックはメッシュの draw フェーズに出ることもポスト段に出ることも
+あります。
+
+負荷を変えたときの応答:
+
+| 設定 | p50 | p99 | max | ヒッチ率 |
+|---|---|---|---|---|
+| 既定 | 7.6 | 197.4 | 199.9 | 33.9 % |
+| `?post=0` | 13.6 | 95.8 | **100.9** | **5.9 %** |
+| `?q=high` | 7.8 | 154.4 | 200.0 | 23.8 % |
+| `?clustered=0` | 7.3 | 224.4 | 321.4 | 15.6 % |
+
+`?post=0` で max が半減するのは GPU 仕事が約半分になるからで、閾値やタイムアウトでは
+ありません。`?clustered=0` で悪化するのは、clustered lighting を外すとライトごとの
+パスが増えて GPU 仕事がむしろ増えるためです。
+
+#### 本家の最大の性能問題は再発していません
+
+本家の README にあった「実プレイ中に 34+ 本のシェーダが遅延コンパイルされ
+728〜1236 ms 停止する」は、この移植では発生しません。`?systime=1` でフレームごとに
+Effect 数を記録していますが、**実行中まったく増えません** (上の `progΔ0`)。
+
+理由は構造的なものです。Three 版は「可視 point light 数」がシェーダの permutation key
+だったため、ランプが 1 個視界に入るだけで全マテリアルが再コンパイルされていました。
+Babylon の clustered lighting ではシェーダから見たライト数が常に一定なので、
+**この permutation が原理的に存在しません**。
+
+#### 「測れているか」を先に判定する — `tools/perfsuite.mjs`
+
+上の表を「傾向」としか書けなかった反省から、測定そのものをゲート化しました。
+
+```
+node tools/perfsuite.mjs --port=5173 --runs=5
+```
+
+`profile.mjs` を N 回まわし、**数値を出す前に「その数値が信頼できるか」を判定**します。
+
+1. 測定の前後で load average / CPU 数を取り、**0.5 を超えていたら警告**
+   (測っているのはブラウザではなくマシンの混み具合なので)
+2. run 間のばらつき (相対四分位範囲) を出す
+3. ばらつきが 15% を超えたら **`stable: false` を返して exit 1**
+
+つまり「速い/遅い」ではなく「**測れている/測れていない**」をゲートにします。数字を
+出すこと自体は簡単で、危険なのは振れている数字を確定値として読むことなので、そこを
+機械化しました。実プレイ中のシェーダコンパイル数だけは、ばらつきではなく絶対値 0 で
+見ます (本家最大の性能問題だったため)。
+
+## 移植直後に積み残していたもの — その後の追い込みで解消
+
+移植を終えた時点では、以下を「積み残し」として明記していました。**いずれも解消済み**です。
+
+| 積み残し | 現在 |
+|---|---|
+| IBL が GGX 事前フィルタでない | **実装済み**。roughness 0.25 の球で地平線エッジ勾配 44.8 → 11.2、隣接画素差 -37%。roughness 0 は不変〜シャープ化で、**向きが roughness で逆転する**ことが一律 mip バイアスでない証拠 |
+| ラグドール未移植 (手続き倒れ込みで代替) | **Havok で実装済み**。Babylon 標準の `Physics/v2/ragdoll.js` は関節リミットが `_initJoints()` に渡らない dead code (既定 HINGE が無制限回転) なので不採用とし、`PhysicsBody` + カプセル 11 + `Physics6DoFConstraint` 10 本で自前構築 |
+| 兵士の 2 スケールディテールと RIM 未移植 | **`MaterialPluginBase` で実装済み**。0.19 m 相当で高周波エネルギ +26.9%、gameplay FOV では最大 1 LSB まで落ちる (遠距離で消えるのが正しい挙動。残るべきマクロ側はベースタイルの担当で無改変) |
+| `muzzle` にフラッシュが写らない | **実バグでした** (下記) |
+
+### 追い込みで出てきた「動いてはいるので誰も気付かない」バグ 4 件
+
+いずれも例外も NaN も出さず、絵も壊さず、ゲートを通り続けていたものです。
+
+1. **マズルフラッシュが 1 フレームも描画されていなかった** — TAA の `clampHistory`
+   (下記)
+2. **プレイヤーが仕様の 1/15 の加速でしか動いていなかった** — Babylon の
+   `PhysicsCharacterController.acceleration` が既定 0.05 で、`groundAccel = 92 m/s²`
+   を無条件に上書きしていました。0.95 秒経っても 2.51 m/s (修正後は 1 フレームで
+   4.573 m/s)
+3. **動力学がこの移植で一度も積分されていなかった** — `HavokPlugin` が
+   `executeStep` の delta を捨てるため、`setTimeStep(0)` のまま world step が 0。
+   **デブリもグレネードも一度も落ちていません**でした。キャラクタは自前積分なので
+   無症状
+4. **`tools/playtest.mjs` が `--port` を無視**して常にポート 5173 を測っていました。
+   「変更前と変更後」の比較が成立していませんでした
+
+この移植の最大の教訓は「**エラーが出ない = 動いた、ではない**」でしたが、それには
+数値版があります。**閾値を「0 か 1 か」で置くと「動くが仕様の 1/15」は素通りします。**
+### マズルフラッシュが写らなかった件 — 撮影の問題ではなく実バグでした
+
+以前ここには「`muzzle` ショットにマズルフラッシュ本体は写りません。寿命 52ms と
+シャッターの位相の問題で、銃煙は写っています」と書いていました。**これは誤りでした。**
+
+発射の前後 14 フレームを 1 フレームずつ撮って銃口の最大輝度を測ったところ、
+**どのフレームでも一度も写っていません**でした。遅れて出るのでもありません。
+
+```
+                銃口 (1000-1090 x 620-690) の最大輝度と位置
+taa なし         219-255  (1044-1046, 652-659) = 銃口     毎フレーム写る
+taa あり (既定)   196-208  (1003, 689) = 矩形の角          一度も写らない
+taa あり + clamp 212-229  (1049-1054, 659-666) = 銃口     修正後
+```
+
+原因は Babylon の `TAARenderingPipeline` の `clampHistory` が既定 false だったこと。
+これは履歴ピクセルを周囲 3x3 の min/max にクランプする neighborhood clamping で、
+**これが無い TAA は「履歴 92% + 現フレーム 8%」の指数移動平均でしかなく、数フレーム
+しか存在しない現象を完全に潰します**。つまり撮影の問題ではなく、**実プレイでも銃口は
+光っていませんでした**。
+
+切り分けを長引かせた自分の失敗も記録します。最初に `taa=0` の画像を**目視だけで**
+「フラッシュなし」と誤判断し、そこから「ポストプロセスが犯人」という誤った枝に
+入りました。同じ画像を数値で測ると max 230 が銃口位置に立っており、最初から答えは
+写っていました。「画像は必ず目で見る」は正しいのですが、**明るい背景に対する
+局所ピークは目視では埋もれる**ので、目視と数値の両方が要ります。
+
+あわせて `tools/capture.mjs` をロックステップ化しました。従来は engine の rAF ループを
+止めずに撮っていたため、`grabFrame` と実際のシャッターフレームが一致せず (実測で
+frame 209 / 255 のように毎回違う)、一過性イベントを狙うショットが撮れませんでした。
+
+**本家の Honest assessment のうち、この移植で変わっていないもの**: 手が指の板である
+こと、近距離のマテリアルが手続き的ノイズに見えること、敵が遠景でマネキンに見えること。
+これらは描画 API の問題ではなく制作の問題なので、WebGPU にしても解決しません。
+WebGPU が与えたのは **フレーム予算と、保守できる構造**であって、絵そのものではありません。
+
+## 契約ファイル
+
+`ARCHITECTURE.md` はエージェント間の唯一の調整機構であり、**欠陥メモリ**として
+運用しています。移植中に踏んだ罠 (副作用 import 4 種、beginFrame/endFrame、
+LEVEL 空間と WORLD 空間、WGSL の 8 項目、SSAO と MotionBlur の経路衝突など) は
+すべてそこに記録してあります。新しいエージェントは毎回同じ地雷を踏み直すので、
+一度払ったデバッグ代を二度払わないための装置です。

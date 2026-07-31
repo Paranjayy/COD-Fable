@@ -1,33 +1,27 @@
-import * as THREE from 'three';
+import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
+import { Buffer } from '@babylonjs/core/Buffers/buffer.js';
+import { ShaderMaterial } from '@babylonjs/core/Materials/shaderMaterial.js';
+import { ShaderStore } from '@babylonjs/core/Engines/shaderStore.js';
+import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage.js';
+import { Constants } from '@babylonjs/core/Engines/constants.js';
+import { Vector3, Vector4 } from '@babylonjs/core/Maths/math.vector.js';
 
-/**
- * GPU particle system.
- *
- * One instanced quad per particle. The whole simulation lives in the vertex
- * shader as a closed-form solution of
- *
- *     dv/dt = -k v + g          =>   v(t) = v0 e^-kt + g/k (1 - e^-kt)
- *                                    x(t) = x0 + (v0 - g/k)(1 - e^-kt)/k + g t / k
- *
- * plus a per-particle turbulence term, so the CPU never touches a particle
- * again after it is spawned: no per-frame simulation, no per-frame allocation,
- * no readback. Spawning writes 32 floats into a preallocated interleaved ring
- * buffer and uploads only the dirty span.
- *
- * Two blend modes share the code:
- *   ADDITIVE  premultiplied ONE/ONE — sparks, muzzle flash, fire, tracers.
- *             Order independent, so no sorting is needed.
- *   LIT/alpha src-alpha over — smoke, dust, blood. Shaded with a spherical
- *             fake normal bent by the sprite's own density gradient, wrapped
- *             sun term plus a forward-scatter lobe, so a puff reads as volume.
- *
- * Both fade softly against `render.depthTexture` (linear view depth in metres)
- * so nothing shows a hard intersection line with the world.
- */
+import { WGSL_PARTICLE_VERT, WGSL_PARTICLE_FRAG } from './wgsl/particle.js';
 
+/** 1 粒子あたりの float 数。8 x vec4。 */
 export const STRIDE = 32;
 
-// interleaved slot offsets
+/**
+ * 粒子属性の名前。**WGSL の `attribute` 宣言と 1 対 1 で対応する。**
+ * 片方だけ変えると、その属性だけゼロで届いて静かに壊れる。
+ *
+ * **配列の順序 = インターリーブバッファ内のオフセット順序** (index * 4 float)。
+ * 下の O_* 定数と並びを揃えてあるので、追加・入れ替えは両方を同時に直すこと。
+ */
+const ATTR_KINDS = ['aPS', 'aVS', 'aLife', 'aRot', 'aCol0', 'aCol1', 'aMisc', 'aExtra'];
+
+// インターリーブされたスロットのオフセット (float 単位。ATTR_KINDS と同順)
 const O_PS = 0; // pos.xyz, size0
 const O_VS = 4; // vel.xyz, size1
 const O_LF = 8; // birth, 1/life, drag, gravity
@@ -37,15 +31,21 @@ const O_C1 = 20; // colour B rgb, intensity B
 const O_MS = 24; // tile, softness, alpha, alphaCurve
 const O_EX = 28; // turbAmp, turbFreq, seed, flags
 
-/** Reusable spawn descriptor — spawning must never allocate. */
+/**
+ * 再利用される spawn 記述子。
+ *
+ * **spawn は決してアロケーションしてはならない** (ARCHITECTURE.md Hard rule 5)。
+ * 1 発の着弾で数十粒子が出るので、ここで new すると着弾のたびに GC 圧が跳ねる。
+ * 呼び出し側は `resetSpawn()` で初期化してからフィールドを埋め、`emit` に渡す。
+ */
 export const SP = {
   x: 0, y: 0, z: 0,
   vx: 0, vy: 0, vz: 0,
   size0: 0.2, size1: 0.3, sizeCurve: 1,
   life: 1, delay: 0, drag: 1.4, gravity: 0,
   rot: 0, spin: 0,
-  /** Velocity-aligned smear: length = size * (1 + stretch * speed). ~1 is one
-   *  frame of motion blur at 60 Hz for a centimetre-scale sprite. */
+  /** 速度方向への引き伸ばし。長さ = size * (1 + stretch * speed)。
+   *  1 前後が 60Hz の 1 フレーム相当のモーションブラーになる。 */
   stretch: 0,
   r0: 1, g0: 1, b0: 1, i0: 1,
   r1: 1, g1: 1, b1: 1, i1: 0,
@@ -67,292 +67,220 @@ export function resetSpawn() {
   return s;
 }
 
-/* ------------------------------------------------------------------------- */
-/*  shaders                                                                  */
-/* ------------------------------------------------------------------------- */
+let _shadersRegistered = false;
 
-export const PARTICLE_VERT = /* glsl */ `
-precision highp float;
-
-attribute vec4 aPS;
-attribute vec4 aVS;
-attribute vec4 aLife;
-attribute vec4 aRot;
-attribute vec4 aCol0;
-attribute vec4 aCol1;
-attribute vec4 aMisc;
-attribute vec4 aExtra;
-
-uniform float uTime;
-uniform vec2 uAtlas;   // cols, 1/cols
-
-varying vec2 vUv;
-varying vec4 vCol;
-varying float vViewZ;
-varying float vSoft;
-varying vec2 vQ;
-varying float vAge;
-
-void main() {
-  float t = uTime - aLife.x;
-  float n = t * aLife.y;
-  if ( t < 0.0 || n >= 1.0 ) {
-    vUv = vec2( 0.0 );
-    vCol = vec4( 0.0 );
-    vViewZ = 1.0;
-    vSoft = 1.0;
-    vQ = vec2( 0.0 );
-    vAge = 0.0;
-    gl_Position = vec4( 0.0, 0.0, 2.0, 1.0 );  // behind the far plane: clipped
-    return;
-  }
-
-  float k = max( aLife.z, 0.02 );
-  float e = exp( -k * t );
-  vec3 gk = vec3( 0.0, aLife.w, 0.0 ) / k;
-  vec3 wpos = aPS.xyz + ( aVS.xyz - gk ) * ( ( 1.0 - e ) / k ) + gk * t;
-  vec3 wvel = aVS.xyz * e + gk * ( 1.0 - e );
-
-  // Turbulence: three decorrelated sines. Grows in so particles do not
-  // teleport on their first frame, and contributes to the velocity used for
-  // stretch orientation so drifting smoke leans the right way.
-  float ph = aExtra.z * 6.2831853;
-  float f = aExtra.y;
-  float grow = smoothstep( 0.0, 0.4, n );
-  float amp = aExtra.x * grow;
-  wpos += vec3( sin( t * f * 1.13 + ph ), sin( t * f * 0.79 + ph * 2.1 ), cos( t * f * 1.31 + ph * 1.7 ) ) * amp;
-  wvel += vec3( cos( t * f * 1.13 + ph ), cos( t * f * 0.79 + ph * 2.1 ), -sin( t * f * 1.31 + ph * 1.7 ) ) * ( amp * f );
-
-  vec4 mv = viewMatrix * vec4( wpos, 1.0 );
-  vec3 velView = ( viewMatrix * vec4( wvel, 0.0 ) ).xyz;
-
-  float size = mix( aPS.w, aVS.w, pow( n, max( aRot.w, 0.02 ) ) );
-  vec2 c = position.xy;
-  vec2 off;
-  if ( aRot.z > 0.001 ) {
-    // velocity-aligned: +Y of the sprite runs along screen-space velocity
-    vec2 d = velView.xy;
-    float dl = length( d );
-    vec2 along = dl > 1e-5 ? d / dl : vec2( 0.0, 1.0 );
-    vec2 perp = vec2( -along.y, along.x );
-    float len = size * ( 1.0 + aRot.z * length( velView ) );
-    off = along * ( c.y * len ) + perp * ( c.x * size );
-  } else {
-    float rot = aRot.x + aRot.y * t;
-    float s = sin( rot ), co = cos( rot );
-    off = vec2( c.x * co - c.y * s, c.x * s + c.y * co ) * size;
-  }
-  mv.xy += off;
-
-  vViewZ = -mv.z;
-  vSoft = max( aMisc.y, 0.002 );
-  vQ = off / max( size, 1e-4 ) * 2.0;
-  vAge = n;
-  gl_Position = projectionMatrix * mv;
-
-  vec2 tuv = vec2( mod( aMisc.x, uAtlas.x ), floor( aMisc.x * uAtlas.y ) );
-  vUv = ( uv + tuv ) * uAtlas.y;
-
-  vec3 col = mix( aCol0.rgb, aCol1.rgb, n );
-  float inten = mix( aCol0.w, aCol1.w, n * n );
-  if ( aExtra.w > 0.5 ) inten *= 0.72 + 0.28 * sin( t * 63.0 + ph * 9.0 );  // spark flicker
-  float a = aMisc.z * pow( max( 1.0 - n, 0.0 ), max( aMisc.w, 0.02 ) ) * smoothstep( 0.0, 0.045, n );
-  vCol = vec4( col * inten, a );
-}
-`;
-
-export const PARTICLE_FRAG = /* glsl */ `
-precision highp float;
-
-uniform sampler2D uSprite;
-uniform sampler2D uDepth;
-uniform vec2 uRes;
-uniform vec2 uSoftEnable;
-uniform vec3 uSunDir;   // view space, pointing at the sun
-uniform vec3 uSunCol;
-uniform vec3 uAmbTop;
-uniform vec3 uAmbBot;
-uniform vec3 uUpView;
-uniform vec4 uFog;      // rgb, density
-
-varying vec2 vUv;
-varying vec4 vCol;
-varying float vViewZ;
-varying float vSoft;
-varying vec2 vQ;
-varying float vAge;
-
-layout(location = 0) out vec4 outColor;
-
-void main() {
-  if ( vCol.a <= 0.0 ) discard;
-  vec4 tex = texture2D( uSprite, vUv );
-  float a = tex.a * vCol.a;
-  if ( a < 0.0035 ) discard;
-  vec3 c = vCol.rgb * tex.rgb;
-
-#ifdef LIT
-  float rr = dot( vQ, vQ );
-  vec3 nrm = vec3( vQ, sqrt( max( 0.03, 1.0 - rr ) ) );
-  // Bend the fake sphere normal by the sprite's own density gradient: this is
-  // what turns a soft blob into something with legible internal form.
-  nrm = normalize( nrm - vec3( dFdx( tex.r ), dFdy( tex.r ), 0.0 ) * 7.0 );
-  float ndl = dot( nrm, uSunDir );
-  float wrap = max( 0.0, ( ndl + 0.42 ) / 1.42 );
-  float back = max( 0.0, -ndl );
-  float up = 0.5 + 0.5 * dot( nrm, uUpView );
-  // Irradiance -> radiance: the 1/PI is what keeps a dust puff sitting at the
-  // same exposure as the wall behind it instead of blowing out white.
-  vec3 lit = ( mix( uAmbBot, uAmbTop, up ) + uSunCol * ( wrap * 0.9 + pow( back, 4.0 ) * 0.55 ) ) * 0.3183099;
-  lit *= mix( 1.0, 0.55, clamp( tex.a * 1.1, 0.0, 1.0 ) );  // self-shadowing by density
-  c *= lit;
-#endif
-
-#ifdef SOFT
-  if ( uSoftEnable.x > 0.5 ) {
-    float sceneZ = texture2D( uDepth, gl_FragCoord.xy / uRes ).r;
-    sceneZ = sceneZ > 0.001 ? sceneZ : 1.0e6;   // nothing drawn == infinitely far
-    a *= clamp( ( sceneZ - vViewZ ) / vSoft, 0.0, 1.0 );
-  }
-#endif
-
-  // never let a sprite smear across the lens
-  a *= clamp( ( vViewZ - 0.05 ) / 0.2, 0.0, 1.0 );
-
-  float fogAmt = 1.0 - exp( -uFog.w * vViewZ );
-#ifdef ADDITIVE
-  c *= ( 1.0 - fogAmt );
-  outColor = vec4( c * a, a );
-#else
-  c = mix( c, uFog.rgb, fogAmt );
-  outColor = vec4( c, a );
-#endif
-}
-`;
-
-/* ------------------------------------------------------------------------- */
-/*  ring-buffer storage                                                      */
-/* ------------------------------------------------------------------------- */
-
-let quadGeoSource = null;
-
-function quadSource() {
-  if (!quadGeoSource) {
-    quadGeoSource = new THREE.PlaneGeometry(1, 1, 1, 1);
-  }
-  return quadGeoSource;
+function registerShaders() {
+  if (_shadersRegistered) return;
+  ShaderStore.ShadersStoreWGSL['owParticleVertexShader'] = WGSL_PARTICLE_VERT;
+  ShaderStore.ShadersStoreWGSL['owParticleFragmentShader'] = WGSL_PARTICLE_FRAG;
+  _shadersRegistered = true;
 }
 
 /**
- * A fixed-capacity ring of particles backed by one interleaved buffer.
- * Allocation happens exactly once, in the constructor.
+ * 固定容量のリングバッファに載った 1 層ぶんのパーティクル。
+ *
+ * アロケーションはコンストラクタで 1 回だけ。以降は同じ Float32Array を書き換えて
+ * 差分だけ GPU に上げる。
+ *
+ * ## リングバッファである理由
+ *
+ * 「寿命が尽きた粒子を詰める」処理を一切しないため。詰めると CPU 側で全粒子を
+ * 走査することになり、ステートレス GPU パーティクルの利点が消える。古い粒子は
+ * 上書きされるだけで、生きているうちに上書きされたら **それは容量不足のサイン**
+ * (config.q.particleBudget を上げるか、レシピの粒子数を減らす)。
  */
 export class ParticleLayer {
   /**
    * @param {object} o
-   * @param {number} o.capacity     hard cap, from config.q.particleBudget
+   * @param {number} o.capacity   config.q.particleBudget から
    * @param {'additive'|'lit'} o.mode
-   * @param {THREE.Texture} o.atlas
-   * @param {number} o.cols         atlas columns
-   * @param {boolean} [o.soft]      depth-fade against the scene
+   * @param {BaseTexture} o.atlas
+   * @param {number} o.cols       アトラスの列数
+   * @param {Scene} o.scene
    */
   constructor(o) {
+    registerShaders();
+
     this.capacity = Math.max(16, o.capacity | 0);
     this.mode = o.mode;
     this.cursor = 0;
     this.highWater = 0;
     this.expireAt = -1;
     this.spawned = 0;
+    this.scene = o.scene;
 
-    this.array = new Float32Array(this.capacity * STRIDE);
-    this.ibuf = new THREE.InstancedInterleavedBuffer(this.array, STRIDE, 1);
-    this.ibuf.setUsage(THREE.DynamicDrawUsage);
 
-    const src = quadSource();
-    const geo = new THREE.InstancedBufferGeometry();
-    geo.index = src.index;
-    geo.setAttribute('position', src.getAttribute('position'));
-    geo.setAttribute('uv', src.getAttribute('uv'));
-    const bind = (name, offset) =>
-      geo.setAttribute(name, new THREE.InterleavedBufferAttribute(this.ibuf, 4, offset));
-    bind('aPS', O_PS);
-    bind('aVS', O_VS);
-    bind('aLife', O_LF);
-    bind('aRot', O_RT);
-    bind('aCol0', O_C0);
-    bind('aCol1', O_C1);
-    bind('aMisc', O_MS);
-    bind('aExtra', O_EX);
-    geo.instanceCount = 0;
-    // Particles are world-space in the shader; the mesh transform is identity
-    // and culling must never remove it.
-    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e7);
-    this.geometry = geo;
+    /**
+     * --- ジオメトリ: 1 粒子 = 4 頂点 --------------------------------------
+     *
+     * 粒子ごとに 4 頂点を持ち、同じ属性値を 4 回書く古典的な方式。
+     * インスタンシング機構に依存しないので、Babylon のバージョンや
+     * バックエンドの都合で静かに壊れることがない。
+     *
+     * 代償: 頂点バッファが 4 倍になり (24k 粒子 = 96k 頂点)、emit の書き込みも
+     * 4 倍 (1 粒子 128 float)。着弾 1 発で数十粒子なので実測上は問題にならない。
+     *
+     * なお過去に試したインスタンシング 2 方式 (instanced VertexBuffer /
+     * thinInstanceSetBuffer) が「属性ゼロ」「画面真っ黒」で失敗した根本原因は、
+     * 下の「頂点バッファは 1 本」のコメントにある **WebGPU の頂点バッファ数上限**
+     * だった。方式の問題ではないが、この 4 頂点方式で正しく動いているので戻す
+     * 理由はない。
+     */
+    const mesh = new Mesh(`fx-particles-${o.mode}`, o.scene);
+    const N = this.capacity;
+    /** 各頂点がクアッドのどの隅か。(-0.5..0.5, -0.5..0.5) と UV を兼ねる。 */
+    const corners = new Float32Array(N * 4 * 3);
+    const uvs = new Float32Array(N * 4 * 2);
+    const indices = new Uint32Array(N * 6);
+    const CX = [-0.5, 0.5, 0.5, -0.5];
+    const CY = [-0.5, -0.5, 0.5, 0.5];
+    const UX = [0, 1, 1, 0];
+    const UY = [0, 0, 1, 1];
+    for (let p = 0; p < N; p++) {
+      for (let v = 0; v < 4; v++) {
+        const k = (p * 4 + v) * 3;
+        corners[k] = CX[v];
+        corners[k + 1] = CY[v];
+        corners[k + 2] = 0;
+        const u = (p * 4 + v) * 2;
+        uvs[u] = UX[v];
+        uvs[u + 1] = UY[v];
+      }
+      const o6 = p * 6;
+      const b4 = p * 4;
+      indices[o6] = b4;
+      indices[o6 + 1] = b4 + 1;
+      indices[o6 + 2] = b4 + 2;
+      indices[o6 + 3] = b4;
+      indices[o6 + 4] = b4 + 2;
+      indices[o6 + 5] = b4 + 3;
+    }
+    const vd = new VertexData();
+    vd.positions = corners;
+    vd.uvs = uvs;
+    vd.indices = indices;
+    vd.applyToMesh(mesh, true);
 
+    /**
+     * 粒子ごとの属性。**頂点ごとに同じ値を 4 回持ち、8 属性を 1 本のバッファに
+     * インターリーブする** (1 頂点 = STRIDE=32 float、オフセットは O_* 定数)。
+     *
+     * ## 頂点バッファは必ず 1 本にまとめること (このファイル最大の罠)
+     *
+     * WebGPU の頂点バッファスロット上限は **8 本** (maxVertexBuffers の既定値)。
+     * 以前は属性ごとに `mesh.setVerticesData()` で別バッファを作っており、
+     * position + uv + 8 属性 = **10 本**で上限を超えていた。このとき何が起きるか:
+     *
+     *   - CreateRenderPipeline が「Vertex buffer count (10) exceeds the maximum
+     *     number of vertex buffers (8)」で失敗する
+     *   - 不正なパイプラインを 1 度でも SetPipeline すると、そのフレームの
+     *     **コマンドバッファ全体が invalid になり Queue.Submit ごと捨てられる**
+     *   - 結果、粒子を 1 つ出しただけで **フレーム全体が真っ黒**になる
+     *   - しかもこの検証エラーは console に **error ではなく warning** として
+     *     届く (Babylon が uncaptured error を Logger.Warn で流す)。
+     *     「console にエラーが無い = GPU は正常」と判断してはならない
+     *
+     * 過去に「インスタンス属性が全てゼロで届く」「thin instance でシーン全体が
+     * 消える」と見えていた症状もすべてこれが原因だった (未使用属性が effect から
+     * 削られてバッファ数が 8 以下に収まったときだけ描けていた)。
+     *
+     * Babylon の WebGPU 実装は「同一の GPU バッファを参照し、effect の属性順で
+     * **連続している**属性」を 1 つの GPUVertexBufferLayout にまとめる
+     * (webgpuCacheRenderPipeline._getVertexInputDescriptor)。ただし各属性が
+     * `offset + サイズ <= stride` を満たすことが条件。ここでは 8 x vec4 を
+     * stride 128 byte に詰めるので条件を満たし、position + uv + 本バッファ =
+     * **3 スロット**に収まる。属性の宣言順 (ShaderMaterial の attributes と WGSL)
+     * を ATTR_KINDS と揃えておくこと — 順序が飛び飛びになるとまとめが効かず
+     * スロット数が増える。
+     *
+     * 副次効果として、flush のアップロードも 8 回 → 1 回になる。
+     */
+    this.data = new Float32Array(N * 4 * STRIDE);
+    this._buffer = new Buffer(o.scene.getEngine(), this.data, true, STRIDE);
+    for (let a = 0; a < ATTR_KINDS.length; a++) {
+      // offset / stride は float 単位 (useBytes=false)。サイズは vec4f なので 4。
+      mesh.setVerticesBuffer(this._buffer.createVertexBuffer(ATTR_KINDS[a], a * 4, 4, STRIDE), false);
+    }
+
+    /**
+     * 粒子はシェーダ内でワールド空間に置かれる。メッシュ自体の変換は恒等で、
+     * バウンディングボックスも意味を持たない。**カリングされると全部消える**ので
+     * 必ず常時アクティブにする。
+     */
+    mesh.alwaysSelectAsActiveMesh = true;
+    mesh.isPickable = false;
+    /**
+     * **doNotSyncBoundingInfo は使わない。**
+     *
+     * 半透明メッシュは bounding sphere の中心までの距離でソートされる。同期を
+     * 切ると距離が不定になり、ソートの比較関数が壊れて **フレーム全体が描画
+     * されなくなる** (エラーもワーニングも出ない)。
+     *
+     * 代わりに「巨大な固定の bounding box」を与える。粒子はシェーダ内で
+     * ワールド空間に置かれるためメッシュのバウンディングは意味を持たないが、
+     * ソートが成立する有限の値であることが重要。
+     */
+    mesh.buildBoundingInfo(new Vector3(-1e4, -1e4, -1e4), new Vector3(1e4, 1e4, 1e4));
+    /** 影を落とさない / 物理を持たない印。render と physics が見る。 */
+    mesh.metadata = { owNoShadow: true, owNoCollision: true, owFx: true };
+    // 半透明は最後に描く。加算はさらに後ろ。
+    mesh.renderingGroupId = 0;
+    mesh.alphaIndex = o.mode === 'additive' ? 12 : 10;
+    this.mesh = mesh;
+
+    // --- マテリアル -----------------------------------------------------
     const additive = o.mode === 'additive';
-    this.uniforms = {
-      uTime: { value: 0 },
-      uAtlas: { value: new THREE.Vector2(o.cols, 1 / o.cols) },
-      uSprite: { value: o.atlas },
-      uDepth: { value: null },
-      uRes: { value: new THREE.Vector2(1920, 1080) },
-      uSoftEnable: { value: new THREE.Vector2(0, 0) },
-      uSunDir: { value: new THREE.Vector3(0, 1, 0) },
-      uSunCol: { value: new THREE.Vector3(1, 0.95, 0.86) },
-      uAmbTop: { value: new THREE.Vector3(0.35, 0.42, 0.55) },
-      uAmbBot: { value: new THREE.Vector3(0.16, 0.14, 0.12) },
-      uUpView: { value: new THREE.Vector3(0, 1, 0) },
-      uFog: { value: new THREE.Vector4(0.6, 0.65, 0.72, 0.0) },
-    };
+    const defines = [];
+    if (additive) defines.push('#define ADDITIVE');
+    else defines.push('#define LIT');
 
-    const defines = { SOFT: '' };
-    if (additive) defines.ADDITIVE = '';
-    else defines.LIT = '';
-    if (o.soft === false) delete defines.SOFT;
-
-    const mat = new THREE.ShaderMaterial({
-      name: `fx-particles-${o.mode}`,
-      glslVersion: THREE.GLSL3,
-      uniforms: this.uniforms,
-      vertexShader: PARTICLE_VERT,
-      fragmentShader: PARTICLE_FRAG,
-      transparent: true,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      toneMapped: false,
-      defines,
-      blending: THREE.CustomBlending,
-      blendSrc: additive ? THREE.OneFactor : THREE.SrcAlphaFactor,
-      blendDst: additive ? THREE.OneFactor : THREE.OneMinusSrcAlphaFactor,
-      blendEquation: THREE.AddEquation,
-    });
+    const mat = new ShaderMaterial(
+      `fx-particles-${o.mode}`,
+      o.scene,
+      { vertex: 'owParticle', fragment: 'owParticle' },
+      {
+        attributes: ['position', 'uv', 'aPS', 'aVS', 'aLife', 'aRot', 'aCol0', 'aCol1', 'aMisc', 'aExtra'],
+        uniforms: ['view', 'projection', 'uTime', 'uAtlas', 'uSunDir', 'uSunCol', 'uAmbTop', 'uAmbBot', 'uUpView', 'uFog'],
+        samplers: ['uSprite'],
+        defines,
+        shaderLanguage: ShaderLanguage.WGSL,
+        needAlphaBlending: true,
+      }
+    );
+    mat.backFaceCulling = false;
+    mat.depthFunction = Constants.LESS;
+    /**
+     * 深度は **書かない**。半透明の粒子が深度を書くと、後ろの粒子が消える。
+     * ソートは alphaIndex に任せる。
+     */
+    mat.disableDepthWrite = true;
+    mat.alphaMode = additive ? Constants.ALPHA_ADD : Constants.ALPHA_COMBINE;
+    mat.setTexture('uSprite', o.atlas);
+    mat.setVector4('uAtlas', new Vector4(o.cols, 1 / o.cols, 0, 0));
+    mat.setVector3('uSunDir', new Vector3(0, 1, 0));
+    mat.setVector3('uSunCol', new Vector3(1, 0.95, 0.86));
+    mat.setVector3('uAmbTop', new Vector3(0.35, 0.42, 0.55));
+    mat.setVector3('uAmbBot', new Vector3(0.16, 0.14, 0.12));
+    mat.setVector3('uUpView', new Vector3(0, 1, 0));
+    mat.setVector4('uFog', new Vector4(0.6, 0.65, 0.72, 0));
+    mat.setFloat('uTime', 0);
     this.material = mat;
-
-    this.mesh = new THREE.Mesh(geo, mat);
-    this.mesh.frustumCulled = false;
-    this.mesh.matrixAutoUpdate = false;
-    this.mesh.renderOrder = o.renderOrder ?? (additive ? 12 : 10);
-    this.mesh.visible = false;
-    this.mesh.name = `fx-particles-${o.mode}`;
-    // FX are not level content: keep the render probe's "is the world empty?"
-    // heuristic from counting our sprites as geometry.
-    this.mesh.userData.owProbe = true;
-    this.mesh.userData.owNoShadow = true;
+    mesh.material = mat;
+    mesh.setEnabled(false);
 
     this._dirtyLo = Infinity;
     this._dirtyHi = -Infinity;
     this._wrapped = false;
   }
 
-  /** True while anything might still be alive. */
+  /** 生きている粒子がありうる間 true。 */
   get active() {
-    return this.mesh.visible;
+    return this.mesh.isEnabled();
   }
 
   /**
-   * Write one particle. `s` is the shared {@link SP} descriptor — pass it after
-   * resetSpawn() so nothing leaks between call sites.
+   * 粒子を 1 つ書き込む。`s` は共有の {@link SP}。**resetSpawn() の直後に渡すこと**
+   * (前の呼び出しの値が漏れる)。
    */
   emit(s, now) {
     const i = this.cursor;
@@ -363,50 +291,24 @@ export class ParticleLayer {
     }
     if (i + 1 > this.highWater) this.highWater = i + 1;
 
-    const a = this.array;
-    const b = i * STRIDE;
     const life = Math.max(0.016, s.life);
     const birth = now + s.delay;
+    const D = this.data;
+    const invLife = 1 / life;
 
-    a[b + O_PS] = s.x;
-    a[b + O_PS + 1] = s.y;
-    a[b + O_PS + 2] = s.z;
-    a[b + O_PS + 3] = s.size0;
-
-    a[b + O_VS] = s.vx;
-    a[b + O_VS + 1] = s.vy;
-    a[b + O_VS + 2] = s.vz;
-    a[b + O_VS + 3] = s.size1;
-
-    a[b + O_LF] = birth;
-    a[b + O_LF + 1] = 1 / life;
-    a[b + O_LF + 2] = s.drag;
-    a[b + O_LF + 3] = s.gravity;
-
-    a[b + O_RT] = s.rot;
-    a[b + O_RT + 1] = s.spin;
-    a[b + O_RT + 2] = s.stretch;
-    a[b + O_RT + 3] = s.sizeCurve;
-
-    a[b + O_C0] = s.r0;
-    a[b + O_C0 + 1] = s.g0;
-    a[b + O_C0 + 2] = s.b0;
-    a[b + O_C0 + 3] = s.i0;
-
-    a[b + O_C1] = s.r1;
-    a[b + O_C1 + 1] = s.g1;
-    a[b + O_C1 + 2] = s.b1;
-    a[b + O_C1 + 3] = s.i1;
-
-    a[b + O_MS] = s.tile;
-    a[b + O_MS + 1] = s.soft;
-    a[b + O_MS + 2] = s.alpha;
-    a[b + O_MS + 3] = s.alphaCurve;
-
-    a[b + O_EX] = s.turb;
-    a[b + O_EX + 1] = s.turbFreq;
-    a[b + O_EX + 2] = s.seed;
-    a[b + O_EX + 3] = s.flags;
+    // 4 頂点すべてに同じ値を書く。頂点シェーダは corner (position.xy) だけを
+    // 頂点ごとに変え、それ以外はこの値を共有する。
+    for (let v = 0; v < 4; v++) {
+      const b = (i * 4 + v) * STRIDE;
+      D[b + O_PS] = s.x;      D[b + O_PS + 1] = s.y;        D[b + O_PS + 2] = s.z;       D[b + O_PS + 3] = s.size0;
+      D[b + O_VS] = s.vx;     D[b + O_VS + 1] = s.vy;       D[b + O_VS + 2] = s.vz;      D[b + O_VS + 3] = s.size1;
+      D[b + O_LF] = birth;    D[b + O_LF + 1] = invLife;    D[b + O_LF + 2] = s.drag;    D[b + O_LF + 3] = s.gravity;
+      D[b + O_RT] = s.rot;    D[b + O_RT + 1] = s.spin;     D[b + O_RT + 2] = s.stretch; D[b + O_RT + 3] = s.sizeCurve;
+      D[b + O_C0] = s.r0;     D[b + O_C0 + 1] = s.g0;       D[b + O_C0 + 2] = s.b0;      D[b + O_C0 + 3] = s.i0;
+      D[b + O_C1] = s.r1;     D[b + O_C1 + 1] = s.g1;       D[b + O_C1 + 2] = s.b1;      D[b + O_C1 + 3] = s.i1;
+      D[b + O_MS] = s.tile;   D[b + O_MS + 1] = s.soft;     D[b + O_MS + 2] = s.alpha;   D[b + O_MS + 3] = s.alphaCurve;
+      D[b + O_EX] = s.turb;   D[b + O_EX + 1] = s.turbFreq; D[b + O_EX + 2] = s.seed;    D[b + O_EX + 3] = s.flags;
+    }
 
     if (i < this._dirtyLo) this._dirtyLo = i;
     if (i > this._dirtyHi) this._dirtyHi = i;
@@ -416,31 +318,42 @@ export class ParticleLayer {
     return i;
   }
 
-  /** Upload the dirty span and update per-frame uniforms. Call once per frame. */
+  /**
+   * 差分をアップロードし、毎フレームの uniform を更新する。1 フレームに 1 回呼ぶ。
+   *
+   * **`uTime` はゲーム内の経過秒**であって performance.now() ではない。実時計を
+   * 使うと、キャプチャで boot 時間が変わるだけで粒子の位相が変わり、bit-identical が
+   * 壊れる (README に記録された事故と同じ構図)。
+   */
   flush(now) {
     if (this._dirtyHi >= this._dirtyLo) {
-      const start = this._dirtyLo * STRIDE;
-      const count = (this._dirtyHi - this._dirtyLo + 1) * STRIDE;
-      this.ibuf.addUpdateRange(start, count);
-      this.ibuf.needsUpdate = true;
+      // インターリーブバッファを丸ごと再アップロードする (1 本なので 1 回)。
+      // emit があったフレームだけなので許容範囲。
+      this._buffer.update(this.data);
       this._dirtyLo = Infinity;
       this._dirtyHi = -Infinity;
     }
-    this.uniforms.uTime.value = now;
-    this.geometry.instanceCount = this._wrapped ? this.capacity : this.highWater;
-    this.mesh.visible = now < this.expireAt && this.geometry.instanceCount > 0;
+    this.material.setFloat('uTime', now);
+    const count = this._wrapped ? this.capacity : this.highWater;
+    this.mesh.setEnabled(now < this.expireAt && count > 0);
+  }
+
+  /** 太陽と環境光を更新する。lit レイヤだけが使う。 */
+  setLighting(sunDirView, sunCol, ambTop, ambBot, upView, fog) {
+    const m = this.material;
+    m.setVector3('uSunDir', sunDirView);
+    m.setVector3('uSunCol', sunCol);
+    m.setVector3('uAmbTop', ambTop);
+    m.setVector3('uAmbBot', ambBot);
+    m.setVector3('uUpView', upView);
+    m.setVector4('uFog', fog);
   }
 
   dispose() {
-    this.geometry.dispose();
+    this.mesh.dispose();
     this.material.dispose();
-  }
-}
-
-/** Dispose the module-level quad prototype (called by the FX system). */
-export function disposeQuadSource() {
-  if (quadGeoSource) {
-    quadGeoSource.dispose();
-    quadGeoSource = null;
+    // createVertexBuffer で切り出した VertexBuffer は共有バッファを所有しない
+    // (takeBufferOwnership=false) ので、大本の Buffer はここで自分で捨てる。
+    this._buffer.dispose();
   }
 }

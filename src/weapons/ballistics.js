@@ -1,14 +1,12 @@
-import * as THREE from 'three';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 
 /**
- * Projectile ballistics.
+ * Projectile ballistics — Babylon 移植版 (ロジックは Three 版と同一)。
  *
  * Rounds are simulated, not hitscanned: each shot is a body with a muzzle
- * velocity, gravity and a drag term, stepped at the physics rate. A 9 mm round
- * takes 140 ms to cross a 50 m street and drops about 10 cm doing it, and you
- * can see the tracer travel. Terminal effects (penetration, spall, damage) are
- * handed to `physics.fireBullet()` at the moment of contact so wall penetration
- * and multi-layer hits stay in one place.
+ * velocity, gravity and a drag term, stepped at the physics rate. Terminal
+ * effects は接触の瞬間に `physics.fireBullet()` へ渡す — 貫通・多層ヒットは
+ * physics が一元管理する (自前で当たり判定を持たないこと)。
  */
 
 const GRAVITY = -9.81;
@@ -17,10 +15,10 @@ const MAX_LIVE = 96;
 class Projectile {
   constructor() {
     this.alive = false;
-    this.pos = new THREE.Vector3();
-    this.prev = new THREE.Vector3();
-    this.vel = new THREE.Vector3();
-    this.dir = new THREE.Vector3();
+    this.pos = new Vector3();
+    this.prev = new Vector3();
+    this.vel = new Vector3();
+    this.dir = new Vector3();
     this.damage = 30;
     this.penetration = 1;
     this.dragK = 0.3;
@@ -39,10 +37,10 @@ export class ProjectileSim {
     this.pool = [];
     for (let i = 0; i < MAX_LIVE; i++) this.pool.push(new Projectile());
     this.live = [];
-    this._seg = new THREE.Vector3();
-    this._hitDir = new THREE.Vector3();
-    this._tracerFrom = new THREE.Vector3();
-    this._tracerTo = new THREE.Vector3();
+    this._seg = new Vector3();
+    this._hitDir = new Vector3();
+    this._tracerFrom = new Vector3();
+    this._tracerTo = new Vector3();
     this._tracerPayload = { from: this._tracerFrom, to: this._tracerTo, speed: 800, weapon: null };
     this.stats = { fired: 0, impacts: 0, live: 0 };
   }
@@ -69,12 +67,13 @@ export class ProjectileSim {
       p = this.live[0];
       if (!p) return null;
       this._retire(p);
+      this.live.shift();
     }
     p.alive = true;
-    p.pos.copy(o.origin);
-    p.prev.copy(o.origin);
-    p.dir.copy(o.dir).normalize();
-    p.vel.copy(p.dir).multiplyScalar(o.speed ?? 800);
+    p.pos.copyFrom(o.origin);
+    p.prev.copyFrom(o.origin);
+    p.dir.copyFrom(o.dir).normalize();
+    p.vel.copyFrom(p.dir).scaleInPlace(o.speed ?? 800);
     p.damage = o.damage ?? 30;
     p.penetration = o.penetration ?? 1;
     p.dragK = o.dragK ?? 0.3;
@@ -94,13 +93,14 @@ export class ProjectileSim {
   /** One tracer per burst of rounds: muzzle to wherever the round will land. */
   _emitTracer(p, speed) {
     const phys = this.physics;
-    this._tracerFrom.copy(p.pos);
+    this._tracerFrom.copyFrom(p.pos);
     let dist = Math.min(p.maxRange, 260);
     if (phys) {
       const hit = phys.raycast(p.pos, p.dir, dist, phys.MASK?.BULLET);
       if (hit?.hit) dist = hit.distance;
     }
-    this._tracerTo.copy(p.pos).addScaledVector(p.dir, dist);
+    this._tracerTo.copyFrom(p.pos);
+    p.dir.scaleAndAddToRef(dist, this._tracerTo);
     this._tracerPayload.speed = speed;
     this._tracerPayload.weapon = p.weapon;
     this.ctx.events.emit('bullet:tracer', this._tracerPayload);
@@ -110,20 +110,20 @@ export class ProjectileSim {
     const phys = this.physics;
     for (let i = this.live.length - 1; i >= 0; i--) {
       const p = this.live[i];
-      p.prev.copy(p.pos);
+      p.prev.copyFrom(p.pos);
       // gravity + a linear drag term (good enough over game distances)
       p.vel.y += GRAVITY * h;
       const decay = Math.max(0, 1 - p.dragK * h);
-      p.vel.multiplyScalar(decay);
-      p.pos.addScaledVector(p.vel, h);
+      p.vel.scaleInPlace(decay);
+      p.vel.scaleAndAddToRef(h, p.pos);
       p.age += h;
 
-      this._seg.copy(p.pos).sub(p.prev);
+      this._seg.copyFrom(p.pos).subtractInPlace(p.prev);
       const segLen = this._seg.length();
       p.travelled += segLen;
 
       if (segLen > 1e-6 && phys) {
-        this._hitDir.copy(this._seg).divideScalar(segLen);
+        this._hitDir.copyFrom(this._seg).scaleInPlace(1 / segLen);
         const hit = phys.raycast(p.prev, this._hitDir, segLen, phys.MASK?.BULLET);
         if (hit?.hit) {
           // Contact: hand the round to the penetration solver, which emits

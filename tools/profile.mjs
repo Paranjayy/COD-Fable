@@ -16,6 +16,7 @@
  *   node tools/profile.mjs --port=8080 --dpr=2 --w=1512 --h=982
  */
 import { chromium } from 'playwright';
+import { WEBGPU_FLAGS, CHROMIUM_CHANNEL } from './chromium-flags.mjs';
 import { resolve } from 'node:path';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -27,11 +28,49 @@ const W = Number(args.w ?? 1512);
 const H = Number(args.h ?? 982);
 const DPR = Number(args.dpr ?? 2);
 const FRAMES = Number(args.frames ?? 900);
+/**
+ * `--nofire` で発砲を止める。
+ *
+ * ヒッチの原因が「描画側」なのか「発砲に伴う処理 (弾道・FX・薬莢の剛体生成)」なのかを
+ * 切り分けるため。中央値のフレーム時間だけを見ていると、この区別は絶対に付かない。
+ */
+const NOFIRE = !!args.nofire;
+/** `--noai` で AI の交戦ステージを起動しない。AI 起因のヒッチを切り分けるため。 */
+const NOAI = !!args.noai;
+/**
+ * **`--novsync` で vsync を切る。ヒッチ率を測るときは必須。**
+ *
+ * ## なぜ必要か — 「ヒッチ 2%〜33%」の正体だった
+ *
+ * ヒッチの判定は `dt > max(2 * median, median + 8)` で、**中央値からの相対**で決まる。
+ * vsync が効いていると中央値が 16.6 ms (60 Hz) に張り付き、閾値は 33.2 ms まで上がる
+ * ので、ヒッチはほとんど検出されない。vsync が効かない run では中央値が 7 ms 前後に
+ * なり、閾値は 15 ms に下がるため、**vsync 由来の 16.6 ms フレームが 1 枚混じるだけで
+ * ヒッチと判定される**。
+ *
+ * 実測 (同一ビルド・同一マシン・load 0.42〜0.49 で 5 回):
+ *
+ *   run 1  p50  7.2ms (139fps)  ヒッチ 34.3%
+ *   run 2  p50  7.1ms (141fps)  ヒッチ 34.4%
+ *   run 3  p50  9.6ms (104fps)  ヒッチ 13.0%
+ *   run 4  p50 16.6ms ( 60fps)  ヒッチ  4.4%   ← vsync に張り付いた run
+ *   run 5  p50  7.5ms (133fps)  ヒッチ 31.8%
+ *
+ * **p50 とヒッチ率が逆相関している** のが決め手。「速い run ほどヒッチが多い」のは
+ * 実装の性質ではありえず、閾値が中央値に連動しているせい。README に長く
+ * 「ヒッチが 2% と 33% の間で振れる、環境由来か実装由来か切り分けられていない」と
+ * 書いていたが、その振れの主因はマシンの負荷ではなくこれだった。
+ *
+ * `tools/perf.mjs` は元から `--disable-gpu-vsync` を渡していたが、**ヒッチを測る側の
+ * このツールが渡していなかった**。
+ */
+const NOVSYNC = !!args.novsync;
 
 const browser = await chromium.launch({
   headless: true,
-  args: ['--use-angle=metal', '--ignore-gpu-blocklist', '--mute-audio',
-         '--disable-frame-rate-limit', '--disable-gpu-vsync'],
+  // WebGPU を掴むには軽量な headless-shell ではなく full Chrome binary が要る。
+  channel: CHROMIUM_CHANNEL,
+  args: NOVSYNC ? [...WEBGPU_FLAGS, '--disable-gpu-vsync'] : WEBGPU_FLAGS,
 });
 const page = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: DPR });
 const errs = [];
@@ -48,31 +87,79 @@ const bootMarks = await page.evaluate(() =>
   performance.getEntriesByType('measure').map((m) => ({ name: m.name, ms: +m.duration.toFixed(1) }))
     .sort((a, b) => b.ms - a.ms).slice(0, 25));
 
+/**
+ * 内部解像度の実測。
+ *
+ * Three 版は WebGL の drawingBuffer を直接読んでいたが、Babylon では
+ * `engine.getRenderWidth()/getRenderHeight()` が実際に描いている解像度を返す。
+ * **CSS ピクセルではなく内部解像度を見ること** — README に記録された
+ * 「静止カメラで 94fps、実プレイで 12fps」の誤測定は、Retina の内部解像度
+ * (3.34 MP) を 2.07 MP と思い込んでいたことが一因だった。
+ */
 const internal = await page.evaluate(() => {
-  const r = window.__ENGINE__.ctx.peek('render');
-  const gl = r.renderer.getContext();
+  const eng = window.__ENGINE__;
+  const b = eng.babylon;
+  const w = b.getRenderWidth();
+  const h = b.getRenderHeight();
   return {
-    pixelRatio: r.renderer.getPixelRatio(),
-    drawingBuffer: [gl.drawingBufferWidth, gl.drawingBufferHeight],
-    megapixels: +((gl.drawingBufferWidth * gl.drawingBufferHeight) / 1e6).toFixed(2),
-    quality: window.__ENGINE__.config.quality,
-    renderScale: window.__ENGINE__.config.q.renderScale,
+    backend: eng.backend,
+    hardwareScaling: b.getHardwareScalingLevel(),
+    drawingBuffer: [w, h],
+    megapixels: +((w * h) / 1e6).toFixed(2),
+    quality: eng.config.quality,
+    renderScale: eng.config.q.renderScale,
   };
 });
 
 // Enable player control and run a scripted gameplay sequence while sampling.
-await page.evaluate(() => {
+await page.evaluate((noai) => {
+  window.__NOAI__ = noai;
   const e = window.__ENGINE__;
   e.input.enabled = true; e.input.frozen = false;
   e.ctx.peek('player')?.setControlEnabled?.(true);
-  e.ctx.peek('ai')?.debugStage?.('firefight');
-});
+  if (!window.__NOAI__) e.ctx.peek('ai')?.debugStage?.('firefight');
+}, NOAI);
 
-const result = await page.evaluate((FRAMES) => new Promise((done) => {
+const result = await page.evaluate(({ FRAMES, NOFIRE }) => new Promise((done) => {
   const e = window.__ENGINE__;
-  const r = e.ctx.peek('render');
   const samples = [];
   let last = performance.now(), i = 0;
+  const wallStart = performance.now();
+
+  /**
+   * **GPU がどれだけ CPU から遅れているか (gpuLag)。**
+   *
+   * `queue.onSubmittedWorkDone()` が解決するまでの時間 = 「今 submit した仕事が
+   * 終わるまでの待ち行列の長さ」。CPU が GPU より速く回せてしまう構成では、ここが
+   * 数百 ms から 1 秒以上に膨らむ。
+   *
+   * ## なぜこの指標が要るのか
+   *
+   * `WEBGPU_FLAGS` には `--disable-frame-rate-limit` が入っており、rAF は GPU の
+   * 完了を待たない。したがって **`dt` から出した fps は「CPU がどれだけ先行できたか」
+   * であって、絵が更新された回数ではない**。CPU が GPU の 2.5 倍で回れば「135 fps」と
+   * 出るが、実際に画面に出ているのは ~55 fps でしかない。
+   *
+   * そして Chrome の renderer↔GPU プロセス間フロー制御は、溜まった負債を **200 ms
+   * 単位のブロック**で清算する。これが「3 フレームに 1 回 200 ms 止まる」の正体で、
+   * シェーダコンパイルでも readback でもタイムアウト値でもない。`?post=0` でブロックが
+   * ~100 ms に半減するのは、GPU 仕事が半分になって負債も半分になるため。
+   *
+   * gpuLag と実効 fps (wallclock ベース) を並べて初めて、「本物のヒッチ (compile /
+   * readback)」と「未ペーシングによる脈動」が区別できる。
+   */
+  const q = e.babylon?._device?.queue ?? null;
+  let gpuLagMs = -1;
+  let lagPending = false;
+  const pollLag = () => {
+    if (!q || lagPending) return;
+    lagPending = true;
+    const t = performance.now();
+    q.onSubmittedWorkDone().then(() => {
+      gpuLagMs = performance.now() - t;
+      lagPending = false;
+    }).catch(() => { lagPending = false; });
+  };
 
   const tick = () => {
     const now = performance.now();
@@ -83,23 +170,49 @@ const result = await page.evaluate((FRAMES) => new Promise((done) => {
     e.camera.rotation.y += 0.006;
     const mv = e.ctx.peek('player');
     if (mv) { try { e.input.down.add('KeyW'); } catch {} }
-    if (i % 90 < 30) { e.input.down.add('Mouse0'); } else { e.input.down.delete('Mouse0'); }
+    if (!NOFIRE && i % 90 < 30) { e.input.down.add('Mouse0'); } else { e.input.down.delete('Mouse0'); }
 
+    /**
+     * `progs` は「コンパイル済みシェーダ (Effect) の本数」。
+     *
+     * README に記録された最大の性能問題は「フレーム中に 34〜35 本のシェーダが
+     * 遅延コンパイルされ 728〜1236ms 停止する」ことだった。**ヒッチと同じフレームで
+     * この数が跳ねていれば、それはシェーダコンパイル由来**と断定できる。
+     * 中央値のフレーム時間だけを見ていると絶対に見つからない類の問題なので、
+     * 必ずフレームごとに記録する。
+     *
+     * Babylon では engine._compiledEffects がコンパイル済み Effect のマップ。
+     * WebGPU ではさらにパイプライン生成のコストが乗るが、その大半は Effect 生成に
+     * 紐づくのでこの指標で追える。
+     */
+    pollLag();
     samples.push({
       i, dt,
-      progs: r.renderer.info.programs?.length ?? 0,
-      calls: r.renderer.info.render.calls,
-      tris: r.renderer.info.render.triangles,
-      geos: r.renderer.info.memory.geometries,
-      texs: r.renderer.info.memory.textures,
+      progs: Object.keys(e.babylon._compiledEffects ?? {}).length,
+      /**
+       * **`_drawCalls.current` は累積値。フレーム差分にすること。**
+       * 生のまま見ると min 55,240 / max 549,064 のような無意味な数字になる
+       * (実際にそう報告していた)。
+       */
+      callsCum: e.babylon._drawCalls?.current ?? 0,
+      tris: (e.scene.getActiveIndices?.() ?? 0) / 3,
+      meshes: e.scene.getActiveMeshes?.().length ?? 0,
+      texs: e.babylon._internalTexturesCache?.length ?? 0,
       heap: performance.memory ? performance.memory.usedJSHeapSize >> 20 : 0,
+      gpuLag: gpuLagMs,
+      // ?systime=1 のときだけ埋まる。ヒッチの内訳を名指しするための内訳。
+      sys: e.sysTime ? { ...e.sysTime } : null,
     });
 
-    if (++i >= FRAMES) return done(samples);
+    if (++i >= FRAMES) {
+      // wallclock は「実際に何秒かかったか」。dt の中央値から出す fps と違い、
+      // CPU の先行では水増しされない。
+      return done({ samples, wallMs: performance.now() - wallStart });
+    }
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
-}), FRAMES);
+}), { FRAMES, NOFIRE });
 
 // Discard the first 60 frames: control handover and the first shadow-cascade fit
 // are one-time costs, not steady state.
@@ -108,7 +221,7 @@ const result = await page.evaluate((FRAMES) => new Promise((done) => {
 // a lazily-compiled program lands in exactly those discarded frames, so the
 // default view is blind to the stall the pre-warm exists to remove.
 const WARMUP = Number(args.warmup ?? 60);
-const warm = result.slice(WARMUP);
+const warm = result.samples.slice(WARMUP);
 const dts = warm.map((s) => s.dt).sort((a, b) => a - b);
 const q = (p) => +dts[Math.min(dts.length - 1, Math.floor(dts.length * p))].toFixed(2);
 const med = q(0.5);
@@ -119,7 +232,15 @@ const hitches = warm
     const prev = warm[warm.indexOf(s) - 1];
     return {
       frame: s.i, ms: +s.dt.toFixed(1),
-      progDelta: prev ? s.progs - prev.progs : 0,
+      // ヒッチのフレームで最も時間を食ったサブシステム上位 3 つ。
+    top: s.sys
+      ? Object.entries(s.sys)
+          .filter(([k]) => !k.startsWith('_fixed.steps'))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([k, v]) => `${k}=${(+v).toFixed(1)}ms`)
+      : null,
+    progDelta: prev ? s.progs - prev.progs : 0,
       geoDelta: prev ? s.geos - prev.geos : 0,
       texDelta: prev ? s.texs - prev.texs : 0,
     };
@@ -132,14 +253,43 @@ console.log(JSON.stringify({
   internal,
   frames: warm.length,
   frameTimeMs: { p1: q(0.01), p50: med, p90: q(0.9), p95: q(0.95), p99: q(0.99), max: q(1) },
+  /**
+   * **`fps.p50` は「CPU がどれだけ先行できたか」であって絵の更新レートではない。**
+   * `--disable-frame-rate-limit` により rAF は GPU の完了を待たないため、CPU が
+   * GPU の 2.5 倍で回れば 135 と出る。実際に絵が出た回数は `effectiveFps`。
+   * **報告に使うのは `effectiveFps` の方。**
+   */
   fps: { p50: +(1000 / med).toFixed(0), p95: +(1000 / q(0.95)).toFixed(0), p99: +(1000 / q(0.99)).toFixed(0) },
+  /**
+   * wallclock ベースの実効フレームレート。CPU の先行では水増しされない。
+   * warmup を含む全フレームを実経過時間で割る (wallclock は計測開始からの通算なので、
+   * warmup 分だけを差し引くことはできない)。
+   */
+  effectiveFps: +(result.samples.length / (result.wallMs / 1000)).toFixed(1),
+  wallMs: +result.wallMs.toFixed(0),
+  /**
+   * GPU が CPU からどれだけ遅れているか (`onSubmittedWorkDone` の解決レイテンシ)。
+   * 数百 ms〜1 秒に膨らんでいたら「未ペーシングによる脈動」で、シェーダコンパイルや
+   * readback による本物のヒッチとは別物。
+   */
+  gpuLagMs: (() => {
+    const v = warm.map((s) => s.gpuLag).filter((x) => x >= 0).sort((a, b) => a - b);
+    if (!v.length) return null;
+    return { p50: +v[v.length >> 1].toFixed(1), max: +v[v.length - 1].toFixed(1), samples: v.length };
+  })(),
   hitchCount: hitches.length,
   hitchPctOfFrames: +((hitches.length / warm.length) * 100).toFixed(2),
   worstHitches: hitches.sort((a, b) => b.ms - a.ms).slice(0, 15),
   programs: { start: first.progs, end: lastS.progs, compiledDuringPlay: lastS.progs - first.progs },
   resources: { geosStart: first.geos, geosEnd: lastS.geos, texStart: first.texs, texEnd: lastS.texs },
   heapMb: { start: first.heap, end: lastS.heap, growth: lastS.heap - first.heap },
-  drawCalls: { min: Math.min(...warm.map(s=>s.calls)), max: Math.max(...warm.map(s=>s.calls)) },
+  /** フレーム差分。`_drawCalls.current` は累積値なので生のまま出すと無意味。 */
+  drawCallsPerFrame: (() => {
+    const d = [];
+    for (let n = 1; n < warm.length; n++) d.push(warm[n].callsCum - warm[n - 1].callsCum);
+    d.sort((a, b) => a - b);
+    return d.length ? { p50: d[d.length >> 1], min: d[0], max: d[d.length - 1] } : null;
+  })(),
   errors: errs.slice(0, 6),
 }, null, 2));
 

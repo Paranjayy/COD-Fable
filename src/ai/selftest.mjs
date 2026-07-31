@@ -194,12 +194,14 @@ console.log('\nalbedo budget — map avg x vertex tint, per part (linear)');
     }
     MAP_AVG.cloth = s / (N * N);
     const built = buildSoldier(vname, { rng: new Rng(7).fork(), materials: stub });
-    const col = built.geometry.getAttribute('color');
+    // Babylon 移植後: geometry は生配列レコード (colors = Float32Array, stride 3)
+    const col = built.geometry.colors;
     const rows = [];
     for (const p of built.parts) {
       let r = 0, g = 0, b = 0;
       for (let i = 0; i < p.count; i++) {
-        r += col.getX(p.start + i); g += col.getY(p.start + i); b += col.getZ(p.start + i);
+        const o = (p.start + i) * 3;
+        r += col[o]; g += col[o + 1]; b += col[o + 2];
       }
       const vc = lum([r / p.count, g / p.count, b / p.count]);
       const map = MAP_AVG[p.material] ?? 0.1;

@@ -1,11 +1,12 @@
 import { Engine } from './core/engine.js';
 import { createConfig } from './core/config.js';
+import { installDeterministicRandom, randomCallCount } from './core/determinism.js';
 
-import { RenderSystem } from './render/index.js';
 import { MaterialSystem } from './materials/index.js';
 import { SkySystem } from './sky/index.js';
-import { WorldSystem } from './world/index.js';
+import { RenderSystem } from './render/index.js';
 import { PhysicsSystem } from './physics/index.js';
+import { WorldSystem } from './world/index.js';
 import { PlayerSystem } from './player/index.js';
 import { WeaponSystem } from './weapons/index.js';
 import { FxSystem } from './fx/index.js';
@@ -18,28 +19,113 @@ import { prewarm } from './core/prewarm.js';
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
-// Deterministic shutter for the pixel gate: the engine does not schedule its own
-// frames, the driver advances exactly N of them through window.__PUMP__. Opt-in,
-// because tools that measure real frame pacing (tools/perf.mjs) need the loop to
-// free-run. See the long comment in src/dev/shots.js.
+/**
+ * 決定的シャッター用のロックステップ。
+ *
+ * engine 自身はフレームを回さず、ドライバが window.__PUMP__ で正確に N フレーム
+ * 進める。opt-in なのは、実フレームレートを測るツール (tools/profile.mjs) では
+ * ループを自走させる必要があるため。詳細は src/dev/shots.js のコメント。
+ */
 const lockstep = capture && params.get('lockstep') === '1';
 
 const config = createConfig({
   quality: params.get('q') ?? 'ultra',
   deterministic: capture,
+  /**
+   * バックエンドは既定で自動 (WebGPU → 駄目なら WebGL2)。
+   *
+   * **キャプチャ時は必ず明示すること。** バックエンドが違えばピクセルは当然一致
+   * しないので、自動フォールバックが黙って起きた状態でベースラインを撮ると
+   * 「最適化で絵が変わった」と誤診する。tools/capture.mjs は常に ?backend=webgpu を
+   * 付ける。
+   */
+  backend: params.get('backend') ?? undefined,
 });
+
+/**
+ * 切り分け用のフラグ。品質プリセットの個々の機能を URL から落とせる。
+ *
+ * ポストプロセスは互いに影響するうえ、WebGPU のエラーは「どのパスが原因か」を
+ * 教えてくれないことが多い。プリセット単位でしか切り替えられないと二分探索が
+ * できないため、機能ごとの穴を開けてある。
+ */
+for (const [key, flag] of [
+  ['clustered', 'clusteredLights'],
+  ['taa', 'taa'],
+  ['gtao', 'gtao'],
+  ['mblur', 'motionBlur'],
+  ['bloom', 'bloom'],
+]) {
+  const v = params.get(key);
+  if (v === '0') config.q[flag] = false;
+  else if (v === '1') config.q[flag] = true;
+}
+
+/**
+ * 決定的キャプチャでは render が SSAO とモーションブラーを強制的に切る
+ * (GPU 由来の非決定性のため。理由は src/render/index.js のコメント)。
+ * `?gtao=1` / `?mblur=1` を明示したときだけその上書きを尊重する。
+ */
+/**
+ * `?fxparticles=0` でパーティクル層を無効化できる (切り分け用)。既定は有効。
+ * かつて既定無効だった理由 (WebGPU の頂点バッファ数上限で真っ黒になるバグ) は
+ * 解決済み — 経緯は src/fx/particles.js のコメント参照。
+ */
+config.fxParticles = params.get('fxparticles') !== '0';
+
+/**
+ * `?ragdoll=0` で敵の死亡演出を Havok ラグドールから手続き倒れ込み
+ * (src/ai/deathfall.js の DeathFall) にフォールバックできる。既定は有効。
+ * DeathFall は完全決定的なので、ラグドール起因の揺れを疑うときの切り分けと、
+ * 決定性キャプチャの逃げ道として残してある (経緯は deathfall.js 冒頭)。
+ */
+config.ragdoll = params.get('ragdoll') !== '0';
+
+config.forcePost = {
+  gtao: params.get('gtao') === '1' ? true : undefined,
+  mblur: params.get('mblur') === '1' ? true : undefined,
+};
+
+// 切り分け用: ?post=0 でポストプロセスを丸ごと外す。
+if (params.get('post') === '0') config.post = false;
+
+/**
+ * **Babylon のオブジェクトを 1 つでも作る前に**乱数を決定化する。
+ *
+ * Babylon 内部 (SSAO のサンプルカーネル等) が Math.random() を使っており、
+ * ページを読むたびに別の絵になる。詳細と実測値は src/core/determinism.js を参照。
+ * SSAO のカーネルはパイプラインのコンストラクタで作られるので、engine 生成後に
+ * 差し替えても手遅れになる。
+ */
+if (config.deterministic) installDeterministicRandom();
 
 const canvas = document.getElementById('game');
 
-const engine = new Engine({ canvas, config });
+// WebGPU の初期化が非同期なので、Engine は静的ファクトリで作る。
+const engine = await Engine.create({ canvas, config });
 
-// Registration order is irrelevant — Registry topo-sorts on static deps.
+/**
+ * 登録順は無関係 — Registry が static deps でトポロジカルソートする。
+ *
+ * 依存関係:
+ *   materials → (なし)
+ *   sky       → (なし)
+ *   render    → sky   (太陽の DirectionalLight が無いと CSM を作れない)
+ *   physics   → (なし)
+ *   world     → materials, physics, render
+ *   player    → physics, world, render
+ *   weapons   → materials, physics
+ *   fx        → render, materials, physics
+ *   ui        → render
+ *   audio     → (なし)  physics は実行時に peek するだけなので依存にしない。
+ *                       AudioContext はユーザー操作まで作られないので init は常に成功する。
+ */
 engine
-  .add(RenderSystem)
   .add(MaterialSystem)
   .add(SkySystem)
-  .add(WorldSystem)
+  .add(RenderSystem)
   .add(PhysicsSystem)
+  .add(WorldSystem)
   .add(PlayerSystem)
   .add(WeaponSystem)
   .add(FxSystem)
@@ -57,37 +143,56 @@ try {
        font:12px/1.5 ui-monospace,monospace;overflow:auto;z-index:9999;white-space:pre-wrap">
 BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
   );
+  window.__BOOT_ERROR__ = String(err.stack ?? err.message);
+  window.__READY__ = true; // ハーネスがタイムアウトせず失敗を報告できるようにする
   throw err;
 }
 
+/**
+ * **キャプチャ用の細工を prewarm より先に入れる。順序が意味を持つ。**
+ *
+ * installShotApi は capture モードで `engine.step` を差し替え、フレーム時間を実時計
+ * ではなく固定 1/60 s にする。prewarm は内部で `engine.step()` を 2 回呼ぶ (影と
+ * G バッファのバリアントを作るため) ので、**先に prewarm を走らせるとその 2 フレームが
+ * 実時計で進み、`time.elapsed` が run ごとにブレる**。
+ *
+ * 実測: この順序が逆だったとき、CPU 側の状態 (frame / rng / 乱数消費回数 / 三角形数)
+ * はすべて run 間で完全に一致しているのに、絵は 4〜12% のピクセルが最大 123 ずれて
+ * いた。原因の切り分けに時間を要したのは「CPU が決定的なら絵も決定的なはず」と
+ * 思い込んだため。**time.elapsed も CPU 状態の一部**である。
+ *
+ * README に記録された「boot 時間との結合が視覚的変化に見えた」事故と同じ構図。
+ */
 const shotApi = installShotApi(engine, { capture, lockstep });
 
-// Compile every shader permutation before the frame loop starts. Measured: without
-// this, 86 programs compile lazily during play, up to 30 on one frame, producing
-// 3.1-3.9 SECOND stalls. See src/core/prewarm.js.
-//
-// ON BY DEFAULT since the capture path was made frame-deterministic; opt out with
-// `?prewarm=0`. It is now PROVEN pixel-neutral: `tools/baseline.mjs` with
-// `--query=prewarm=0` vs `--query=prewarm=1` reports identical:true on all 11
-// shots (0 changed pixels, maxDelta 0). The two things that previously made the
-// ~1.4 s pre-warm spend look like a visual change were both boot-duration
-// couplings OUTSIDE the subsystems: (1) the shutter frame index was latency-bound
-// because the engine kept stepping through the driver's round trips — fixed by
-// lockstep in src/dev/shots.js; (2) `will-change: transform` on the compass strip
-// cached a composited-layer raster taken at a wall-clock-dependent moment — fixed
-// in src/ui/style.js.
-const warmup = params.get('prewarm') === '0' ? { ok: false, reason: 'disabled by ?prewarm=0' } : await prewarm(engine);
+/**
+ * ゲームループを回す前に全マテリアルのパイプラインを事前生成する。
+ *
+ * これが無いと、カメラが旋回して新しいメッシュが視界に入るたびに WebGPU の
+ * パイプライン生成で **数百 ms 停止する**。実測は src/core/prewarm.js の冒頭を参照。
+ *
+ * `?prewarm=0` で無効化できる。**pixel gate で「pre-warm の有無で絵が変わらない」
+ * ことを確認するため**の穴で、常用するものではない。
+ */
+const warmup =
+  params.get('prewarm') === '0'
+    ? { ok: false, reason: 'disabled by ?prewarm=0' }
+    : await prewarm(engine);
 console.info('[boot] prewarm', warmup);
 window.__PREWARM__ = warmup;
 
+
+
 engine.start();
 
-// Capture harness handshake: only flag ready once a frame has actually landed.
-//
-// BOOT_FRAMES is deliberately a frame COUNT, not a rAF race. In lockstep mode the
-// engine has no loop of its own, so we hand-pump exactly this many frames and only
-// then raise __READY__; the shot is therefore always applied at engine frame 3, no
-// matter how long boot (or pre-warm) took in wall-clock terms.
+/**
+ * キャプチャハーネスとのハンドシェイク。**フレームが実際に landed してから** ready
+ * を立てる。
+ *
+ * BOOT_FRAMES は意図的に「フレーム数」であって rAF レースではない。ロックステップでは
+ * engine が自分のループを持たないので、この数だけ手で送ってから __READY__ を立てる。
+ * したがってショットは常に engine frame 3 で適用され、boot が何秒かかろうと変わらない。
+ */
 const BOOT_FRAMES = 3;
 if (lockstep) {
   await shotApi.pump(BOOT_FRAMES);
@@ -104,7 +209,20 @@ if (lockstep) {
   requestAnimationFrame(readyProbe);
 }
 
+/**
+ * `?systime=1` でサブシステム別の所要時間計測を有効にする。
+ * tools/profile.mjs がヒッチの内訳を取るために使う。
+ */
+if (params.get('systime') === '1') engine.sysTime = {};
+
 window.__ENGINE__ = engine;
+window.__BACKEND__ = engine.backend;
+/**
+ * 診断用。**キャプチャの実行ごとにこの数が変わるなら、まだどこかに実時計依存や
+ * 環境依存の分岐が残っている** (乱数の消費回数が経路に依存しているということ)。
+ * bit-identical が崩れたときに最初に見る値。
+ */
+window.__RANDOM_CALLS__ = randomCallCount();
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => engine.dispose());

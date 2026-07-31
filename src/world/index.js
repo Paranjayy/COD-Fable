@@ -1,445 +1,637 @@
-import * as THREE from 'three';
-import { Assembler } from './builder.js';
-import { BUILDINGS, STREET, SET_PIECES, GATE } from './layout.js';
-import { buildGround } from './ground.js';
-import { buildBuilding, collapseRoof } from './buildings.js';
-import { registerProps } from './props.js';
-import {
-  registerDressingProps,
-  dressStreet,
-  dressBuildings,
-  scatterDebris,
-  buildGate,
-  buildPerimeter,
-  groundY,
-  isOpen,
-} from './dressing.js';
+import { PointLight } from '@babylonjs/core/Lights/pointLight.js';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Color3 } from '@babylonjs/core/Maths/math.color.js';
+
+import { WorldBuilder } from './builder.js';
+import { STREET, ALLEYS, BUILDINGS, GATE, SET_PIECES } from './layout.js';
 
 /**
- * WORLD — level geometry, the modular building kit, props, set dressing and
- * static collision.
+ * WORLD — 中東の市場通り。約 120x120 m。
  *
- * A ~120 x 120 m Middle-Eastern market street: one main street with a plaza,
- * flanking alleys, eighteen buildings (three of them enterable and furnished
- * across multiple floors), an arched gate closing the vista, and several
- * thousand props. Nothing is loaded from disk — every vertex is generated here.
+ * ## 構成
  *
- * HOW IT FITS TOGETHER
- *   layout.js     the map: footprints, facade programmes, set-piece positions
- *   util.js       geometry toolkit (chamfered boxes, wall panels with real
- *                 holes, cloth grids, catenary tubes, rocks) + vertex masks
- *   kit.js        the modular building kit (facades, windows, doors, balconies,
- *                 stairs, awnings, parapets, drainpipes, damage)
- *   buildings.js  assembles a building from a footprint + a facade programme
- *   interiors.js  furnishes rooms so an interior screenshot is worth taking
- *   props.js      the instanced prop library
- *   dressing.js   places the hundreds of props, cables, laundry and debris
- *   ground.js     terrain, road camber, kerbs, pavement slabs, sand drifts
- *   builder.js    the Assembler: merges statics, batches instances, authors
- *                 collision proxies, bakes the level->world transform
+ *   - アスファルトの本通り (-Z 方向に伸びる) と両脇の歩道
+ *   - 路地・中庭 (ALLEYS)
+ *   - 建物 10 棟 (BUILDINGS)。壁・窓・屋根・バルコニー
+ *   - 遠景を締めるアーチ門 (GATE)
+ *   - 市場の屋台、バリア、土嚢、廃車、ヤシ、街灯、瓦礫、電線 (SET_PIECES)
  *
- * PUBLIC API — `const world = ctx.get('world')`
- *   world.root                THREE.Group holding everything
- *   world.bounds              THREE.Box3 of the playable area, world space
- *   world.spawnPoints         [{ position:Vector3, yaw:number, tag:string }]
- *   world.spawn(i)            one of the above
- *   world.groundHeight(x, z)  cheap analytic floor height (physics is exact)
- *   world.isOpen(x, z)        true where a character can stand outdoors
- *   world.stats               { staticTris, instTris, instances, drawCalls }
- *   world.prewarmMaterials()  compile every shader permutation the world can
- *                             produce, before the frame loop starts. Awaitable.
- *                             Call it from src/core/prewarm.js — see the method.
- *   world.levelToWorld(x,y,z,out) / world.worldToLevel(x,y,z,out)
+ * レイアウトのデータ (layout.js / palette.js = 842 行) は Three.js 版からそのまま
+ * 再利用している。どちらも純粋なデータで描画ライブラリに依存していなかったため、
+ * 移植で失われるものが無い。**この 842 行は移植対象ではなく資産**。
+ *
+ * ## 実用光源 (practicals) について
+ *
+ * 街灯や窓明かりは PointLight で置き `render.addLight()` に登録する。
+ *
+ * Three 版はここに `_stabiliseLightCount` という仕掛けを持っていた: 可視ライト数が
+ * シェーダの permutation key になるため、ランプ 1 個が減衰半径を跨ぐだけで全マテリアル
+ * が再コンパイルされ 640〜900ms のスパイクを出す、という問題への対処だった。
+ *
+ * **Babylon の clustered lighting ではこの問題が発生しない**ので、バラストライトも
+ * 可視数の固定も不要になった。ライトはただ置くだけでよい (詳細は render/index.js)。
  */
-
 /**
- * LEVEL -> WORLD. The street is authored down -Z; this yaw puts it on the axis
- * the canonical hero/sunset cameras look along, with the market in the near
- * third of the frame and the gate closing the far end.
+ * LEVEL→WORLD 変換。**値は Three 版 (main ブランチ) からそのまま引き継ぐこと。**
+ *
+ * layout.js は「通りが -Z に走る LEVEL 空間」で書かれている。一方、カメラショット
+ * (dev/shots.js)・スポーン・AI の配置は「この yaw で回転済みの WORLD 空間」で
+ * 書かれている。この変換が無いと hero カメラ (12,1.75,18) は東側の建物の**内部**に
+ * 埋まり、「空が真っ黒 / 世界が屋内に見える」という一見シェーダ起因に見える壊れ方を
+ * する (実際にこの移植で数時間を溶かした)。値を変えると全ショットの構図と全
+ * スポーンが同時にずれるので、絶対に単独でいじらないこと。
  */
 const LEVEL_YAW = 0.5877;
 const LEVEL_TX = 0.9;
 const LEVEL_TZ = 1.34;
 
-/**
- * How many zero-intensity "ballast" point lights the world parks in the scene to
- * hold `numPointLights` — and therefore the shader permutation — constant. See
- * `_addBallast()`. Must be at least the worst-case number of practicals that can
- * be in range at once: a sweep of the whole playable area at three eye heights
- * puts that at 10 for the world's own lights, plus whatever `fx` keeps live.
- */
-const LIGHT_SLOTS = 20;
-
-/** Spawn points in LEVEL space: [x, z, yaw, tag]. */
-const SPAWNS = [
-  [0.4, 22.5, Math.PI, 'north street'],
-  [-2.4, 30.0, Math.PI, 'north plaza'],
-  [3.6, 5.0, Math.PI, 'market'],
-  [-3.4, -12.0, 0, 'mid street'],
-  [2.6, -32.0, 0, 'south street'],
-  [-1.0, -39.0, 0, 'gate'],
-  [10.5, 4.6, -Math.PI / 2, 'east alley'],
-  [-9.0, -10.2, Math.PI / 2, 'west alley'],
-];
-
 export class WorldSystem {
   static id = 'world';
-  static deps = ['materials', 'physics'];
+  static deps = ['materials', 'physics', 'render'];
+
+  constructor() {
+    /** 統合済みのワールドメッシュ。 */
+    this.meshes = [];
+    /** 実用光源。 */
+    this.lights = [];
+    /** 街灯の灯具位置。_buildSetPieces が埋める。 */
+    this.lampHeads = [];
+    /** プレイヤーのスポーン地点。 */
+    this.spawns = [
+      { position: new Vector3(12, 1.8, 18), yaw: -2.35 },
+      { position: new Vector3(-2, 1.8, -30), yaw: 0.2 },
+    ];
+  }
 
   async init(ctx) {
     this.ctx = ctx;
     this.rng = ctx.rng.fork();
-    const rng = this.rng;
     const materials = ctx.get('materials');
-    const physics = ctx.peek('physics');
-    const render = ctx.peek('render');
+    const physics = ctx.get('physics');
+    const render = ctx.get('render');
 
-    this.root = new THREE.Group();
-    this.root.name = 'world';
-    this.root.matrixAutoUpdate = false;
-    ctx.scene.add(this.root);
+    const b = new WorldBuilder(ctx.scene, materials);
+    this.builder = b;
+    // LEVEL 空間のレイアウトを WORLD 空間へ。push より前に設定すること (builder 参照)。
+    b.setTransform(LEVEL_YAW, LEVEL_TX, LEVEL_TZ);
 
-    // Weathering in the shared materials keys off the ground plane.
-    materials.setGroundLevel?.(0);
+    this._buildGround(b);
+    this._buildAlleys(b);
+    for (const def of BUILDINGS) this._buildBuilding(b, def);
+    this._buildGate(b);
+    this._buildSetPieces(b);
 
-    const t0 = performance.now();
-    const A = new Assembler({ materials, rng, render });
-    this.A = A;
-    A.setTransform(LEVEL_YAW, LEVEL_TX, LEVEL_TZ);
+    this.meshes = b.finish();
 
-    // 1. prototypes first: the level references them by id while it builds
-    registerProps(A, rng);
-    registerDressingProps(A, rng);
-
-    // 2. ground, then the shells, then what people put in and on them
-    buildGround(A, rng);
-
-    const infos = [];
-    for (const spec of BUILDINGS) {
-      const info = buildBuilding(A, rng, spec);
-      infos.push(info);
-      if (spec.collapse) {
-        collapseRoof(A, rng, spec, info, {
-          x: spec.x + rng.range(-2, 2),
-          z: spec.z + rng.range(-2, 2),
-        });
-      }
+    // 物理と影に登録する。統合済みなので登録は数十回で済む。
+    for (const m of this.meshes) {
+      if (!m.metadata?.owNoCollision) physics.addStatic(m, m.metadata?.owSurface);
+      render.addShadowCaster(m, false);
     }
-    this.buildings = infos;
 
-    buildGate(A, rng);
-    buildPerimeter(A, rng);
-    dressStreet(A, rng);
-    dressBuildings(A, rng, infos);
-    scatterDebris(A, rng);
+    this._addLights(render, ctx);
 
-    this._addLights(A);
-
-    A.finalize(this.root, physics);
-    A.releaseCache();
-
-    // -------------------------------------------------------------- queries --
-    this._v = new THREE.Vector3();
-    this._inv = new THREE.Matrix4().copy(A.xform).invert();
-    this.spawnPoints = SPAWNS.map(([x, z, yaw, tag]) => ({
-      position: A.toWorld(x, 0, z),
-      yaw: yaw + LEVEL_YAW,
-      tag,
-    }));
-    this.bounds = new THREE.Box3(
-      new THREE.Vector3(-62, -2, -62),
-      new THREE.Vector3(62, 26, 62)
-    ).applyMatrix4(A.xform);
-    this.stats = A.stats;
-
-    const ms = performance.now() - t0;
-    console.info(
-      `[world] built in ${ms.toFixed(0)}ms — ${(A.stats.staticTris / 1000).toFixed(0)}k static tris, ` +
-        `${(A.stats.instTris / 1000).toFixed(0)}k instanced tris in ${A.stats.instances} instances, ` +
-        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris`
-    );
+    console.info(`[world] ${this.meshes.length} merged meshes, ${this.lights.length} practicals`);
   }
 
-  // ----------------------------------------------------------------- lights --
-  /**
-   * Punctual lights the world owns: the bare bulbs inside the enterable
-   * buildings (what makes an interior read as lived-in against cool skylight)
-   * and the street lamps, which only draw power after dusk.
-   */
-  _addLights(A) {
-    this.bulbs = [];
-    this.lamps = [];
+  /* ================================================================== */
+  /* Ground                                                             */
+  /* ================================================================== */
 
-    for (const b of A.interiorLights.slice(0, 20)) {
-      // A bare 60 W bulb in an unlit room: the only thing separating an interior
-      // from a black hole, so it has to actually carry the room.
-      // Intensity is re-driven every update() off the solar altitude; this is
-      // the daylight value so a frame captured before the first update is right.
-      const l = new THREE.PointLight(0xffc07a, 5, 13, 2);
-      l.position.set(b.x, b.y, b.z);
-      l.castShadow = false;
-      A.light(l, { range: 13, priority: 2 });
-      this.bulbs.push(l);
+  _buildGround(b) {
+    const { halfWidth, kerb, walkH, zMin, zMax } = STREET;
+    const len = zMax - zMin;
+    const cz = (zMin + zMax) / 2;
+
+    // 砂地のベース。街の外まで広げて、路地の隙間から地面の切れ目が見えないようにする。
+    b.pushGround(0, -0.02, cz, 140, 140, 'sand', { name: 'ground_base', subdivisions: 8 });
+
+    // アスファルトの車道。
+    b.pushGround(0, 0, cz, halfWidth * 2, len, 'asphalt', { name: 'road' });
+
+    // 轍。乾いた土埃が溜まって見えるよう僅かに色を変える。
+    b.pushBox(-1.5, 0.004, cz, 1.1, 0.01, len, 'road_rut', { noCollision: true });
+    b.pushBox(1.5, 0.004, cz, 1.1, 0.01, len, 'road_rut', { noCollision: true });
+
+    // 歩道。車道より walkH だけ高い。
+    for (const s of [-1, 1]) {
+      const x = s * ((halfWidth + kerb) / 2);
+      const w = kerb - halfWidth;
+      b.pushBox(x, walkH / 2, cz, w, walkH, len, 'concrete', { name: `walk${s}` });
+      // 縁石。車道側に一段の陰を作る。
+      b.pushBox(s * halfWidth, walkH / 2, cz, 0.12, walkH + 0.01, len, 'concrete_dark');
     }
 
-    for (const p of A.lampAnchors) {
-      const l = new THREE.PointLight(0xffb765, 0, 22, 2);
-      l.position.set(p.x, p.y - 0.12, p.z);
-      l.castShadow = false;
-      A.light(l, { range: 22, priority: 3 });
-      this.lamps.push(l);
+    // 建物際の砂の吹き溜まり。地面と壁の接合線を隠す。
+    for (const s of [-1, 1]) {
+      b.pushBox(s * (kerb - 0.35), walkH + 0.02, cz, 0.7, 0.05, len, 'dust_skirt', {
+        noCollision: true,
+        noShadow: true,
+      });
     }
-    this.lampLens = A.mat('lamp_lens');
-    this._lampMix = -1;
-
-    this._addBallast();
   }
 
-  /**
-   * BALLAST — hold the scene's point-light COUNT constant.
-   *
-   * MEASURED, not guessed. The single worst source of stalls in this build was
-   * not geometry: it was shader compilation triggered by the world's own
-   * practicals. `render` distance-culls every registered punctual light
-   * (`light.visible = fade > 0.002`), and Three bakes the number of *visible*
-   * point lights into the program cache key. The world owns 17 practicals (12
-   * interior bulbs at 13 m, 5 street lamps at 22 m), so walking down the street
-   * sweeps the visible count through 9-8-7-6-5-4 — and every single step
-   * recompiles EVERY lit material in the frame:
-   *
-   *   f15 +36 programs  636 ms   f32 +35  702 ms   f41 +35  699 ms
-   *   f51 +35 programs  678 ms   f99 +33  698 ms
-   *   → 186 programs and ~3.5 s of stalls inside 900 frames of play
-   *
-   * Pre-compiling every count instead costs 9.5 s of boot (measured: 595
-   * programs for counts 0-16), which is the wrong trade. Holding the count
-   * still costs nothing.
-   *
-   * These lights are black (`color 0x000000`, `intensity 0`) with a 1 cm range,
-   * parked under the map, and are NOT registered with `render.addLight`, so
-   * nothing culls or re-lights them. A point light whose colour times intensity
-   * is exactly 0 contributes `0.0` to irradiance — not "almost nothing", but a
-   * float zero that is added to the accumulator — so this cannot move a pixel
-   * no matter how many slots are lit. It only changes `numPointLights`, which
-   * is a shader-permutation input and nothing else.
-   *
-   * Cost of the padding, measured over 3 paired runs at 1512x982 DPR 2 with 20
-   * ballast slots live: p05 frame time 15.7 ms -> 14.4 ms (i.e. inside noise).
-   */
-  _addBallast() {
-    this._ballast = [];
-    for (let i = 0; i < LIGHT_SLOTS + 4; i++) {
-      const l = new THREE.PointLight(0x000000, 0, 0.01, 2);
-      l.name = `world_light_ballast_${i}`;
-      l.castShadow = false;
-      l.visible = false;
-      l.userData.owBallast = true;
-      // Far under the terrain, so even the distance-attenuation term is 0.
-      l.position.set(0, -1000, 0);
-      this.root.add(l);
-      this._ballast.push(l);
+  _buildAlleys(b) {
+    for (const a of ALLEYS) {
+      const [x0, z0, x1, z1] = a.rect;
+      const key = a.surface === 'gravel' ? 'gravel' : 'dirt';
+      b.pushGround(
+        (x0 + x1) / 2,
+        0.005,
+        (z0 + z1) / 2,
+        Math.abs(x1 - x0),
+        Math.abs(z1 - z0),
+        key
+      );
     }
-    /** Point lights in the scene that are NOT ballast; refreshed periodically. */
-    this._pointLights = [];
-    this._pointLightsFrame = -1e9;
-    this._lightTarget = LIGHT_SLOTS;
-    this._lightRanges = new Map(); // light -> the cull radius `render` gave it
-    this._camPos = new THREE.Vector3();
-    this._collectPointLight = (o) => {
-      if (o.isPointLight === true && o.userData.owBallast !== true) this._pointLights.push(o);
-    };
   }
 
+  /* ================================================================== */
+  /* Buildings                                                          */
+  /* ================================================================== */
+
   /**
-   * Top the visible point-light count up to a fixed target. Runs in lateUpdate,
-   * after every subsystem has finished moving lights and the camera, and before
-   * `render` draws — so the count Three sees is the same every frame.
+   * 建物 1 棟。
    *
-   * The count has to be PREDICTED rather than read off `light.visible`, because
-   * `render._cullLights()` runs inside `render.render()` — i.e. after this. Using
-   * last frame's flags is right on 99% of frames and off by one on exactly the
-   * frames where a light crosses its cull radius, which are exactly the frames
-   * that used to stall. So mirror the renderer's own test here. Getting the
-   * prediction wrong can only cost a permutation, never a pixel: the ballast
-   * lights are black, and a black light is a no-op however many are lit.
+   * 壁は「実際に厚みのある 4 枚の板」として作る。README にある通り内部に入れることが
+   * 要件なので、箱を 1 つ置くだけでは成立しない。
    */
-  _stabiliseLightCount(ctx) {
-    const list = this._pointLights;
-    if (!list) return;
-    const render = this._render ?? (this._render = ctx.peek('render'));
-    // The set of point lights in the scene only changes when a subsystem builds
-    // or frees a pool, so rescanning every frame is pure waste. Every 90 frames
-    // is often enough to catch a pool that appears after boot.
-    if (ctx.time.frame - this._pointLightsFrame >= 90) {
-      this._pointLightsFrame = ctx.time.frame;
-      list.length = 0;
-      ctx.scene.traverse(this._collectPointLight);
-      this._lightRanges.clear();
-      for (const e of render?.lights ?? []) {
-        if (e.light?.isPointLight === true) this._lightRanges.set(e.light, e.range);
+  _buildBuilding(b, def) {
+    const floorH = 3.1;
+    const wallT = 0.32;
+    const wallKey = def.wallKey ?? 'plaster_sand';
+    const trimKey = def.trimKey ?? 'concrete';
+    const { x, z } = def;
+
+    for (let f = 0; f < def.floors; f++) {
+      // セットバック: 上階が奥に下がる。単調な箱に見せないための造作。
+      const inset = def.setback && f >= def.setback.from ? def.setback.depth : 0;
+      const w = def.w - inset;
+      const d = def.d - inset;
+      const y0 = f * floorH;
+      const cy = y0 + floorH / 2;
+      const ox = inset && def.setback.side & 1 ? inset / 2 : 0;
+
+      // 床スラブ。
+      b.pushBox(x + ox, y0 + 0.09, z, w, 0.18, d, f === 0 ? 'floor_concrete' : 'concrete');
+      this._buildWalls(b, x + ox, cy, z, w, d, floorH, wallT, wallKey, def, f);
+    }
+
+    // 屋根 + パラペット。
+    const topY = def.floors * floorH;
+    const inset = def.setback ? def.setback.depth : 0;
+    const rw = def.w - inset;
+    const rd = def.d - inset;
+    const ox = inset && def.setback.side & 1 ? inset / 2 : 0;
+    b.pushBox(x + ox, topY + 0.1, z, rw, 0.2, rd, 'roof_screed');
+    const pH = 0.62;
+    for (const [dx, dz, pw, pd] of [
+      [0, rd / 2, rw, 0.22],
+      [0, -rd / 2, rw, 0.22],
+      [rw / 2, 0, 0.22, rd],
+      [-rw / 2, 0, 0.22, rd],
+    ]) {
+      b.pushBox(x + ox + dx, topY + 0.2 + pH / 2, z + dz, pw, pH, pd, trimKey);
+    }
+
+    // 屋上設備。シルエットを崩すためのもの。
+    for (let i = 0; i < (def.roofProps ?? 0); i++) {
+      const px = x + ox + this.rng.range(-rw / 2 + 0.8, rw / 2 - 0.8);
+      const pz = z + this.rng.range(-rd / 2 + 0.8, rd / 2 - 0.8);
+      if (this.rng.float() < 0.5) {
+        b.pushCylinder(px, topY + 0.7, pz, 1.0, 1.0, 'metal_rust_prop');
+      } else {
+        b.pushBox(px, topY + 0.55, pz, 0.9, 0.7, 0.7, 'metal_dark');
       }
     }
 
-    ctx.camera.getWorldPosition(this._camPos);
-    let n = 0;
-    for (let i = 0; i < list.length; i++) {
-      const l = list[i];
-      const range = this._lightRanges.get(l);
-      if (range === undefined) {
-        // Not registered for distance culling: its owner drives `visible`.
-        if (l.visible === true) n++;
+    // バルコニー。
+    if (def.balconies) {
+      for (let f = 1; f < def.floors; f++) {
+        if (this.rng.float() > def.balconies) continue;
+        const s = def.streetSide === 1 ? 1 : -1;
+        const by = f * floorH + 0.12;
+        const bz = z + s * (def.d / 2 + 0.5);
+        b.pushBox(x, by, bz, 2.4, 0.14, 1.0, trimKey);
+        b.pushBox(x, by + 0.5, bz + s * 0.45, 2.4, 0.9, 0.08, 'metal_rust');
+      }
+    }
+  }
+
+  /**
+   * 4 面の壁を建てる。通りに面した壁だけ「腰壁 + 窓台 + 窓 + 楣上」に割る。
+   *
+   * 窓を「穴」ではなく分割で表現するのは CSG のブーリアンを避けるため。ブーリアンは
+   * 頂点数が跳ね上がるうえ、統合後のメッシュで法線が壊れやすい。
+   */
+  _buildWalls(b, x, cy, z, w, d, floorH, t, wallKey, def, floor) {
+    const sillH = 0.95;
+    const winH = 1.35;
+    const headH = floorH - sillH - winH;
+    // 面: 0=-Z, 1=+X, 2=+Z, 3=-X (layout.js の side 規約)
+    const faces = [
+      { len: w, cx: x, cz: z - d / 2 + t / 2, horiz: true },
+      { len: d, cx: x + w / 2 - t / 2, cz: z, horiz: false },
+      { len: w, cx: x, cz: z + d / 2 - t / 2, horiz: true },
+      { len: d, cx: x - w / 2 + t / 2, cz: z, horiz: false },
+    ];
+
+    for (let s = 0; s < 4; s++) {
+      const face = faces[s];
+      const isStreet = s === def.streetSide || s === def.secondarySide;
+      const bw = face.horiz ? face.len : t;
+      const bd = face.horiz ? t : face.len;
+
+      if (!isStreet) {
+        // 通りに面していない壁は開口なしの一枚板。
+        b.pushBox(face.cx, cy, face.cz, bw, floorH, bd, wallKey);
         continue;
       }
-      // The renderer's test, verbatim: fade = 1 - smoothstep(d, .75r, 1.15r),
-      // light.visible = fade > 0.002.
-      const d = l.position.distanceTo(this._camPos);
-      if (1 - THREE.MathUtils.smoothstep(d, range * 0.75, range * 1.15) > 0.002) n++;
-    }
 
-    // A subsystem can always out-run the pool; adopting the higher count costs
-    // one compile, once, instead of one per crossing.
-    if (n > this._lightTarget) this._lightTarget = n;
-    const want = this._lightTarget - n;
-    const pool = this._ballast;
-    for (let i = 0; i < pool.length; i++) {
-      const v = i < want;
-      if (pool[i].visible !== v) pool[i].visible = v;
+      // 1 階の通り側には出入口を空ける。
+      if (floor === 0 && def.doorBays && def.doorBays[s] !== undefined) {
+        const doorW = 1.3;
+        const rest = (face.len - doorW) / 2;
+        for (const sgn of [-1, 1]) {
+          const off = sgn * (doorW / 2 + rest / 2);
+          b.pushBox(
+            face.horiz ? face.cx + off : face.cx,
+            cy,
+            face.horiz ? face.cz : face.cz + off,
+            face.horiz ? rest : t,
+            floorH,
+            face.horiz ? t : rest,
+            wallKey
+          );
+        }
+        // 出入口の上の垂れ壁。
+        b.pushBox(
+          face.cx,
+          cy - floorH / 2 + 2.1 + (floorH - 2.1) / 2,
+          face.cz,
+          face.horiz ? doorW : t,
+          floorH - 2.1,
+          face.horiz ? t : doorW,
+          wallKey
+        );
+        continue;
+      }
+
+      // 腰壁。
+      const sillY = cy - floorH / 2 + sillH / 2;
+      b.pushBox(face.cx, sillY, face.cz, bw, sillH, bd, wallKey);
+      // 窓台。
+      b.pushBox(face.cx, sillY + sillH / 2 + 0.05, face.cz, bw, 0.1, bd + 0.06, 'concrete');
+      /**
+       * 窓ガラス。開口として抜かずガラス板で塞ぐ。
+       * 抜くと室内が丸見えになり、10 棟ぶんの内装を全部作る羽目になる。
+       */
+      const winY = cy - floorH / 2 + sillH + winH / 2;
+      b.pushBox(
+        face.cx,
+        winY,
+        face.cz,
+        face.horiz ? bw * 0.86 : 0.04,
+        winH,
+        face.horiz ? 0.04 : bd * 0.86,
+        'glass',
+        { noShadow: true }
+      );
+      // 窓枠の縦桟。
+      b.pushBox(face.cx, winY, face.cz, face.horiz ? 0.07 : t, winH, face.horiz ? t : 0.07, 'wood_dark');
+      // 楣より上の壁。
+      b.pushBox(face.cx, cy + floorH / 2 - headH / 2, face.cz, bw, headH, bd, wallKey);
     }
   }
 
-  // ---------------------------------------------------------------- runtime --
-  update(dt, ctx) {
-    // Distance LOD for the scatter clouds: one bounding-sphere test per batch.
-    this.A?.updateLod(ctx.camera);
+  /* ================================================================== */
+  /* Gate                                                               */
+  /* ================================================================== */
 
-    // Street lamps come on as the sun goes down, driven by the sky's real solar
-    // altitude rather than a timer, so it is right at any time of day.
-    const sky = this._sky ?? (this._sky = ctx.peek('sky'));
-    const alt = sky?.sunAltitude ?? 0.6;
-    const mix = 1 - Math.min(1, Math.max(0, (alt + 0.05) / 0.16));
-    if (Math.abs(mix - this._lampMix) > 0.01) {
-      this._lampMix = mix;
-      for (let i = 0; i < this.lamps.length; i++) this.lamps[i].intensity = 14 * mix;
-      if (this.lampLens) this.lampLens.emissiveIntensity = 9 * mix;
-      // Bulbs stay on around the clock — but a 60 W bulb is NOT competitive with
-      // daylight, and running it at night strength at noon is what made every
-      // interior read as pure tungsten (B-R -93) and sit level with the sunlit
-      // street instead of 1.5-2.5 stops under it. Gate the bulb on solar
-      // altitude: a weak practical by day, the room's only light after dark.
-      for (let i = 0; i < this.bulbs.length; i++) this.bulbs[i].intensity = 5 + 17 * mix;
-    }
-  }
-
-  lateUpdate(dt, ctx) {
-    this._stabiliseLightCount(ctx);
-  }
-
-  // --------------------------------------------------------------- pre-warm --
   /**
-   * Compile every shader permutation the world can produce, before the frame
-   * loop starts. See `src/core/prewarm.js` — that module asks each subsystem for
-   * exactly this hook, because `renderer.compileAsync(scene, camera)` alone
-   * reaches only the forward lit variant of a material, not the two override
-   * passes the world's geometry also goes through every frame:
+   * 遠景を締めるアーチ門。
    *
-   *   - the CSM cascades render the whole scene with `csm.depthMaterial`
-   *   - the prepass renders it again with the gbuffer's ShaderMaterial
-   *
-   * Both are separate programs, and each one has its own permutations for plain
-   * geometry, instanced geometry and instanced geometry with an instanceColor —
-   * which is precisely the mix the world puts in front of them.
-   *
-   * Pixel-neutral by construction: it compiles, it does not draw. The only
-   * mutations are `scene.overrideMaterial` and the ballast light visibility,
-   * both restored in the `finally`.
+   * layout.js の GATE には「なぜこの形なのか」が詳しく書かれている (16:30 の太陽が
+   * -X/-Z 象限にあるため、塔を手前に出すと西側の returns が順光になり、隣の日陰面と
+   * 2 段の明度差ができる)。**その意図を壊さないよう寸法はそのまま使う。**
    */
-  async prewarmMaterials(ctx = this.ctx) {
-    const render = ctx.peek?.('render') ?? ctx.get?.('render');
-    const renderer = render?.renderer;
-    if (!renderer) return { ok: false, reason: 'no renderer' };
-    const scene = ctx.scene;
-    const camera = ctx.camera;
-    const before = renderer.info.programs?.length ?? 0;
-    const t0 = performance.now();
+  _buildGate(b) {
+    const g = GATE;
+    const key = 'concrete';
+    b.pushBox((g.xL0 + g.xL1) / 2, g.hL / 2, g.z, g.xL1 - g.xL0, g.hL, g.depth, key);
+    b.pushBox(
+      (g.xR0 + g.xR1) / 2,
+      g.hR / 2,
+      g.z - g.eastProud / 2,
+      g.xR1 - g.xR0,
+      g.hR,
+      g.depth + g.eastProud,
+      key
+    );
+    b.pushBox(
+      (g.xT0 + g.xT1) / 2,
+      g.hT / 2,
+      g.z - g.towerProud / 2,
+      g.xT1 - g.xT0,
+      g.hT,
+      g.depth + g.towerProud,
+      key
+    );
 
-    // Every lit material must carry render's CSM/AO/SSR injection before it is
-    // compiled, or the program we warm is not the program the frame will use.
-    render.patchMaterials?.(this.root);
-
-    // Compile at the count the frame loop will actually run at, not at whatever
-    // the distance cull happens to have left visible during boot.
-    this._stabiliseLightCount(ctx);
-
-    const prevOverride = scene.overrideMaterial;
-    try {
-      // 1. forward lit pass.
-      await this._compile(renderer, scene, camera);
-      // 2. the shadow cascades and 3. the depth/normal/velocity prepass, both of
-      //    which draw this same geometry through an override material.
-      for (const over of [render.csm?.depthMaterial, render.gbuffer?.material]) {
-        if (!over) continue;
-        scene.overrideMaterial = over;
-        await this._compile(renderer, scene, camera);
-      }
-    } finally {
-      scene.overrideMaterial = prevOverride;
+    // アーチ。半円を短冊で近似する (CSG を避ける理由は _buildWalls と同じ)。
+    const steps = 12;
+    const r = g.span / 2;
+    const cx = (g.xL1 + g.xR0) / 2;
+    for (let i = 0; i < steps; i++) {
+      const a0 = (i / steps) * Math.PI;
+      const a1 = ((i + 1) / steps) * Math.PI;
+      const y0 = g.height - r + Math.sin(a0) * r;
+      const y1 = g.height - r + Math.sin(a1) * r;
+      const x0 = cx + Math.cos(a0) * r;
+      const x1 = cx + Math.cos(a1) * r;
+      const seg = Math.hypot(x1 - x0, y1 - y0);
+      const mesh = b.pushBox((x0 + x1) / 2, (y0 + y1) / 2 + 0.35, g.z, seg, 0.7, g.depth, key);
+      mesh.rotation.z = Math.atan2(y1 - y0, x1 - x0);
     }
-
-    return {
-      ok: true,
-      ms: Math.round(performance.now() - t0),
-      compiled: (renderer.info.programs?.length ?? 0) - before,
-      lightTarget: this._lightTarget,
-    };
+    // アーチ上の胴体。
+    b.pushBox(cx, (g.height + g.bodyH) / 2 + 0.3, g.z, g.xR0 - g.xL1, g.bodyH - g.height, g.depth, key);
   }
 
-  async _compile(renderer, scene, camera) {
-    try {
-      await renderer.compileAsync(scene, camera);
-    } catch {
-      try {
-        renderer.compile(scene, camera);
-      } catch {
-        /* a driver we cannot pre-warm on; boot must still proceed */
+  /* ================================================================== */
+  /* Set pieces                                                         */
+  /* ================================================================== */
+
+  _buildSetPieces(b) {
+    const S = SET_PIECES;
+
+    // 市場の屋台。天板 + 4 本脚 + 日除け。市場らしさの大半はこの色布が担う。
+    for (const [x, z, ry, w] of S.stalls) {
+      b.pushBox(x, 0.9, z, w, 0.08, 1.2, 'wood_prop', { ry });
+      for (const dx of [-w / 2 + 0.12, w / 2 - 0.12]) {
+        for (const dz of [-0.5, 0.5]) {
+          b.pushBox(
+            x + dx * Math.cos(ry) - dz * Math.sin(ry),
+            0.45,
+            z + dx * Math.sin(ry) + dz * Math.cos(ry),
+            0.07,
+            0.9,
+            0.07,
+            'wood_prop_dark'
+          );
+        }
+      }
+      const cloth = this.rng.pick(['fabric_red', 'fabric_teal', 'fabric_cream']);
+      b.pushBox(x, 2.05, z, w + 0.3, 0.04, 1.6, cloth, { ry });
+      for (const dx of [-w / 2, w / 2]) {
+        b.pushBox(x + dx * Math.cos(ry), 1.5, z + dx * Math.sin(ry), 0.05, 1.1, 0.05, 'wood_prop_dark');
+      }
+    }
+
+    // ジャージーバリア。断面が台形なので 2 段の箱で近似する。
+    for (const [x, z, ry] of S.jerseys) {
+      b.pushBox(x, 0.28, z, 0.62, 0.56, 1.9, 'concrete_prop', { ry });
+      b.pushBox(x, 0.72, z, 0.34, 0.34, 1.9, 'concrete_prop', { ry });
+    }
+
+    // 土嚢。1 袋ずつ積む。数が多いので統合前提。
+    for (const [x, z, ry, len] of S.sandbagWalls) {
+      const per = Math.max(2, Math.round(len / 0.42));
+      for (let r = 0; r < 3; r++) {
+        for (let i = 0; i < per; i++) {
+          // 段ごとに半個ずらすと積んだ感じが出る。
+          const off = (i - (per - 1) / 2) * 0.42 + (r % 2) * 0.21;
+          b.pushBox(
+            x + off * Math.cos(ry),
+            0.11 + r * 0.2,
+            z + off * Math.sin(ry),
+            0.4,
+            0.2,
+            0.26,
+            'burlap',
+            { ry: ry + this.rng.range(-0.12, 0.12) }
+          );
+        }
+      }
+    }
+
+    // 廃車。箱を組んで車らしいシルエットを作る。
+    for (const [x, z, ry] of S.wrecks) {
+      b.pushBox(x, 0.55, z, 1.8, 0.7, 4.2, 'metal_dark', { ry });
+      b.pushBox(x, 1.15, z - 0.3, 1.7, 0.6, 2.0, 'metal_dark', { ry });
+      for (const [dx, dz] of [
+        [-0.85, 1.5],
+        [0.85, 1.5],
+        [-0.85, -1.5],
+        [0.85, -1.5],
+      ]) {
+        b.pushCylinder(
+          x + dx * Math.cos(ry) - dz * Math.sin(ry),
+          0.32,
+          z + dx * Math.sin(ry) + dz * Math.cos(ry),
+          0.62,
+          0.24,
+          'rubber',
+          { ry: ry + Math.PI / 2, sides: 12 }
+        );
+      }
+    }
+
+    // ヤシ。幹 + 葉。
+    for (const [x, z, s] of S.palms) {
+      const h = 5.2 * s;
+      b.pushCylinder(x, h / 2, z, 0.34 * s, h, 'wood_dark', { sides: 10 });
+      for (let i = 0; i < 7; i++) {
+        const a = (i / 7) * Math.PI * 2 + this.rng.range(-0.2, 0.2);
+        const len = 2.1 * s;
+        const mesh = b.pushBox(
+          x + Math.cos(a) * len * 0.45,
+          h + 0.25,
+          z + Math.sin(a) * len * 0.45,
+          len,
+          0.05,
+          0.5 * s,
+          'foliage',
+          { ry: -a }
+        );
+        mesh.rotation.z = 0.28;
+      }
+    }
+
+    // 街灯。灯具の位置を控えておき、後で PointLight を足す。
+    for (const [x, z, ry] of S.lamps) {
+      b.pushCylinder(x, 2.6, z, 0.16, 5.2, 'metal_dark', { sides: 10 });
+      const armLen = 1.4;
+      const hx = x + Math.cos(ry) * armLen;
+      const hz = z + Math.sin(ry) * armLen;
+      b.pushBox((x + hx) / 2, 5.15, (z + hz) / 2, armLen, 0.1, 0.1, 'metal_dark', { ry });
+      b.pushBox(hx, 5.0, hz, 0.5, 0.16, 0.28, 'metal_dark', { ry });
+      // 灯具位置はメッシュではないので LEVEL→WORLD を自分で通す (builder.toWorld 参照)。
+      this.lampHeads.push(b.toWorld(hx, 4.86, hz));
+    }
+
+    // 瓦礫。小石を撒く。
+    for (const [x, z, r, n] of S.rubble) {
+      for (let i = 0; i < n; i++) {
+        const a = this.rng.float() * Math.PI * 2;
+        const rr = Math.sqrt(this.rng.float()) * r;
+        const s = this.rng.range(0.12, 0.42);
+        const mesh = b.pushBox(
+          x + Math.cos(a) * rr,
+          s * 0.4,
+          z + Math.sin(a) * rr,
+          s,
+          s * 0.7,
+          s * this.rng.range(0.7, 1.3),
+          'concrete_prop',
+          { ry: this.rng.float() * Math.PI }
+        );
+        mesh.rotation.x = this.rng.range(-0.3, 0.3);
+        mesh.rotation.z = this.rng.range(-0.3, 0.3);
+      }
+    }
+
+    // タイヤの山。
+    for (const [x, z, n] of S.tyres) {
+      for (let i = 0; i < n; i++) {
+        b.pushCylinder(
+          x + this.rng.range(-0.06, 0.06),
+          0.11 + i * 0.2,
+          z + this.rng.range(-0.06, 0.06),
+          0.68,
+          0.2,
+          'rubber',
+          { sides: 14 }
+        );
+      }
+    }
+
+    // ファサードの吊り布。
+    for (const [x, y, z, ry, w, h] of S.hangings) {
+      const cloth = this.rng.pick(['fabric_red', 'fabric_teal', 'fabric_cream']);
+      b.pushBox(x, y, z, 0.04, h, w, cloth, { ry, noCollision: true });
+    }
+
+    // 洗濯物。線に沿って布を吊るす。
+    for (const [x0, y0, z0, x1, y1, z1] of S.laundry) {
+      const n = 5;
+      for (let i = 1; i <= n; i++) {
+        const t = i / (n + 1);
+        // 線は中央でたるむ。
+        const sag = Math.sin(t * Math.PI) * 0.18;
+        const cloth = this.rng.pick(['fabric_cream', 'fabric_teal', 'fabric_red']);
+        b.pushBox(
+          x0 + (x1 - x0) * t,
+          y0 + (y1 - y0) * t - sag - 0.35,
+          z0 + (z1 - z0) * t,
+          0.03,
+          0.6,
+          0.45,
+          cloth,
+          { noCollision: true, noShadow: true }
+        );
+      }
+    }
+
+    // 電線。たるみを短冊で近似する。
+    for (const [x0, y0, z0, x1, y1, z1, sag] of S.cables) {
+      const n = 8;
+      let prev = null;
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const px = x0 + (x1 - x0) * t;
+        const pz = z0 + (z1 - z0) * t;
+        const py = y0 + (y1 - y0) * t - Math.sin(t * Math.PI) * sag;
+        if (prev) {
+          const len = Math.hypot(px - prev.px, py - prev.py, pz - prev.pz);
+          const mesh = b.pushBox(
+            (prev.px + px) / 2,
+            (prev.py + py) / 2,
+            (prev.pz + pz) / 2,
+            len,
+            0.035,
+            0.035,
+            'metal_dark',
+            { ry: Math.atan2(-(pz - prev.pz), px - prev.px), noCollision: true, noShadow: true }
+          );
+          mesh.rotation.z = Math.asin((py - prev.py) / Math.max(len, 1e-4));
+        }
+        prev = { px, py, pz };
       }
     }
   }
 
-  // ---------------------------------------------------------------- queries --
+  /* ================================================================== */
+  /* Lights                                                             */
+  /* ================================================================== */
+
+  /**
+   * 実用光源。
+   *
+   * Three 版はここで可視ライト数を固定する仕掛け (`_stabiliseLightCount`) を必要と
+   * していたが、clustered lighting ではライトをただ置くだけでよい。詳細は
+   * render/index.js の冒頭コメント。
+   */
+  _addLights(render, ctx) {
+    // 街灯。夜だけ点く (強度は update で振る)。
+    for (const p of this.lampHeads) {
+      const l = new PointLight(`lamp_${p.x.toFixed(1)}_${p.z.toFixed(1)}`, p.clone(), ctx.scene);
+      l.diffuse = new Color3(1.0, 0.82, 0.55);
+      l.intensity = 0;
+      l.range = 14;
+      render.addLight(l);
+      this.lights.push({ light: l, base: 22 });
+    }
+
+    // 窓明かり。1 階の通り側だけに置く。全窓に置くと夜景がのっぺりする。
+    for (const def of BUILDINGS) {
+      if (def.streetSide === undefined) continue;
+      const s = def.streetSide === 1 ? 1 : -1;
+      // def.x / def.z は LEVEL 空間 (layout.js) なので WORLD へ写してから置く。
+      const l = new PointLight(
+        `win_${def.id}`,
+        this.builder.toWorld(def.x, 2.2, def.z + s * (def.d / 2 + 0.6)),
+        ctx.scene
+      );
+      l.diffuse = new Color3(1.0, 0.78, 0.5);
+      l.intensity = 0;
+      l.range = 8;
+      render.addLight(l);
+      this.lights.push({ light: l, base: 6 });
+    }
+  }
+
+  /* ================================================================== */
+  /* Frame                                                              */
+  /* ================================================================== */
+
+  update(dt, ctx) {
+    // 夜間だけ実用光源を点ける。太陽高度から連続的に。
+    const sky = ctx.peek('sky');
+    if (!sky?.sunDir) return;
+    const night = 1 - clamp01((sky.sunDir.y + 0.12) / 0.32);
+    for (const e of this.lights) e.light.intensity = e.base * night;
+  }
+
+  /** スポーン地点。player が使う。 */
   spawn(i = 0) {
-    const n = this.spawnPoints.length;
-    return this.spawnPoints[((i % n) + n) % n];
+    return this.spawns[i % this.spawns.length];
   }
 
-  levelToWorld(x, y, z, out = new THREE.Vector3()) {
-    return out.set(x, y, z).applyMatrix4(this.A.xform);
-  }
-
-  worldToLevel(x, y, z, out = new THREE.Vector3()) {
-    return out.set(x, y, z).applyMatrix4(this._inv);
-  }
-
-  /** Analytic floor height. Physics owns the exact answer; this is a hint. */
+  /** (x,z) の地面高さ。ai の経路計算が使う。 */
   groundHeight(x, z) {
-    const p = this.worldToLevel(x, 0, z, this._v);
-    return groundY(p.x, p.z);
-  }
-
-  /** True where a character can stand outdoors (street, pavement, alley). */
-  isOpen(x, z, margin = 0.4) {
-    const p = this.worldToLevel(x, 0, z, this._v);
-    return isOpen(p.x, p.z, margin);
+    return this.ctx.get('physics').groundHeight(x, z);
   }
 
   dispose() {
-    this.A?.dispose();
-    this.root?.parent?.remove(this.root);
-    for (const l of this._ballast ?? []) l.parent?.remove(l);
-    this._ballast = null;
-    this._pointLights = null;
-    this.bulbs = null;
-    this.lamps = null;
+    for (const e of this.lights) e.light.dispose();
+    for (const m of this.meshes) m.dispose();
+    this.lights.length = 0;
+    this.meshes.length = 0;
   }
 }
 
-export { BUILDINGS, STREET, SET_PIECES, GATE };
+function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+export { STREET, BUILDINGS, GATE, SET_PIECES };

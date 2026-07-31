@@ -18,6 +18,7 @@
  *   node tools/baseline.mjs --out=shots/base --port=8080
  */
 import { chromium } from 'playwright';
+import { WEBGPU_FLAGS, CHROMIUM_CHANNEL } from './chromium-flags.mjs';
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -52,8 +53,9 @@ if (!(await portOpen(PORT))) {
 
 const browser = await chromium.launch({
   headless: true,
-  args: ['--use-angle=metal', '--ignore-gpu-blocklist', '--force-color-profile=srgb',
-         '--force-device-scale-factor=1', '--hide-scrollbars', '--mute-audio', '--disable-frame-rate-limit'],
+  // WebGPU を掴むには軽量な headless-shell ではなく full Chrome binary が要る。
+  channel: CHROMIUM_CHANNEL,
+  args: WEBGPU_FLAGS,
 });
 
 mkdirSync(OUTDIR, { recursive: true });
@@ -61,7 +63,7 @@ const report = { ok: true, outDir: OUTDIR, size: `${W}x${H}`, isolated: true, se
 
 // Discover the shot list from a throwaway page.
 const probe = await browser.newPage({ viewport: { width: W, height: H } });
-await probe.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1`, { waitUntil: 'domcontentloaded', timeout: 90000 });
+await probe.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&backend=webgpu`, { waitUntil: 'domcontentloaded', timeout: 90000 });
 await probe.waitForFunction('window.__READY__ === true', null, { timeout: 90000 });
 const all = await probe.evaluate('Object.keys(window.__SHOTS__ ?? {})');
 await probe.close();
@@ -74,7 +76,7 @@ for (const name of wanted) {
   page.on('console', (m) => m.type() !== 'debug' && logs.push(`[${m.type()}] ${m.text()}`));
   page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}`));
   try {
-    await page.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&shot=${encodeURIComponent(name)}${EXTRA}`,
+    await page.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&backend=webgpu&shot=${encodeURIComponent(name)}${EXTRA}`,
       { waitUntil: 'domcontentloaded', timeout: 90000 });
     await page.waitForFunction('window.__READY__ === true', null, { timeout: 90000 });
 

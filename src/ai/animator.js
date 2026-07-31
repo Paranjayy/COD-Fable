@@ -23,7 +23,8 @@
  * Everything is preallocated: `update()` does not allocate.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: Three 互換の自前 math shim (経緯は math3.js 冒頭コメント参照)
+import * as THREE from './math3.js';
 import * as C from './clips.js';
 import { BORE_DIR } from './rig.js';
 

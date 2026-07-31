@@ -1,420 +1,173 @@
-import * as THREE from 'three';
+import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
+import { Buffer } from '@babylonjs/core/Buffers/buffer.js';
+import { ShaderMaterial } from '@babylonjs/core/Materials/shaderMaterial.js';
+import { ShaderStore } from '@babylonjs/core/Engines/shaderStore.js';
+import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage.js';
+import { Constants } from '@babylonjs/core/Engines/constants.js';
+import { Vector3, Vector4 } from '@babylonjs/core/Maths/math.vector.js';
+
+import { WGSL_DECAL_VERT, WGSL_DECAL_FRAG } from './wgsl/decal.js';
+
+/** 1 デカールあたりの float 数。4 x vec4。 */
+const STRIDE = 16;
+const O_POS = 0; // x, y, z, radius
+const O_NRM = 4; // nx, ny, nz, rotation
+const O_MSC = 8; // tile, birth, 1/life, alpha
+const O_COL = 12; // r, g, b, unused
+
+let _registered = false;
 
 /**
- * Projected decals.
+ * デカールのリングバッファ。
  *
- * A decal is a box projector. We pull the static world's triangle soup out of
- * the physics BVH (`queryAabb` -> world-space triangles), reject any triangle
- * whose normal deviates too far from the impact normal, clip what is left
- * against the six planes of the projector box (Sutherland–Hodgman) and fan the
- * resulting polygons into a preallocated vertex ring.
+ * パーティクルと同じ「ステートレス + リングバッファ + インターリーブ 1 本」の構成。
+ * 寿命の管理はシェーダ側 (birth と 1/life から age を求める) なので CPU の更新
+ * ループは存在しない。
  *
- * That gives what a screen-space decal cannot: the decal wraps around corners
- * and window reveals, and it *cannot* smear across a perpendicular face,
- * because the perpendicular face is discarded before clipping. The box's
- * thickness also depth-clips the projection, so a bullet hole on a wall never
- * appears on the pillar 40 cm behind it.
- *
- * Everything is one draw call, one MeshStandardMaterial (so it inherits the
- * renderer's cascaded shadows, AO and IBL), with its own albedo/normal/ORM
- * atlas so a bullet hole has real relief, and a time-based fade driven entirely
- * on the GPU: the CPU touches a decal exactly once, when it is created.
+ * 容量を使い切ると **古いものから上書き**される。config.q.decalBudget が上限。
+ * 弾痕が消えるのが早いと感じたら予算を上げること (寿命を延ばすのではなく)。
  */
+export class DecalLayer {
+  constructor({ capacity, atlas, cols, scene }) {
+    if (!_registered) {
+      ShaderStore.ShadersStoreWGSL['owDecalVertexShader'] = WGSL_DECAL_VERT;
+      ShaderStore.ShadersStoreWGSL['owDecalFragmentShader'] = WGSL_DECAL_FRAG;
+      _registered = true;
+    }
 
-const MAX_POLY = 24;
-// Hoisted so projecting a decal allocates nothing.
-const FAN = [0, 0, 0];
-const QUAD = new Float32Array(12);
-
-export class DecalSystem {
-  /**
-   * @param {object} o
-   * @param {number} o.capacity      config.q.decalBudget
-   * @param {THREE.Texture} o.albedo
-   * @param {THREE.Texture} o.normal
-   * @param {THREE.Texture} o.orm
-   * @param {number} o.cols          atlas columns
-   */
-  constructor(o) {
-    this.capacity = Math.max(8, o.capacity | 0);
-    this.cols = o.cols;
-    this.vertsPerDecal = 36;
-    this.maxVerts = this.capacity * this.vertsPerDecal;
+    this.capacity = Math.max(16, capacity | 0);
     this.cursor = 0;
     this.highWater = 0;
+    this._wrapped = false;
     this.expireAt = -1;
-    this.count = 0;
+    this.array = new Float32Array(this.capacity * STRIDE);
 
-    this.pos = new Float32Array(this.maxVerts * 3);
-    this.nrm = new Float32Array(this.maxVerts * 3);
-    this.uvs = new Float32Array(this.maxVerts * 2);
-    this.dec = new Float32Array(this.maxVerts * 4);
+    const mesh = new Mesh('fx-decals', scene);
+    const vd = new VertexData();
+    vd.positions = [-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0];
+    vd.uvs = [0, 0, 1, 0, 1, 1, 0, 1];
+    vd.indices = [0, 1, 2, 0, 2, 3];
+    vd.applyToMesh(mesh, false);
 
-    const g = new THREE.BufferGeometry();
-    this.aPos = new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage);
-    this.aNrm = new THREE.BufferAttribute(this.nrm, 3).setUsage(THREE.DynamicDrawUsage);
-    this.aUv = new THREE.BufferAttribute(this.uvs, 2).setUsage(THREE.DynamicDrawUsage);
-    this.aDec = new THREE.BufferAttribute(this.dec, 4).setUsage(THREE.DynamicDrawUsage);
-    g.setAttribute('position', this.aPos);
-    g.setAttribute('normal', this.aNrm);
-    g.setAttribute('uv', this.aUv);
-    g.setAttribute('aDecal', this.aDec);
-    g.setDrawRange(0, 0);
-    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e7);
-    this.geometry = g;
+    const engine = scene.getEngine();
+    this.buffer = new Buffer(engine, this.array, true, STRIDE, false, true);
+    const bind = (kind, offset) =>
+      mesh.setVerticesBuffer(this.buffer.createVertexBuffer(kind, offset, 4, STRIDE, true));
+    bind('aPos', O_POS);
+    bind('aNrm', O_NRM);
+    bind('aMisc', O_MSC);
+    bind('aCol', O_COL);
 
-    this.uNow = { value: 0 };
-    const mat = new THREE.MeshStandardMaterial({
-      map: o.albedo,
-      normalMap: o.normal,
-      roughnessMap: o.orm,
-      metalnessMap: o.orm,
-      aoMap: o.orm,
-      roughness: 1,
-      metalness: 1,
-      transparent: true,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -4,
-      polygonOffsetUnits: -8,
-      side: THREE.FrontSide,
-      envMapIntensity: 0.85,
-      normalScale: new THREE.Vector2(1.35, 1.35),
-      alphaTest: 0.004,
-      dithering: true,
-    });
-    mat.name = 'fx-decals';
-    mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uNow = this.uNow;
-      shader.vertexShader = shader.vertexShader
-        .replace(
-          '#include <common>',
-          '#include <common>\nattribute vec4 aDecal;\nvarying vec4 vDecal;'
-        )
-        .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvDecal = aDecal;');
-      shader.fragmentShader = shader.fragmentShader
-        .replace(
-          '#include <common>',
-          '#include <common>\nuniform float uNow;\nvarying vec4 vDecal;'
-        )
-        .replace(
-          '#include <color_fragment>',
-          `#include <color_fragment>
-  {
-    float n = ( uNow - vDecal.x ) * vDecal.y;
-    if ( n < 0.0 || n > 1.0 ) discard;
-    float f = vDecal.w * ( 1.0 - smoothstep( vDecal.z, 1.0, n ) );
-    diffuseColor.a *= f;
-    if ( diffuseColor.a < 0.004 ) discard;
-  }`
-        );
-    };
-    // Distinct cache key so this variant never shares a program with a plain
-    // standard material.
-    mat.customProgramCacheKey = () => 'fx-decal-1';
+    mesh.forcedInstanceCount = 0;
+    mesh.alwaysSelectAsActiveMesh = true;
+    mesh.isPickable = false;
+    mesh.doNotSyncBoundingInfo = true;
+    mesh.metadata = { owNoShadow: true, owNoCollision: true, owFx: true };
+    // 不透明の後、パーティクルより先に描く。壁の弾痕の上に土煙が乗る順序。
+    mesh.alphaIndex = 6;
+    this.mesh = mesh;
+
+    const mat = new ShaderMaterial(
+      'fx-decals',
+      scene,
+      { vertex: 'owDecal', fragment: 'owDecal' },
+      {
+        attributes: ['position', 'uv', 'aPos', 'aNrm', 'aMisc', 'aCol'],
+        uniforms: ['viewProjection', 'uTime', 'uAtlas', 'uSunDir', 'uSunCol', 'uAmb'],
+        samplers: ['uSprite'],
+        shaderLanguage: ShaderLanguage.WGSL,
+        needAlphaBlending: true,
+      }
+    );
+    mat.backFaceCulling = false;
+    /** 深度は書かない。書くと後から貼ったデカールが先のものを消す。 */
+    mat.disableDepthWrite = true;
+    mat.alphaMode = Constants.ALPHA_COMBINE;
+    mat.setTexture('uSprite', atlas);
+    mat.setVector4('uAtlas', new Vector4(cols, 1 / cols, 0, 0));
+    mat.setVector3('uSunDir', new Vector3(0, 1, 0));
+    mat.setVector3('uSunCol', new Vector3(1, 0.95, 0.86));
+    mat.setVector3('uAmb', new Vector3(0.3, 0.34, 0.4));
+    mat.setFloat('uTime', 0);
     this.material = mat;
+    mesh.material = mat;
+    mesh.setEnabled(false);
 
-    this.mesh = new THREE.Mesh(g, mat);
-    this.mesh.frustumCulled = false;
-    this.mesh.matrixAutoUpdate = false;
-    this.mesh.renderOrder = 4;
-    this.mesh.name = 'fx-decals';
-    this.mesh.receiveShadow = false;
-    this.mesh.castShadow = false;
-    this.mesh.userData.owProbe = true;
-    this.mesh.userData.owNoShadow = true;
-    this.mesh.visible = false;
-
-    // scratch (allocated once)
-    this._polyA = new Float32Array(MAX_POLY * 3);
-    this._polyB = new Float32Array(MAX_POLY * 3);
-    this._basis = new Float32Array(9);
     this._dirtyLo = Infinity;
     this._dirtyHi = -Infinity;
-    this._wrapped = false;
-  }
-
-  /** Clip polygon `src`/`n` against plane axis (0..2) sign (+1/-1) limit. */
-  _clip(src, n, dst, axis, sign, limit) {
-    let m = 0;
-    for (let i = 0; i < n; i++) {
-      const j = (i + 1) % n;
-      const ai = i * 3;
-      const bi = j * 3;
-      const av = src[ai + axis] * sign;
-      const bv = src[bi + axis] * sign;
-      const ain = av <= limit;
-      const bin = bv <= limit;
-      if (ain) {
-        if (m < MAX_POLY) {
-          dst[m * 3] = src[ai];
-          dst[m * 3 + 1] = src[ai + 1];
-          dst[m * 3 + 2] = src[ai + 2];
-          m++;
-        }
-      }
-      if (ain !== bin) {
-        const t = (limit - av) / (bv - av);
-        if (m < MAX_POLY) {
-          dst[m * 3] = src[ai] + (src[bi] - src[ai]) * t;
-          dst[m * 3 + 1] = src[ai + 1] + (src[bi + 1] - src[ai + 1]) * t;
-          dst[m * 3 + 2] = src[ai + 2] + (src[bi + 2] - src[ai + 2]) * t;
-          m++;
-        }
-      }
-    }
-    return m;
   }
 
   /**
-   * Project a decal.
+   * デカールを 1 枚貼る。
    *
-   * @param {object} o
-   * @param {THREE.Vector3} o.point   surface point
-   * @param {THREE.Vector3} o.normal  surface normal
-   * @param {number} o.size           edge length in metres
-   * @param {number} o.tile           atlas tile index
-   * @param {number} [o.roll]         rotation about the normal, radians
-   * @param {number} [o.life]         seconds
-   * @param {number} [o.fade]         normalised age at which fading starts
-   * @param {number} [o.opacity]
-   * @param {number} [o.maxAngle]     reject triangles beyond this deviation
-   * @param {number} [o.depth]        projector half-thickness in metres
-   * @param {boolean} [o.flip]        mirror the sprite for variety
-   * @param {object} o.world          physics StaticWorld
-   * @param {number} o.now
+   * @param point  world 座標の貼り付け点
+   * @param normal 面の法線 (正規化済み)
+   * @param o      { tile, size, life, alpha, rot, r, g, b }
    */
-  add(o) {
-    const world = o.world;
-    const size = o.size;
-    const hs = size * 0.5;
-    const hd = o.depth ?? Math.max(0.045, size * 0.35);
-    const p = o.point;
-    const nz = o.normal;
-
-    // ---- orthonormal basis around the impact normal ------------------------
-    let nx = nz.x;
-    let ny = nz.y;
-    let nzz = nz.z;
-    const nl = Math.hypot(nx, ny, nzz) || 1;
-    nx /= nl;
-    ny /= nl;
-    nzz /= nl;
-    // Roll reference: gravity-aligned on walls (so blood runs and gouges read
-    // correctly), arbitrary on floors/ceilings.
-    let ux = 0;
-    let uy = 1;
-    let uz = 0;
-    if (Math.abs(ny) > 0.94) {
-      ux = 1;
-      uy = 0;
-      uz = 0;
-    }
-    // tangent = normalize(up - n * dot(n,up)) then rolled about n
-    let d = ux * nx + uy * ny + uz * nzz;
-    let tx = ux - nx * d;
-    let ty = uy - ny * d;
-    let tz = uz - nzz * d;
-    let tl = Math.hypot(tx, ty, tz);
-    if (tl < 1e-4) {
-      tx = 1;
-      ty = 0;
-      tz = 0;
-      tl = 1;
-    }
-    tx /= tl;
-    ty /= tl;
-    tz /= tl;
-    const roll = o.roll ?? 0;
-    if (roll !== 0) {
-      // Rodrigues rotation of t about n
-      const c = Math.cos(roll);
-      const s = Math.sin(roll);
-      const cx = ny * tz - nzz * ty;
-      const cy = nzz * tx - nx * tz;
-      const cz = nx * ty - ny * tx;
-      const rx = tx * c + cx * s;
-      const ry = ty * c + cy * s;
-      const rz = tz * c + cz * s;
-      tx = rx;
-      ty = ry;
-      tz = rz;
-    }
-    // bitangent = n x t
-    const bx = ny * tz - nzz * ty;
-    const by = nzz * tx - nx * tz;
-    const bz = nx * ty - ny * tx;
-
-    const slot = this.cursor;
-    this.cursor = slot + 1;
+  add(point, normal, o, now) {
+    const i = this.cursor;
+    this.cursor = i + 1;
     if (this.cursor >= this.capacity) {
       this.cursor = 0;
       this._wrapped = true;
     }
-    let w = slot * this.vertsPerDecal; // write cursor, in vertices
-    const limit = w + this.vertsPerDecal;
+    if (i + 1 > this.highWater) this.highWater = i + 1;
 
-    const cosLimit = Math.cos(((o.maxAngle ?? 62) * Math.PI) / 180);
-    const A = this._polyA;
-    const B = this._polyB;
+    const a = this.array;
+    const b = i * STRIDE;
+    const life = Math.max(0.5, o.life ?? 60);
 
-    let wrote = 0;
-    if (world && world.triCount > 0) {
-      const rad = Math.max(hs, hd) * 1.5;
-      const n = world.queryAabb(
-        p.x - rad, p.y - rad, p.z - rad,
-        p.x + rad, p.y + rad, p.z + rad,
-        o.mask ?? 0xffff
-      );
-      const cand = world.candidates;
-      const tpos = world.pos;
-      const tnrm = world.nrm;
-      for (let ci = 0; ci < n && w + 3 <= limit; ci++) {
-        const tri = cand[ci];
-        const tn = tri * 3;
-        const fnx = tnrm[tn];
-        const fny = tnrm[tn + 1];
-        const fnz = tnrm[tn + 2];
-        if (fnx * nx + fny * ny + fnz * nzz < cosLimit) continue;
+    a[b + O_POS] = point.x;
+    a[b + O_POS + 1] = point.y;
+    a[b + O_POS + 2] = point.z;
+    a[b + O_POS + 3] = o.size ?? 0.06;
 
-        // to decal space
-        const tp = tri * 9;
-        let m = 3;
-        for (let v = 0; v < 3; v++) {
-          const dx = tpos[tp + v * 3] - p.x;
-          const dy = tpos[tp + v * 3 + 1] - p.y;
-          const dz = tpos[tp + v * 3 + 2] - p.z;
-          A[v * 3] = dx * tx + dy * ty + dz * tz;
-          A[v * 3 + 1] = dx * bx + dy * by + dz * bz;
-          A[v * 3 + 2] = dx * nx + dy * ny + dz * nzz;
-        }
+    a[b + O_NRM] = normal.x;
+    a[b + O_NRM + 1] = normal.y;
+    a[b + O_NRM + 2] = normal.z;
+    a[b + O_NRM + 3] = o.rot ?? 0;
 
-        m = this._clip(A, m, B, 0, 1, hs);
-        if (m < 3) continue;
-        m = this._clip(B, m, A, 0, -1, hs);
-        if (m < 3) continue;
-        m = this._clip(A, m, B, 1, 1, hs);
-        if (m < 3) continue;
-        m = this._clip(B, m, A, 1, -1, hs);
-        if (m < 3) continue;
-        m = this._clip(A, m, B, 2, 1, hd);
-        if (m < 3) continue;
-        m = this._clip(B, m, A, 2, -1, hd);
-        if (m < 3) continue;
+    a[b + O_MSC] = o.tile ?? 0;
+    a[b + O_MSC + 1] = now;
+    a[b + O_MSC + 2] = 1 / life;
+    a[b + O_MSC + 3] = o.alpha ?? 1;
 
-        // fan, back to world space, lifted off the surface along its own normal
-        const lift = 0.0016 + size * 0.004;
-        for (let v = 1; v + 1 < m && w + 3 <= limit; v++) {
-          FAN[1] = v;
-          FAN[2] = v + 1;
-          for (let q = 0; q < 3; q++) {
-            const s = FAN[q] * 3;
-            const lx = A[s];
-            const ly = A[s + 1];
-            const lz = A[s + 2];
-            const wx = p.x + tx * lx + bx * ly + nx * lz + fnx * lift;
-            const wy = p.y + ty * lx + by * ly + ny * lz + fny * lift;
-            const wz = p.z + tz * lx + bz * ly + nzz * lz + fnz * lift;
-            this.pos[w * 3] = wx;
-            this.pos[w * 3 + 1] = wy;
-            this.pos[w * 3 + 2] = wz;
-            this.nrm[w * 3] = fnx;
-            this.nrm[w * 3 + 1] = fny;
-            this.nrm[w * 3 + 2] = fnz;
-            this._writeUv(w, lx, ly, hs, o.tile, o.flip);
-            w++;
-            wrote++;
-          }
-        }
-      }
-    }
+    a[b + O_COL] = o.r ?? 1;
+    a[b + O_COL + 1] = o.g ?? 1;
+    a[b + O_COL + 2] = o.b ?? 1;
+    a[b + O_COL + 3] = 0;
 
-    // Fallback: nothing in the BVH here (dynamic body, actor, or a world that
-    // has not registered collision yet) — lay a single quad on the plane.
-    if (wrote === 0 && w + 6 <= limit) {
-      const lift = 0.004 + size * 0.01;
-      QUAD[0] = -hs; QUAD[1] = -hs;
-      QUAD[2] = hs; QUAD[3] = -hs;
-      QUAD[4] = hs; QUAD[5] = hs;
-      QUAD[6] = -hs; QUAD[7] = -hs;
-      QUAD[8] = hs; QUAD[9] = hs;
-      QUAD[10] = -hs; QUAD[11] = hs;
-      for (let q = 0; q < 6; q++) {
-        const lx = QUAD[q * 2];
-        const ly = QUAD[q * 2 + 1];
-        this.pos[w * 3] = p.x + tx * lx + bx * ly + nx * lift;
-        this.pos[w * 3 + 1] = p.y + ty * lx + by * ly + ny * lift;
-        this.pos[w * 3 + 2] = p.z + tz * lx + bz * ly + nzz * lift;
-        this.nrm[w * 3] = nx;
-        this.nrm[w * 3 + 1] = ny;
-        this.nrm[w * 3 + 2] = nzz;
-        this._writeUv(w, lx, ly, hs, o.tile, o.flip);
-        w++;
-        wrote++;
-      }
-    }
-
-    // Degenerate the rest of the slot so a shorter decal does not leave the
-    // previous occupant's triangles behind.
-    const life = Math.max(0.2, o.life ?? 30);
-    const birth = o.now;
-    const fade = o.fade ?? 0.72;
-    const opacity = o.opacity ?? 1;
-    for (let v = slot * this.vertsPerDecal; v < limit; v++) {
-      if (v >= slot * this.vertsPerDecal + wrote) {
-        this.pos[v * 3] = 0;
-        this.pos[v * 3 + 1] = 0;
-        this.pos[v * 3 + 2] = 0;
-      }
-      this.dec[v * 4] = birth;
-      this.dec[v * 4 + 1] = 1 / life;
-      this.dec[v * 4 + 2] = fade;
-      this.dec[v * 4 + 3] = opacity;
-    }
-
-    if (slot < this._dirtyLo) this._dirtyLo = slot;
-    if (slot > this._dirtyHi) this._dirtyHi = slot;
-    if (slot + 1 > this.highWater) this.highWater = slot + 1;
-    if (birth + life > this.expireAt) this.expireAt = birth + life;
-    this.count++;
-    return wrote > 0;
-  }
-
-  _writeUv(w, lx, ly, hs, tile, flip) {
-    const cols = this.cols;
-    const tx = tile % cols;
-    const ty = Math.floor(tile / cols);
-    let u = lx / (2 * hs) + 0.5;
-    const v = ly / (2 * hs) + 0.5;
-    if (flip) u = 1 - u;
-    this.uvs[w * 2] = (u + tx) / cols;
-    this.uvs[w * 2 + 1] = (v + ty) / cols;
+    if (i < this._dirtyLo) this._dirtyLo = i;
+    if (i > this._dirtyHi) this._dirtyHi = i;
+    const end = now + life;
+    if (end > this.expireAt) this.expireAt = end;
+    return i;
   }
 
   flush(now) {
-    this.uNow.value = now;
     if (this._dirtyHi >= this._dirtyLo) {
-      const vpd = this.vertsPerDecal;
-      const start = this._dirtyLo * vpd;
-      const count = (this._dirtyHi - this._dirtyLo + 1) * vpd;
-      this.aPos.addUpdateRange(start * 3, count * 3);
-      this.aPos.needsUpdate = true;
-      this.aNrm.addUpdateRange(start * 3, count * 3);
-      this.aNrm.needsUpdate = true;
-      this.aUv.addUpdateRange(start * 2, count * 2);
-      this.aUv.needsUpdate = true;
-      this.aDec.addUpdateRange(start * 4, count * 4);
-      this.aDec.needsUpdate = true;
+      const lo = this._dirtyLo * STRIDE;
+      const hi = (this._dirtyHi + 1) * STRIDE;
+      this.buffer.updateDirectly(this.array.subarray(lo, hi), lo);
       this._dirtyLo = Infinity;
       this._dirtyHi = -Infinity;
     }
-    const verts = (this._wrapped ? this.capacity : this.highWater) * this.vertsPerDecal;
-    this.geometry.setDrawRange(0, verts);
-    this.mesh.visible = verts > 0 && now < this.expireAt;
+    this.material.setFloat('uTime', now);
+    const count = this._wrapped ? this.capacity : this.highWater;
+    this.mesh.forcedInstanceCount = count;
+    this.mesh.setEnabled(now < this.expireAt && count > 0);
+  }
+
+  setLighting(sunDir, sunCol, amb) {
+    this.material.setVector3('uSunDir', sunDir);
+    this.material.setVector3('uSunCol', sunCol);
+    this.material.setVector3('uAmb', amb);
   }
 
   dispose() {
-    this.geometry.dispose();
+    this.mesh.dispose();
     this.material.dispose();
+    this.buffer.dispose();
   }
 }

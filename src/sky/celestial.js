@@ -1,39 +1,48 @@
-import * as THREE from 'three';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 
 /**
- * Where the sun and moon actually are.
+ * 太陽と月が実際にどこにあるか。
  *
- * Standard spherical astronomy: declination from the day of year, hour angle
- * from local solar time, then the altitude/azimuth transform for the site
- * latitude. Nothing is hand-placed, so the shots that matter come out of one
- * consistent sky rather than three separate art passes.
+ * 標準的な球面天文学: 通日から赤緯、地方太陽時から時角、緯度で高度/方位に変換する。
+ * 手置きの値は無いので、重要なショットは 3 つの別々のアートパスではなく
+ * **1 つの整合した空**から出てくる。
  *
- * Site and date are chosen so the graded times land where the shot list says
- * they should (lat 45N, summer solstice, sunset at 19.71):
+ * ## なぜ簡易軌道 (sin カーブ) ではダメなのか
  *
- *   16.50  sun +32.0 deg, azimuth 272 (due west)   — hard afternoon key
- *   19.20  sun  +4.6 deg, azimuth 299 (WNW)        — golden hour, disc in frame
- *   01.50  sun -18.6 deg                           — full night
- *          moon +21.7 deg, azimuth 288 (W)         — half-lit, in frame
+ * dev/shots.js のショットリストは Three 版のこのモデルを前提に時刻が振られている。
+ * サイトと日付は「グレーディング済みの時刻がショットリストの言う場所に来る」よう
+ * 選ばれている (緯度 45N、夏至、日没 19.71 時):
  *
- * Azimuth convention: 0 = north = -Z, 90 = east = +X. `northAngle` rotates the
- * whole celestial sphere for art direction without touching the astronomy.
+ *   16.50  太陽 +32.0°, 方位 272 (真西)   — 硬い午後のキーライト
+ *   19.20  太陽  +4.6°, 方位 299 (西北西) — ゴールデンアワー、太陽円板がフレーム内
+ *   01.50  太陽 -18.6°                    — 完全な夜
+ *          月   +21.7°, 方位 288 (西)     — 半月、フレーム内
+ *
+ * 最初の Babylon 移植は「日の出 6 時 / 日没 18 時」の sin カーブで代用しており、
+ * 19.2 時の sunset ショットが太陽高度 -18.6° (= 真っ暗な夜) になって空が黒一色に
+ * なった。**時刻→太陽位置の対応はショットリストとの契約**なので、この天文計算を
+ * 簡略化してはいけない。
+ *
+ * 方位の規約: 0 = 北 = -Z、90 = 東 = +X。`northAngleDeg` は天文計算に触れずに
+ * 天球全体を回すアートディレクション用のつまみ。
+ *
+ * (Three 版にあった星空用の celestialMatrix は、星のレンダリングを移植したときに
+ * 一緒に持ってくること。ここでは未使用なので省いている。)
  */
 
 export const SITE = {
   latitudeDeg: 45.0,
-  dayOfYear: 172, // summer solstice
-  /** Rotates north in world space. 0 keeps north at -Z. */
+  dayOfYear: 172, // 夏至
+  /** ワールド空間の北を回す。0 で北 = -Z のまま。 */
   northAngleDeg: 0,
   /**
-   * Moon hour angle offset from the sun, degrees, and lunar declination.
+   * 月の時角オフセット (太陽からの度数) と月の赤緯。
    *
-   * 244 / +28 (the moon's real declination limit) puts the moon at altitude 22 /
-   * azimuth 288 at 01:30, which is INSIDE the night shot's frustum — the old
-   * 216.8 / +12 put it at azimuth 250, twenty degrees off the left edge, so the
-   * one frame that exists to show a moonlit street had no moon in it. At this
-   * declination it is also 58% illuminated, so the terminator reads and the disc
-   * is a sphere rather than a flat white dot.
+   * 244 / +28 (月の赤緯の実限界) は 01:30 に月を高度 22 / 方位 288 に置く。これは
+   * night ショットの視錐台の**内側**。Three 版で 216.8 / +12 にしていた頃は方位 250
+   * となり左端から 20 度外れ、「月明かりの街を見せるためのフレームに月が無い」
+   * 状態だった。この赤緯では輝面比も 58% になり、明暗境界が読めて円板が平坦な
+   * 白い点ではなく球に見える。
    */
   moonHourOffsetDeg: 244.0,
   moonDeclinationDeg: 28.0,
@@ -41,14 +50,16 @@ export const SITE = {
 
 const DEG = Math.PI / 180;
 
-/** Solar declination, Cooper's approximation. */
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+/** 太陽赤緯。Cooper の近似式。 */
 export function solarDeclination(dayOfYear) {
   return 23.44 * DEG * Math.sin(((2 * Math.PI) / 365) * (284 + dayOfYear));
 }
 
 /**
- * Altitude/azimuth for a body at a given hour angle and declination.
- * `hourAngle` in radians, 0 at local meridian, positive in the afternoon.
+ * 与えた時角と赤緯の天体の高度/方位。
+ * `hourAngle` はラジアン。子午線通過で 0、午後に正。
  */
 export function altAz(hourAngle, declination, latitudeDeg, out = { alt: 0, az: 0 }) {
   const lat = latitudeDeg * DEG;
@@ -57,53 +68,50 @@ export function altAz(hourAngle, declination, latitudeDeg, out = { alt: 0, az: 0
   const sinD = Math.sin(declination);
   const cosD = Math.cos(declination);
   const sinAlt = sinLat * sinD + cosLat * cosD * Math.cos(hourAngle);
-  const alt = Math.asin(THREE.MathUtils.clamp(sinAlt, -1, 1));
+  const alt = Math.asin(clamp(sinAlt, -1, 1));
   const cosAlt = Math.cos(alt);
   let cosAz = 0;
   if (cosAlt > 1e-6 && cosLat > 1e-6) {
     cosAz = (sinD - sinAlt * sinLat) / (cosAlt * cosLat);
   }
-  let az = Math.acos(THREE.MathUtils.clamp(cosAz, -1, 1));
-  // Hour angle positive = past the meridian = western half of the sky.
+  let az = Math.acos(clamp(cosAz, -1, 1));
+  // 時角が正 = 子午線を過ぎた = 空の西半分。
   if (Math.sin(hourAngle) > 0) az = 2 * Math.PI - az;
   out.alt = alt;
   out.az = az;
   return out;
 }
 
-/** World-space unit vector from altitude/azimuth. Points *toward* the body. */
+/** 高度/方位からワールド空間の単位ベクトル。**天体の方を指す。** */
 export function dirFromAltAz(alt, az, northAngleRad, out) {
   const a = az + northAngleRad;
   const ca = Math.cos(alt);
-  return out.set(ca * Math.sin(a), Math.sin(alt), -ca * Math.cos(a)).normalize();
+  out.set(ca * Math.sin(a), Math.sin(alt), -ca * Math.cos(a));
+  return out.normalize();
 }
 
 /**
- * Full celestial state for an hour of the day.
- * `sun`/`moon` are unit world directions pointing at the body.
+ * ある時刻の天体状態一式。`sun` / `moon` は天体を指す単位ワールド方向。
+ *
+ * ベクトルは再利用する (毎フレーム呼ばれても GC を出さない — Hard rule 5)。
  */
 export class Celestial {
   constructor(site = SITE) {
     this.site = { ...site };
-    this.sun = new THREE.Vector3(0, 1, 0);
-    this.moon = new THREE.Vector3(0, -1, 0);
+    this.sun = new Vector3(0, 1, 0);
+    this.moon = new Vector3(0, -1, 0);
     this.sunAlt = 0;
     this.sunAz = 0;
     this.moonAlt = 0;
     this.moonAz = 0;
-    /** Illuminated fraction of the lunar disc, 0..1. */
-    this.moonPhase = 1;
-    /** Angular separation sun-moon; drives the terminator on the disc. */
-    this.moonElongation = Math.PI;
     this._aa = { alt: 0, az: 0 };
-    this._m = new THREE.Matrix4();
-    this._tilt = new THREE.Matrix4();
   }
 
   setHour(hour) {
     const s = this.site;
     const north = s.northAngleDeg * DEG;
     const decl = solarDeclination(s.dayOfYear);
+    // 時角: 12 時に 0、1 時間 = 15 度。
     const H = (hour - 12) * 15 * DEG;
 
     altAz(H, decl, s.latitudeDeg, this._aa);
@@ -117,19 +125,6 @@ export class Celestial {
     this.moonAz = this._aa.az;
     dirFromAltAz(this.moonAlt, this.moonAz, north, this.moon);
 
-    this.moonElongation = Math.acos(THREE.MathUtils.clamp(this.sun.dot(this.moon), -1, 1));
-    this.moonPhase = 0.5 * (1 - Math.cos(this.moonElongation));
-
-    // Equatorial -> world rotation for the starfield: the sky turns 15 deg/hour
-    // about the polar axis, which is tilted from vertical by (90 - latitude).
-    const polarTilt = (90 - s.latitudeDeg) * DEG;
-    this._m.makeRotationY(-H + north);
-    this._m.premultiply(this._tilt.makeRotationX(polarTilt));
     return this;
-  }
-
-  /** THREE.Matrix3 usable as a `mat3` uniform, world dir -> fixed sky. */
-  celestialMatrix(out) {
-    return out.setFromMatrix4(this._m);
   }
 }

@@ -7,7 +7,8 @@
  * bones they bind to.
  */
 
-import * as THREE from 'three';
+// Babylon 移植: Three 互換の自前 math shim (経緯は math3.js 冒頭コメント参照)
+import * as THREE from './math3.js';
 import {
   emptyMesh, loft, tube, ribbon, revolve, ellipsoid, boxRound, superEllipse,
   ellipseProfile, appendMesh, computeNormals, displace, warp, transformMesh, vcount,
