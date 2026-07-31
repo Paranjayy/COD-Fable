@@ -4,6 +4,26 @@
  *
  * Edge queries (`pressed`, `released`) are valid only during the frame in which
  * the transition happened — read them in update(), not fixedUpdate().
+ *
+ * ## Pointer Events を使うこと。mousedown/mouseup を使ってはいけない
+ *
+ * Babylon の Scene 入力マネージャは `preventDefaultOnPointerDown`
+ * (`preventDefaultOnPointerUp`) が既定で true で、`pointerdown` / `pointerup` に対して
+ * `preventDefault()` を呼ぶ。この preventDefault は **互換イベントである
+ * `mousedown` / `mouseup` の生成そのものを止める**。
+ *
+ * three.js から Babylon に移行した際、ここが `mousedown` / `mouseup` を購読したままだったため、
+ * 以下がすべて無言で死んでいた (エラーもログも出ない):
+ *
+ * - `_onMouseDown` が発火しない → `requestPointerLock()` が呼ばれない → **視点移動不能**
+ * - `Mouse0` / `Mouse2` が `down` に入らない → **射撃・ADS 不能**
+ *
+ * `pointermove` / `mousemove` は preventDefault の影響を受けないので当時も動いており、
+ * 「視点だけ動かない」ように見えて原因が分かりにくかった。
+ *
+ * Babylon 側のフラグを false にして mousedown を復活させる手もあるが、それは
+ * 「サードパーティの既定値に依存し続ける」修正でしかない。入力層は自前のイベント源を
+ * 持つべきなので、ボタン・移動とも Pointer Events に統一する。
  */
 
 export const ACTIONS = {
@@ -54,9 +74,9 @@ export class Input {
     this._bound = {
       keydown: this._onKeyDown.bind(this),
       keyup: this._onKeyUp.bind(this),
-      mousedown: this._onMouseDown.bind(this),
-      mouseup: this._onMouseUp.bind(this),
-      mousemove: this._onMouseMove.bind(this),
+      pointerdown: this._onPointerDown.bind(this),
+      pointerup: this._onPointerUp.bind(this),
+      pointermove: this._onPointerMove.bind(this),
       wheel: this._onWheel.bind(this),
       lockchange: this._onLockChange.bind(this),
       blur: this._onBlur.bind(this),
@@ -67,9 +87,9 @@ export class Input {
   attach() {
     addEventListener('keydown', this._bound.keydown);
     addEventListener('keyup', this._bound.keyup);
-    addEventListener('mousedown', this._bound.mousedown);
-    addEventListener('mouseup', this._bound.mouseup);
-    addEventListener('mousemove', this._bound.mousemove);
+    addEventListener('pointerdown', this._bound.pointerdown);
+    addEventListener('pointerup', this._bound.pointerup);
+    addEventListener('pointermove', this._bound.pointermove);
     addEventListener('wheel', this._bound.wheel, { passive: true });
     addEventListener('blur', this._bound.blur);
     document.addEventListener('pointerlockchange', this._bound.lockchange);
@@ -79,9 +99,9 @@ export class Input {
   detach() {
     removeEventListener('keydown', this._bound.keydown);
     removeEventListener('keyup', this._bound.keyup);
-    removeEventListener('mousedown', this._bound.mousedown);
-    removeEventListener('mouseup', this._bound.mouseup);
-    removeEventListener('mousemove', this._bound.mousemove);
+    removeEventListener('pointerdown', this._bound.pointerdown);
+    removeEventListener('pointerup', this._bound.pointerup);
+    removeEventListener('pointermove', this._bound.pointermove);
     removeEventListener('wheel', this._bound.wheel);
     removeEventListener('blur', this._bound.blur);
     document.removeEventListener('pointerlockchange', this._bound.lockchange);
@@ -114,18 +134,23 @@ export class Input {
     this._pendingUp.add(e.code);
   }
 
-  _onMouseDown(e) {
-    if (!this.enabled) return;
+  /**
+   * ボタンのコードは `Mouse${button}` のまま (Mouse0 = 左, Mouse2 = 右)。
+   * タッチ / ペンは `pointerType` で弾く — マウス以外は button の意味が変わり、
+   * 「画面に触れたら発砲」になってしまう。
+   */
+  _onPointerDown(e) {
+    if (!this.enabled || e.pointerType !== 'mouse') return;
     if (!this.pointerLocked && e.button === 0) this.requestPointerLock();
     this._pendingDown.add(`Mouse${e.button}`);
   }
 
-  _onMouseUp(e) {
-    if (!this.enabled) return;
+  _onPointerUp(e) {
+    if (!this.enabled || e.pointerType !== 'mouse') return;
     this._pendingUp.add(`Mouse${e.button}`);
   }
 
-  _onMouseMove(e) {
+  _onPointerMove(e) {
     if (!this.enabled || !this.pointerLocked || this.frozen) return;
     // movementX/Y is already relative and unaffected by cursor clamping.
     this._rawLook.x += e.movementX ?? 0;
