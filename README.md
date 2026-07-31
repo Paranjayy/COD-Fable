@@ -1,6 +1,24 @@
-# Claude of Duty
+# COD Fable
 
-Get updates [here](https://shumer.dev/newsletter).
+**A procedural browser FPS built in Three.js.** Every environment, weapon,
+character, texture and sound is generated from code — no downloaded game assets.
+
+[![Play COD Fable](https://img.shields.io/badge/Play-COD%20Fable-f2742a?style=for-the-badge)](https://cod-fable.vercel.app)
+[![Open in DeepWiki](https://img.shields.io/badge/Open%20in-DeepWiki-171717?style=for-the-badge)](https://deepwiki.com/Paranjayy/COD-Fable)
+
+## Project links
+
+- **Play:** [cod-fable.vercel.app](https://cod-fable.vercel.app)
+- **Project repository:** [Paranjayy/COD-Fable](https://github.com/Paranjayy/COD-Fable)
+- **DeepWiki:** [AI-generated project documentation](https://deepwiki.com/Paranjayy/COD-Fable)
+- **Upstream source:** [mshumer/Claude-of-Duty](https://github.com/mshumer/Claude-of-Duty)
+- **Original demo:** [Matt Shumer on X](https://x.com/mattshumer_/status/2081054356405731740)
+- **Updates:** [Matt Shumer’s newsletter](https://shumer.dev/newsletter)
+
+The repository is intentionally evolving beyond the upstream demo. The immediate
+focus is a robust browser launch experience, a play-worthy session loop, and
+measured performance work for Apple silicon laptops — without flattening the
+procedural visual character that makes it special.
 
 A first-person shooter built in the browser with Three.js r180 and WebGL2. Roughly
 55k lines across 11 subsystems, written by a fleet of AI agents under orchestration.

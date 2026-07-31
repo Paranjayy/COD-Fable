@@ -13,6 +13,7 @@ import { WorldMarkers } from './markers.js';
 import { Prompt, Banner } from './prompts.js';
 import { PauseMenu } from './menu.js';
 import { CombatDemo } from './demo.js';
+import { HomeScreen } from './home.js';
 
 const MAX_BLIPS = 48;
 
@@ -91,6 +92,10 @@ export class UiSystem {
     this.prompt = new Prompt(this.chromeLayer);
     this.banner = new Banner(this.chromeLayer);
     this.menu = new PauseMenu(this.root, ctx);
+    this.home = new HomeScreen(this.root, {
+      onStart: (mode) => this.startSession(mode),
+      onSettings: () => this.openSettings(),
+    });
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
 
@@ -128,8 +133,9 @@ export class UiSystem {
     this.k = 1;
     this.vw = 1920;
     this.vh = 1080;
-    this.hudVisible = 1;
-    this.hudTarget = 1;
+    this._isCapture = !!ctx.config.deterministic;
+    this.hudVisible = this._isCapture ? 1 : 0;
+    this.hudTarget = this._isCapture ? 1 : 0;
     this._lastRaw = ctx.time.raw;
     this._lastKillAt = -10;
     this._regenTimer = 0;
@@ -151,6 +157,16 @@ export class UiSystem {
 
     this._unsubs = [];
     const on = (type, fn) => this._unsubs.push(ctx.events.on(type, fn));
+
+    on('ui:pause', ({ paused }) => {
+      if (paused || !this._returnHomeAfterMenu) return;
+      this._returnHomeAfterMenu = false;
+      this.setHudVisible(false);
+      ctx.input.enabled = false;
+      ctx.peek('player')?.setControlEnabled?.(false);
+      document.exitPointerLock?.();
+      this.home.show();
+    });
 
     on('weapon:fire', (e) => {
       this.crosshair.onFire(e?.recoil ?? 1);
@@ -242,6 +258,15 @@ export class UiSystem {
 
     this.resize(ctx.canvas.clientWidth || innerWidth, ctx.canvas.clientHeight || innerHeight, ctx);
     this._prevPos.copy(this._playerPos());
+    // The procedural world can finish booting behind the command screen, but
+    // it must not respond to movement or mouse input until the player commits
+    // to a session.
+    if (this._isCapture) {
+      this.home.hide();
+    } else {
+      ctx.input.enabled = false;
+      ctx.peek('player')?.setControlEnabled?.(false);
+    }
   }
 
   /* ------------------------------------------------------------- helpers -- */
@@ -358,6 +383,21 @@ export class UiSystem {
 
   setHudVisible(v) {
     this.hudTarget = v ? 1 : 0;
+  }
+
+  startSession(mode = 'operation') {
+    const practice = mode === 'practice';
+    this.setMatch({ mode: practice ? 'PRACTICE' : 'OPERATION', scoreUs: 0, scoreThem: 0, timeLeft: 600 });
+    this.setHudVisible(true);
+    this.ctx.input.enabled = true;
+    this.ctx.peek('player')?.setControlEnabled?.(true);
+    this.ctx.input.requestPointerLock();
+    this.ctx.events.emit('session:start', { mode });
+  }
+
+  openSettings() {
+    this._returnHomeAfterMenu = true;
+    this.menu.show();
   }
 
   pause() {
@@ -607,6 +647,7 @@ export class UiSystem {
     this.prompt.dispose();
     this.banner.dispose();
     this.menu.dispose();
+    this.home.dispose();
     this.root.remove();
     removeStyles();
   }

@@ -677,6 +677,60 @@ const CSS = `
   letter-spacing:.2em; color: var(--ink-3);
 }
 
+/* ======================================================== command lobby */
+.ow-home {
+  position:absolute; inset:0; z-index:30; pointer-events:auto;
+  display:grid; grid-template-columns:minmax(18rem, 31vw) minmax(16rem, 25vw) 1fr;
+  grid-template-rows:1fr auto; align-items:end; gap:clamp(1rem, 3vw, 4rem);
+  padding:clamp(1.5rem, 5vw, 5.5rem); overflow:hidden;
+  background:linear-gradient(90deg, rgba(10,13,14,.84) 0%, rgba(10,13,14,.51) 32%, rgba(10,13,14,.07) 69%, rgba(10,13,14,.34) 100%);
+  transition:opacity .36s ease, transform .36s cubic-bezier(.16,1,.3,1);
+}
+.ow-home::before {
+  content:""; position:absolute; inset:0; pointer-events:none; opacity:.32;
+  background:repeating-linear-gradient(0deg, rgba(255,255,255,.035) 0 1px, transparent 1px 5px);
+}
+.ow-home.leaving { opacity:0; transform:scale(1.015); }
+.ow-home-mast, .ow-home-actions, .ow-home-rail { position:relative; z-index:1; }
+.ow-home-mast { align-self:center; margin-bottom:12vh; }
+.ow-home-eyebrow, .ow-home-status span {
+  color:rgba(255,186,95,.82); font-size:clamp(.58rem,.7vw,.72rem); letter-spacing:.2em; text-transform:uppercase;
+}
+.ow-home-title {
+  margin:clamp(.4rem,1vw,.8rem) 0 0; color:#f1e8d8; font:800 clamp(3rem,8vw,8.5rem)/.79 Impact, Haettenschweiler, sans-serif;
+  letter-spacing:-.055em; text-transform:uppercase; text-shadow:0 4px 20px rgba(0,0,0,.35);
+}
+.ow-home-deck { max-width:25rem; margin-top:clamp(1.25rem,2.2vw,2.2rem); color:rgba(231,225,213,.71); font-size:clamp(.8rem,.95vw,1rem); line-height:1.5; letter-spacing:.025em; }
+.ow-home-actions { display:grid; gap:.6rem; align-self:center; margin-bottom:6vh; }
+.ow-home-mode, .ow-home-settings {
+  appearance:none; border:0; border-radius:0; color:#eee5d5; font:inherit; text-align:left; cursor:pointer;
+}
+.ow-home-mode {
+  min-height:7.3rem; display:grid; grid-template-columns:2.5rem 1fr auto; gap:1rem; align-items:center; padding:1.15rem 1.1rem;
+  background:rgba(12,15,16,.46); border-left:1px solid rgba(241,232,214,.21); transition:background .16s ease, transform .16s ease, border-color .16s ease;
+}
+.ow-home-mode:hover, .ow-home-mode:focus-visible { background:rgba(242,116,42,.9); color:#17110d; border-color:#ffd29a; transform:translateX(.45rem); outline:0; }
+.ow-home-index { align-self:start; color:rgba(255,192,104,.78); font:600 .68rem/1 ui-monospace, SFMono-Regular, monospace; letter-spacing:.1em; }
+.ow-home-mode:hover .ow-home-index, .ow-home-mode:focus-visible .ow-home-index { color:rgba(23,17,13,.7); }
+.ow-home-copy { display:grid; gap:.35rem; }
+.ow-home-copy strong { font-size:clamp(.94rem,1.1vw,1.18rem); letter-spacing:.06em; text-transform:uppercase; }
+.ow-home-copy small { color:rgba(231,225,213,.65); font-size:.68rem; letter-spacing:.04em; line-height:1.35; }
+.ow-home-mode:hover small, .ow-home-mode:focus-visible small { color:rgba(23,17,13,.72); }
+.ow-home-go { font-size:.62rem; letter-spacing:.17em; text-transform:uppercase; opacity:.62; }
+.ow-home-rail { grid-column:1 / -1; display:flex; justify-content:space-between; align-items:end; border-top:1px solid rgba(240,230,210,.16); padding-top:1rem; }
+.ow-home-status { display:grid; gap:.2rem; text-transform:uppercase; }
+.ow-home-status strong { color:#b7d68d; font-size:.68rem; letter-spacing:.17em; }
+.ow-home-settings { color:rgba(235,226,210,.68); font-size:.68rem; letter-spacing:.17em; text-transform:uppercase; padding:.5rem 0; }
+.ow-home-settings:hover, .ow-home-settings:focus-visible { color:#f3a959; outline:0; text-decoration:underline; text-underline-offset:.35rem; }
+@media (max-width: 720px) {
+  .ow-home { grid-template-columns:1fr; grid-template-rows:auto 1fr auto; align-items:start; padding:1.5rem; background:linear-gradient(180deg,rgba(10,13,14,.83),rgba(10,13,14,.24)); }
+  .ow-home-mast, .ow-home-actions { margin-bottom:0; align-self:start; }
+  .ow-home-title { font-size:clamp(3.5rem,19vw,6rem); }
+  .ow-home-actions { align-self:end; }
+  .ow-home-mode { min-height:5.8rem; }
+}
+@media (prefers-reduced-motion: reduce) { .ow-home, .ow-home-mode { transition:none; } }
+
 /* ============================================================== fadeouts */
 .ow-hidden { display:none !important; }
 `;

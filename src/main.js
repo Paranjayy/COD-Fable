@@ -92,7 +92,7 @@ console.info('[boot] prewarm', warmup);
 window.__PREWARM__ = warmup;
 
 engine.start();
-bootStatus.textContent = 'Ready — click to deploy';
+bootStatus.textContent = 'Command terminal ready';
 bootStatus.classList.add('ready');
 setTimeout(() => bootStatus.remove(), 400);
 
