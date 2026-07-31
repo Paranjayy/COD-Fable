@@ -18,6 +18,7 @@ import { prewarm } from './core/prewarm.js';
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
+const bootStatus = document.getElementById('boot');
 // Deterministic shutter for the pixel gate: the engine does not schedule its own
 // frames, the driver advances exactly N of them through window.__PUMP__. Opt-in,
 // because tools that measure real frame pacing (tools/perf.mjs) need the loop to
@@ -25,7 +26,9 @@ const capture = params.get('capture') === '1';
 const lockstep = capture && params.get('lockstep') === '1';
 
 const config = createConfig({
-  quality: params.get('q') ?? 'ultra',
+  // Medium is the reliable browser-demo default. Ultra remains available via
+  // `?q=ultra`, and can be selected from the pause menu after the game starts.
+  quality: params.get('q') ?? 'medium',
   deterministic: capture,
 });
 
@@ -48,6 +51,7 @@ engine
   .add(AudioSystem);
 
 try {
+  bootStatus.textContent = 'Building the world…';
   await engine.init();
 } catch (err) {
   console.error('[boot] init failed', err);
@@ -76,11 +80,21 @@ const shotApi = installShotApi(engine, { capture, lockstep });
 // lockstep in src/dev/shots.js; (2) `will-change: transform` on the compass strip
 // cached a composited-layer raster taken at a wall-clock-dependent moment — fixed
 // in src/ui/style.js.
-const warmup = params.get('prewarm') === '0' ? { ok: false, reason: 'disabled by ?prewarm=0' } : await prewarm(engine);
+// Some WebGL drivers leave `compileAsync` unresolved for a very long time. It
+// used to block `engine.start()` and therefore looked like a permanently blank
+// game. Keep shader pre-warming available for performance investigations, but
+// never make a first visit depend on it finishing.
+bootStatus.textContent = 'Finalizing renderer…';
+const warmup = params.get('prewarm') === '1'
+  ? await prewarm(engine)
+  : { ok: false, reason: 'opt in with ?prewarm=1' };
 console.info('[boot] prewarm', warmup);
 window.__PREWARM__ = warmup;
 
 engine.start();
+bootStatus.textContent = 'Ready — click to deploy';
+bootStatus.classList.add('ready');
+setTimeout(() => bootStatus.remove(), 400);
 
 // Capture harness handshake: only flag ready once a frame has actually landed.
 //
