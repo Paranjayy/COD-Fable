@@ -63,12 +63,14 @@ export class HomeScreen {
     this.open = false;
     this.root.classList.toggle('leaving', animate);
     setStyle(this.root, 'pointer-events', 'none');
-    if (animate) setTimeout(() => setStyle(this.root, 'display', 'none'), 380);
+    clearTimeout(this._hideTimer);
+    if (animate) this._hideTimer = setTimeout(() => setStyle(this.root, 'display', 'none'), 380);
     else setStyle(this.root, 'display', 'none');
   }
 
   show() {
     if (this.open) return;
+    clearTimeout(this._hideTimer);
     this.open = true;
     this.root.classList.remove('leaving');
     setStyle(this.root, 'display', '');

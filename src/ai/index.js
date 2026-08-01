@@ -309,6 +309,15 @@ export class AiSystem {
       }
     });
 
+    on('session:end', () => {
+      this.sessionMode = null;
+      for (const a of this.agents) {
+        a.hasTarget = false;
+        a.targetVisible = false;
+        a.wantFire = false;
+      }
+    });
+
     on('weapon:fire', (e) => {
       if (this.sessionMode !== 'operation') return;
       if (!e || !e.origin || e.weapon === 'ai_rifle') return; // ignore our own

@@ -19,12 +19,10 @@ import { prewarm } from './core/prewarm.js';
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
 const bootStatus = document.getElementById('boot');
-// Safari on Retina Apple-silicon laptops is the configuration that has shown
-// the clearest memory/frame-time pressure. Give a first visit a playable
-// profile there, while keeping the balanced medium preset everywhere else and
-// letting `?q=` always win as an explicit player choice.
-const safari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-const initialQuality = params.get('q') ?? (safari ? 'performance' : 'medium');
+// Preserve the original showcase quality by default. Performance is a clearly
+// labelled, explicit lobby/settings choice (`?q=performance`), never a silent
+// downgrade based on the browser.
+const initialQuality = params.get('q') ?? 'ultra';
 // Deterministic shutter for the pixel gate: the engine does not schedule its own
 // frames, the driver advances exactly N of them through window.__PUMP__. Opt-in,
 // because tools that measure real frame pacing (tools/perf.mjs) need the loop to
@@ -32,8 +30,7 @@ const initialQuality = params.get('q') ?? (safari ? 'performance' : 'medium');
 const lockstep = capture && params.get('lockstep') === '1';
 
 const config = createConfig({
-  // Medium is the reliable browser-demo default. Ultra remains available via
-  // `?q=ultra`, and can be selected from the pause menu after the game starts.
+  // The homepage exposes Performance as an opt-in for constrained hardware.
   quality: initialQuality,
   deterministic: capture,
 });

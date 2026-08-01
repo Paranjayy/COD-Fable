@@ -135,6 +135,7 @@ export class UiSystem {
     this.vw = 1920;
     this.vh = 1080;
     this._isCapture = !!ctx.config.deterministic;
+    this.sessionActive = false;
     this.hudVisible = this._isCapture ? 1 : 0;
     this.hudTarget = this._isCapture ? 1 : 0;
     this._lastRaw = ctx.time.raw;
@@ -388,12 +389,26 @@ export class UiSystem {
 
   startSession(mode = 'operation') {
     const practice = mode === 'practice';
+    this.sessionActive = true;
     this.setMatch({ mode: practice ? 'PRACTICE' : 'OPERATION', scoreUs: 0, scoreThem: 0, timeLeft: 600 });
     this.setHudVisible(true);
     this.ctx.input.enabled = true;
     this.ctx.peek('player')?.setControlEnabled?.(true);
     this.ctx.input.requestPointerLock();
     this.ctx.events.emit('session:start', { mode });
+  }
+
+  returnToHome() {
+    if (!this.sessionActive && !this.menu.open) return;
+    this._returnHomeAfterMenu = false;
+    if (this.menu.open) this.menu.close();
+    this.sessionActive = false;
+    this.setHudVisible(false);
+    this.ctx.input.enabled = false;
+    this.ctx.peek('player')?.setControlEnabled?.(false);
+    document.exitPointerLock?.();
+    this.ctx.events.emit('session:end');
+    this.home.show();
   }
 
   openSettings() {
@@ -454,7 +469,10 @@ export class UiSystem {
 
     // ---- pause -----------------------------------------------------------
     if (ctx.input.enabled && !ctx.input.frozen) {
-      if (ctx.input.actionPressed('pause')) this.menu.toggle();
+      if (ctx.input.actionPressed('pause')) {
+        if (this.sessionActive) this.returnToHome();
+        else this.menu.toggle();
+      }
       // Losing pointer lock mid-match is the same intent as pressing Escape.
       if (ctx.input.pointerLocked) this._hadPointerLock = true;
       else if (this._hadPointerLock && !this.menu.open) {
