@@ -19,6 +19,24 @@ export const UNITS = {
 };
 
 export const QUALITY_PRESETS = {
+  // Intended for integrated GPUs and Apple-silicon laptops. Keep the scene,
+  // material response, weapon and bloom; cut the multiplicative render-target
+  // and simulation budgets that make a Retina display expensive.
+  performance: {
+    renderScale: 0.7,
+    shadowMapSize: 1024,
+    cascades: 2,
+    shadowDistance: 65,
+    taa: false,
+    gtao: false,
+    ssr: false,
+    volumetrics: false,
+    motionBlur: false,
+    bloom: true,
+    anisotropy: 4,
+    particleBudget: 3200,
+    decalBudget: 96,
+  },
   low: {
     renderScale: 0.72,
     shadowMapSize: 1024,

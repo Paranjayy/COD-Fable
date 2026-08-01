@@ -702,7 +702,7 @@ const CSS = `
 }
 .ow-home-deck { max-width:25rem; margin-top:clamp(1.25rem,2.2vw,2.2rem); color:rgba(231,225,213,.71); font-size:clamp(.8rem,.95vw,1rem); line-height:1.5; letter-spacing:.025em; }
 .ow-home-actions { display:grid; gap:.6rem; align-self:center; margin-bottom:6vh; }
-.ow-home-mode, .ow-home-settings {
+.ow-home-mode, .ow-home-settings, .ow-home-performance {
   appearance:none; border:0; border-radius:0; color:#eee5d5; font:inherit; text-align:left; cursor:pointer;
 }
 .ow-home-mode {
@@ -720,8 +720,9 @@ const CSS = `
 .ow-home-rail { grid-column:1 / -1; display:flex; justify-content:space-between; align-items:end; border-top:1px solid rgba(240,230,210,.16); padding-top:1rem; }
 .ow-home-status { display:grid; gap:.2rem; text-transform:uppercase; }
 .ow-home-status strong { color:#b7d68d; font-size:.68rem; letter-spacing:.17em; }
-.ow-home-settings { color:rgba(235,226,210,.68); font-size:.68rem; letter-spacing:.17em; text-transform:uppercase; padding:.5rem 0; }
-.ow-home-settings:hover, .ow-home-settings:focus-visible { color:#f3a959; outline:0; text-decoration:underline; text-underline-offset:.35rem; }
+.ow-home-settings, .ow-home-performance { color:rgba(235,226,210,.68); font-size:.68rem; letter-spacing:.17em; text-transform:uppercase; padding:.5rem 0; }
+.ow-home-performance { margin-left:auto; margin-right:1.4rem; }
+.ow-home-settings:hover, .ow-home-settings:focus-visible, .ow-home-performance:hover, .ow-home-performance:focus-visible { color:#f3a959; outline:0; text-decoration:underline; text-underline-offset:.35rem; }
 @media (max-width: 720px) {
   .ow-home { grid-template-columns:1fr; grid-template-rows:auto 1fr auto; align-items:start; padding:1.5rem; background:linear-gradient(180deg,rgba(10,13,14,.83),rgba(10,13,14,.24)); }
   .ow-home-mast, .ow-home-actions { margin-bottom:0; align-self:start; }

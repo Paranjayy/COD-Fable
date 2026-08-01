@@ -1,6 +1,6 @@
 import { el, setText, setStyle, clamp, damp, ease } from './util.js';
 
-const PRESETS = ['low', 'medium', 'high', 'ultra'];
+const PRESETS = ['performance', 'low', 'medium', 'high', 'ultra'];
 
 /**
  * Pause / settings menu.
@@ -28,7 +28,7 @@ export class PauseMenu {
 
     // ---- quality preset --------------------------------------------------
     this.qBtns = [];
-    const qRow = this._row('Graphics Preset');
+    const qRow = this._row('Graphics Preset · Restarts Game');
     const seg = el('div', 'ow-seg', qRow);
     for (const p of PRESETS) {
       const b = el('button', null, seg, p);
@@ -85,7 +85,7 @@ export class PauseMenu {
       this.sens.set(1);
       this.fov.set(80);
       this.ctx.config.invertY = false;
-      this.setQuality('ultra');
+      this.setQuality('medium');
     });
     el('div', 'hint', inner, 'ESC RESUME · WASD MOVE · SHIFT SPRINT · R RELOAD · F USE');
 
@@ -134,12 +134,17 @@ export class PauseMenu {
 
   setQuality(name) {
     try {
-      this.ctx.config.setQuality(name);
-      this.ctx.events.emit('ui:quality', { quality: name });
+      if (name === this.ctx.config.quality) return;
+      // Quality decides render targets, shaders, material bake resolution and
+      // FX capacities at startup. Mutating the config mid-session only made the
+      // old UI *look* like it had changed. Reload into an explicit URL profile
+      // so the full pipeline is recreated honestly.
+      const next = new URL(location.href);
+      next.searchParams.set('q', name);
+      location.assign(next.href);
     } catch (err) {
       console.warn('[ui] quality switch failed', err);
     }
-    this.syncFromConfig();
   }
 
   syncFromConfig() {

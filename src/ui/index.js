@@ -95,6 +95,7 @@ export class UiSystem {
     this.home = new HomeScreen(this.root, {
       onStart: (mode) => this.startSession(mode),
       onSettings: () => this.openSettings(),
+      onPerformance: () => this.setStartupQuality('performance'),
     });
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
@@ -398,6 +399,12 @@ export class UiSystem {
   openSettings() {
     this._returnHomeAfterMenu = true;
     this.menu.show();
+  }
+
+  setStartupQuality(name) {
+    const next = new URL(location.href);
+    next.searchParams.set('q', name);
+    location.assign(next.href);
   }
 
   pause() {

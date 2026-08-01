@@ -7,9 +7,10 @@ import { el, setStyle } from './util.js';
  * same interface instead of forking player, weapon, or AI code.
  */
 export class HomeScreen {
-  constructor(parent, { onStart, onSettings }) {
+  constructor(parent, { onStart, onSettings, onPerformance }) {
     this.onStart = onStart;
     this.onSettings = onSettings;
+    this.onPerformance = onPerformance;
     this.root = el('section', 'ow-home', parent);
     this.root.setAttribute('aria-label', 'COD Fable command lobby');
 
@@ -26,6 +27,9 @@ export class HomeScreen {
     const status = el('div', 'ow-home-status', rail);
     el('span', null, status, 'System status');
     el('strong', null, status, 'Online');
+    this.performance = el('button', 'ow-home-performance', rail, 'Performance profile · M1 / older Macs');
+    this.performance.type = 'button';
+    this.performance.addEventListener('click', () => this.onPerformance?.());
     this.settings = el('button', 'ow-home-settings', rail, 'Settings');
     this.settings.type = 'button';
     this.settings.addEventListener('click', () => this.onSettings?.());
