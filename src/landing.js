@@ -31,17 +31,17 @@ app.innerHTML = `
       <div class="fable-copy">
         <p class="fable-kicker">Market district // live simulation</p>
         <h1>TAKE<br>THE BLOCK.</h1>
-        <p class="fable-intro">A code-born tactical sandbox with a live city waiting on the other side of deploy.</p>
+        <p class="fable-intro">A code-born tactical sandbox. Choose a session, then the district builds around you.</p>
         <div class="fable-readout"><span>OPERATION READY</span><b>02:43</b><i>THREAT: ACTIVE</i></div>
         <div class="fable-actions">
-          <button class="fable-deploy" data-play="operation" type="button"><span>Deploy</span><small>Garrison operation</small><i>↗</i></button>
+          <button class="fable-deploy" data-play="operation" type="button"><span>Play now</span><small>Garrison · live-fire</small><i>↗</i></button>
           <button class="fable-secondary" data-play="practice" type="button">Practice range <i>→</i></button>
         </div>
       </div>
 
       <aside class="fable-brief" aria-label="Operation briefing">
         <div class="fable-brief-top"><span>Featured operation</span><b>01 / 03</b></div>
-        <div class="fable-map"><i></i><i></i><i></i><strong>GARRISON</strong><span>MARKET SECTOR</span><em>F</em></div>
+        <div class="fable-map"><i></i><i></i><i></i><strong>GARRISON</strong><span>MARKET SECTOR</span></div>
         <div class="fable-brief-body"><strong>Live-fire patrol</strong><p>Push through the market district against two hostile squads. No matchmaking. Just the simulation.</p></div>
         <div class="fable-brief-meta"><span>SOLO</span><span>6 HOSTILES</span><span>OPEN ENDED</span></div>
       </aside>
@@ -109,7 +109,9 @@ style.textContent = `
   .fable-art-label { position:absolute; color:rgba(233,228,216,.56); font:600 .55rem/1 ui-monospace,SFMono-Regular,monospace; letter-spacing:.16em; writing-mode:vertical-rl; text-transform:uppercase; }.fable-art-label.top{right:1.3rem;top:1rem}.fable-art-label.bottom{left:1.3rem;bottom:1.5rem;transform:rotate(180deg)}
   .fable-copy,.fable-brief { z-index:2; }.fable-copy h1 { position:relative; }.fable-copy h1::after { content:""; position:absolute; width:7rem; height:.35rem; background:var(--red); left:.1rem; bottom:-1.2rem; }.fable-intro{margin-top:2.8rem}.fable-readout{display:flex;gap:1rem;align-items:center;margin:0 0 1.35rem;color:rgba(233,228,216,.66);font:600 .57rem/1 ui-monospace,SFMono-Regular,monospace;letter-spacing:.12em}.fable-readout b{color:#f1b678}.fable-readout i{font-style:normal;color:#ee7b65}
   .fable-brief { border-color:rgba(240,231,215,.45); box-shadow:22px 24px 0 rgba(4,7,8,.25),-6px 0 0 var(--red); }.fable-map { background:linear-gradient(145deg,#213943,#102228); }.fable-map em{position:absolute;right:1.1rem;bottom:.7rem;color:rgba(238,78,63,.75);font:900 4rem/.8 Impact,Haettenschweiler,sans-serif;font-style:normal}.fable-brief-body{background:rgba(7,12,15,.33)}
-  @media(max-width:1100px){.fable-hero-art{inset:5% 7% 4% 22%;opacity:.55}.fable-operator{right:-5%;bottom:-5%;width:68vw}.fable-brief{align-self:end}.fable-copy{align-self:center}.fable-art-label{display:none}}
+  /* The command surface must keep its reading column clear at laptop widths.
+     Key art lives in the right field; it is never allowed to sit under copy. */
+  @media(max-width:1100px){.fable-stage{grid-template-columns:minmax(0,1fr) minmax(17.5rem,20rem);gap:clamp(1.5rem,3vw,2.5rem);padding-left:clamp(2rem,7vw,5rem);padding-right:clamp(2rem,7vw,5rem)}.fable-copy{max-width:25rem;align-self:center}.fable-copy h1{font-size:clamp(4.3rem,8vw,6.8rem)}.fable-intro{max-width:22rem}.fable-hero-art{inset:7% -3% 3% 48%;opacity:.4}.fable-operator{right:-14%;bottom:-4%;width:58vw}.fable-orbit{display:none}.fable-brief{align-self:center}.fable-art-label{display:none}.fable-readout{gap:.7rem;font-size:.52rem}}
   @media(max-width:800px){.fable-hero-art{inset:5% -10% 35% 25%;opacity:.34}.fable-operator{width:105vw;right:-25%;bottom:-16%}.fable-orbit{display:none}.fable-readout{margin-top:2.2rem}.fable-brief{z-index:3}.fable-copy h1::after{bottom:-.8rem}}
 `;
 document.head.appendChild(style);
