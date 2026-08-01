@@ -20,6 +20,20 @@ focus is a robust browser launch experience, a play-worthy session loop, and
 measured performance work for Apple silicon laptops — without flattening the
 procedural visual character that makes it special.
 
+## Play modes and performance
+
+- **Garrison Operation:** the full live-fire sandbox with hostile squads.
+- **Practice Range:** a low-pressure session with static, shootable targets for
+  movement and weapon familiarisation.
+- **Performance profile:** choose it from the command lobby (recommended for M1
+  and older Macs), or launch directly with [`?q=performance`](https://cod-fable.vercel.app/?q=performance).
+
+Graphics profiles rebuild the renderer on selection rather than pretending to
+change expensive render targets mid-match. `medium` remains the balanced default;
+the Performance profile keeps the environment, material response, weapon, and
+bloom while reducing internal resolution, cascades, FX budgets, and full-screen
+effects.
+
 A first-person shooter built in the browser with Three.js r180 and WebGL2. Roughly
 55k lines across 11 subsystems, written by a fleet of AI agents under orchestration.
 

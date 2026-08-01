@@ -73,6 +73,11 @@ export class AiSystem {
     this.cover = null;
     this.inspect = false;
     this.debugLog = false;
+    // The world is allowed to build while the command lobby is open, but no
+    // combat simulation runs until the player picks a session. Practice keeps
+    // soldiers as shootable, static range targets; Operation enables the full
+    // squad/perception/combat loop.
+    this.sessionMode = null;
     /** dev: force the garrison to spawn even in deterministic capture runs */
     this.forcePopulate = false;
     this._navPending = true;
@@ -293,7 +298,19 @@ export class AiSystem {
     this._off = [];
     const on = (t, fn) => this._off.push(ctx.events.on(t, fn));
 
+    on('session:start', ({ mode } = {}) => {
+      this.sessionMode = mode === 'operation' ? 'operation' : 'practice';
+      if (this.sessionMode === 'practice') {
+        for (const a of this.agents) {
+          a.hasTarget = false;
+          a.targetVisible = false;
+          a.wantFire = false;
+        }
+      }
+    });
+
     on('weapon:fire', (e) => {
+      if (this.sessionMode !== 'operation') return;
       if (!e || !e.origin || e.weapon === 'ai_rifle') return; // ignore our own
       // A gunshot is the loudest thing in the level: everybody hears it, and
       // anyone near the line of fire also feels suppressed by it.
@@ -308,6 +325,7 @@ export class AiSystem {
     });
 
     on('bullet:impact', (e) => {
+      if (this.sessionMode !== 'operation') return;
       if (!e || !e.point) return;
       for (const a of this.agents) {
         if (!a.alive) continue;
@@ -327,6 +345,7 @@ export class AiSystem {
     });
 
     on('explosion', (e) => {
+      if (this.sessionMode !== 'operation') return;
       if (!e || !e.position) return;
       const radius = e.radius ?? 5;
       for (const a of this.agents) {
@@ -343,6 +362,7 @@ export class AiSystem {
     });
 
     on('player:footstep', (e) => {
+      if (this.sessionMode !== 'operation') return;
       if (!e || !e.position) return;
       const loud = e.running ? 24 : 11;
       for (const a of this.agents) if (a.alive) a.hear(e.position, loud);
@@ -727,6 +747,12 @@ export class AiSystem {
       // shot asks for a tableau, so nobody's screenshot gets a stray patrol
       // wandering through it.
       if (!this._navPending && (!ctx.config.deterministic || this.forcePopulate)) this.populate();
+    }
+
+    if (this.sessionMode !== 'operation') {
+      this.stats.agents = this.agents.length;
+      this.stats.alive = this.agents.reduce((n, a) => n + Number(a.alive), 0);
+      return;
     }
 
     // Per-frame A* budget: see requestPath().
