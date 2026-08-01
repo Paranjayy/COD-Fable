@@ -15,10 +15,24 @@ app.innerHTML = `
     </header>
 
     <section class="fable-stage">
+      <div class="fable-hero-art" aria-hidden="true">
+        <div class="fable-orbit orbit-a"></div><div class="fable-orbit orbit-b"></div><div class="fable-crosshair"></div>
+        <svg viewBox="0 0 560 680" class="fable-operator" fill="none">
+          <path d="M291 92c49 0 88 40 88 89 0 29-14 55-35 71l25 87 74 37-34 67-88-25-16 92 58 93-88 37-62-100-64 101-85-38 63-95-20-122-70 6-11-73 90-18 30-102c-22-16-36-43-36-73 0-49 39-89 88-89Z" fill="#e6dfcf"/>
+          <path d="m201 240 89 47 84-24 83 89-27 32-80-55-91 28-74-56 16-61Z" fill="#ee4e3f"/>
+          <path d="m118 323 186 22 190-98 12 28-191 130-205-23 8-59Z" fill="#121b20"/>
+          <path d="m110 382 205 23 104 82-31 44-122-61-139-13-17-75Z" fill="#a6bdbe"/>
+          <path d="m213 180 50-24 61 20 25 52-56 29-73-20-7-57Z" fill="#17252a"/>
+          <circle cx="293" cy="126" r="49" fill="#ee4e3f"/><path d="m270 126 18 19 33-35" stroke="#f6eedf" stroke-width="11" stroke-linecap="square"/>
+          <path d="m180 513 31 111m111-119 58 104" stroke="#ee4e3f" stroke-width="12"/>
+        </svg>
+        <div class="fable-art-label top">UNIT // F-07</div><div class="fable-art-label bottom">PROCEDURAL OPERATOR</div>
+      </div>
       <div class="fable-copy">
         <p class="fable-kicker">Market district // live simulation</p>
-        <h1>MAKE<br>THE PUSH.</h1>
-        <p class="fable-intro">A code-born tactical sandbox. Pick a session; the district builds only when you deploy.</p>
+        <h1>TAKE<br>THE BLOCK.</h1>
+        <p class="fable-intro">A code-born tactical sandbox with a live city waiting on the other side of deploy.</p>
+        <div class="fable-readout"><span>OPERATION READY</span><b>02:43</b><i>THREAT: ACTIVE</i></div>
         <div class="fable-actions">
           <button class="fable-deploy" data-play="operation" type="button"><span>Deploy</span><small>Garrison operation</small><i>↗</i></button>
           <button class="fable-secondary" data-play="practice" type="button">Practice range <i>→</i></button>
@@ -27,7 +41,7 @@ app.innerHTML = `
 
       <aside class="fable-brief" aria-label="Operation briefing">
         <div class="fable-brief-top"><span>Featured operation</span><b>01 / 03</b></div>
-        <div class="fable-map"><i></i><i></i><i></i><strong>GARRISON</strong><span>MARKET SECTOR</span></div>
+        <div class="fable-map"><i></i><i></i><i></i><strong>GARRISON</strong><span>MARKET SECTOR</span><em>F</em></div>
         <div class="fable-brief-body"><strong>Live-fire patrol</strong><p>Push through the market district against two hostile squads. No matchmaking. Just the simulation.</p></div>
         <div class="fable-brief-meta"><span>SOLO</span><span>6 HOSTILES</span><span>OPEN ENDED</span></div>
       </aside>
@@ -84,5 +98,18 @@ style.textContent = `
   .fable-toast { position:fixed; right:2rem; bottom:5.4rem; max-width:18rem; padding:.8rem 1rem; opacity:0; transform:translateY(.5rem); color:#201d19; background:#e8ddca; font:600 .68rem/1.4 Arial,sans-serif; transition:opacity .2s,transform .2s; pointer-events:none; }.fable-toast.show{opacity:1;transform:none}
   @media(max-width:800px){.fable-topbar{height:60px;gap:1rem}.fable-topbar nav{gap:1rem}.fable-topbar nav button:not(.active){display:none}.fable-status{font-size:.52rem}.fable-stage{grid-template-columns:1fr;padding:4rem 1.5rem 3rem}.fable-brief{max-width:28rem}.fable-footer{gap:1rem;padding:0 1.5rem}.fable-footer span:nth-child(2){display:none}.fable-footer button{margin-left:auto}}
   @media(prefers-reduced-motion:reduce){.fable-deploy,.fable-toast{transition:none}}
+
+  /* Deliberately asymmetric key-art treatment: an operator constructed from
+     inline geometry, not a stock image, so first paint stays instant. */
+  .fable-stage { position:relative; }
+  .fable-hero-art { position:absolute; inset:4% 19% 2% 29%; pointer-events:none; overflow:hidden; opacity:.92; }
+  .fable-operator { position:absolute; width:min(58vw,620px); height:auto; right:3%; bottom:-9%; filter:drop-shadow(0 26px 28px rgba(0,0,0,.45)); transform:rotate(-4deg); }
+  .fable-orbit { position:absolute; border:1px solid rgba(238,78,63,.65); border-radius:50%; transform:rotate(-27deg); }.orbit-a{width:41vw;height:41vw;max-width:560px;max-height:560px;right:6%;bottom:7%;}.orbit-b{width:28vw;height:28vw;max-width:390px;max-height:390px;right:20%;bottom:25%;border-color:rgba(224,216,200,.22);}
+  .fable-crosshair { position:absolute; right:4%; top:19%; width:140px; height:140px; border:1px solid rgba(230,223,207,.2); transform:rotate(45deg); }.fable-crosshair::before,.fable-crosshair::after{content:"";position:absolute;background:rgba(230,223,207,.32)}.fable-crosshair::before{width:1px;top:-24px;bottom:-24px;left:50%}.fable-crosshair::after{height:1px;left:-24px;right:-24px;top:50%}
+  .fable-art-label { position:absolute; color:rgba(233,228,216,.56); font:600 .55rem/1 ui-monospace,SFMono-Regular,monospace; letter-spacing:.16em; writing-mode:vertical-rl; text-transform:uppercase; }.fable-art-label.top{right:1.3rem;top:1rem}.fable-art-label.bottom{left:1.3rem;bottom:1.5rem;transform:rotate(180deg)}
+  .fable-copy,.fable-brief { z-index:2; }.fable-copy h1 { position:relative; }.fable-copy h1::after { content:""; position:absolute; width:7rem; height:.35rem; background:var(--red); left:.1rem; bottom:-1.2rem; }.fable-intro{margin-top:2.8rem}.fable-readout{display:flex;gap:1rem;align-items:center;margin:0 0 1.35rem;color:rgba(233,228,216,.66);font:600 .57rem/1 ui-monospace,SFMono-Regular,monospace;letter-spacing:.12em}.fable-readout b{color:#f1b678}.fable-readout i{font-style:normal;color:#ee7b65}
+  .fable-brief { border-color:rgba(240,231,215,.45); box-shadow:22px 24px 0 rgba(4,7,8,.25),-6px 0 0 var(--red); }.fable-map { background:linear-gradient(145deg,#213943,#102228); }.fable-map em{position:absolute;right:1.1rem;bottom:.7rem;color:rgba(238,78,63,.75);font:900 4rem/.8 Impact,Haettenschweiler,sans-serif;font-style:normal}.fable-brief-body{background:rgba(7,12,15,.33)}
+  @media(max-width:1100px){.fable-hero-art{inset:5% 7% 4% 22%;opacity:.55}.fable-operator{right:-5%;bottom:-5%;width:68vw}.fable-brief{align-self:end}.fable-copy{align-self:center}.fable-art-label{display:none}}
+  @media(max-width:800px){.fable-hero-art{inset:5% -10% 35% 25%;opacity:.34}.fable-operator{width:105vw;right:-25%;bottom:-16%}.fable-orbit{display:none}.fable-readout{margin-top:2.2rem}.fable-brief{z-index:3}.fable-copy h1::after{bottom:-.8rem}}
 `;
 document.head.appendChild(style);
