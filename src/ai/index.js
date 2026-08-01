@@ -749,7 +749,10 @@ export class AiSystem {
       if (!this._navPending && (!ctx.config.deterministic || this.forcePopulate)) this.populate();
     }
 
-    if (this.sessionMode !== 'operation') {
+    // Deterministic capture stages its own firefight after boot. It is not a
+    // player session, but it must retain the original agent update path or the
+    // screenshot/perf harness silently regresses.
+    if (this.sessionMode !== 'operation' && !ctx.config.deterministic) {
       this.stats.agents = this.agents.length;
       this.stats.alive = this.agents.reduce((n, a) => n + Number(a.alive), 0);
       return;
