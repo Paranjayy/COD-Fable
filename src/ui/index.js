@@ -91,7 +91,7 @@ export class UiSystem {
     this.ammo = new AmmoPanel(this.chromeLayer);
     this.prompt = new Prompt(this.chromeLayer);
     this.banner = new Banner(this.chromeLayer);
-    this.menu = new PauseMenu(this.root, ctx);
+    this.menu = new PauseMenu(this.root, ctx, { onHome: () => this.returnToHome() });
     this.home = new HomeScreen(this.root, {
       onStart: (mode) => this.startSession(mode),
       onSettings: () => this.openSettings(),
@@ -265,6 +265,9 @@ export class UiSystem {
     // to a session.
     if (this._isCapture) {
       this.home.hide();
+    } else if (ctx.config.launchMode) {
+      this.home.hide();
+      this.startSession(ctx.config.launchMode);
     } else {
       ctx.input.enabled = false;
       ctx.peek('player')?.setControlEnabled?.(false);
@@ -399,16 +402,9 @@ export class UiSystem {
   }
 
   returnToHome() {
-    if (!this.sessionActive && !this.menu.open) return;
-    this._returnHomeAfterMenu = false;
-    if (this.menu.open) this.menu.close();
-    this.sessionActive = false;
-    this.setHudVisible(false);
-    this.ctx.input.enabled = false;
-    this.ctx.peek('player')?.setControlEnabled?.(false);
-    document.exitPointerLock?.();
-    this.ctx.events.emit('session:end');
-    this.home.show();
+    // Going home is a real teardown boundary: unload the WebGL world rather
+    // than leaving the renderer, AI and procedural textures alive behind a UI.
+    location.assign(location.pathname);
   }
 
   openSettings() {
@@ -469,10 +465,7 @@ export class UiSystem {
 
     // ---- pause -----------------------------------------------------------
     if (ctx.input.enabled && !ctx.input.frozen) {
-      if (ctx.input.actionPressed('pause')) {
-        if (this.sessionActive) this.returnToHome();
-        else this.menu.toggle();
-      }
+      if (ctx.input.actionPressed('pause')) this.menu.toggle();
       // Losing pointer lock mid-match is the same intent as pressing Escape.
       if (ctx.input.pointerLocked) this._hadPointerLock = true;
       else if (this._hadPointerLock && !this.menu.open) {

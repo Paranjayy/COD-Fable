@@ -18,6 +18,9 @@ import { prewarm } from './core/prewarm.js';
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
+const launchMode = params.get('play') === 'practice' ? 'practice' : 'operation';
+const app = document.getElementById('app');
+app.innerHTML = '<canvas id="game"></canvas><div id="ui"></div><div id="boot" role="status" aria-live="polite">Building the world…</div>';
 const bootStatus = document.getElementById('boot');
 // Preserve the original showcase quality by default. Performance is a clearly
 // labelled, explicit lobby/settings choice (`?q=performance`), never a silent
@@ -33,6 +36,7 @@ const config = createConfig({
   // The homepage exposes Performance as an opt-in for constrained hardware.
   quality: initialQuality,
   deterministic: capture,
+  launchMode,
 });
 
 const canvas = document.getElementById('game');

@@ -14,7 +14,7 @@ const PRESETS = ['performance', 'low', 'medium', 'high', 'ultra'];
  * `ui:sensitivity` {value}, `ui:fov` {value}, `ui:setting` {key, value}.
  */
 export class PauseMenu {
-  constructor(parent, ctx) {
+  constructor(parent, ctx, { onHome } = {}) {
     this.ctx = ctx;
     this.root = el('div', 'ow-menu', parent);
     const inner = el('div', 'ow-menu-inner', this.root);
@@ -79,6 +79,9 @@ export class PauseMenu {
     this.resumeBtn = el('button', 'ow-btn primary', btns, 'Resume');
     this.resumeBtn.type = 'button';
     this.resumeBtn.addEventListener('click', () => this.close());
+    const home = el('button', 'ow-btn', btns, 'Return to Home');
+    home.type = 'button';
+    home.addEventListener('click', () => onHome?.());
     const reset = el('button', 'ow-btn', btns, 'Defaults');
     reset.type = 'button';
     reset.addEventListener('click', () => {
